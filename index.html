@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TF2 Voice Emulator — Developer Console</title>
+  <meta name="theme-color" content="#171a21">
+  <link rel="icon" href="favicon.ico" type="image/x-icon">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <div class="card" id="main-card">
+    <!-- Authentic Net Graph Overlay -->
+    <div id="net-graph" class="ng-level-0" aria-hidden="true">
+      <div class="ng-row-basic">fps: <span class="ng-fps" id="ng-fps">0</span> <span class="ng-row-graph"><span class="ng-bar"><span class="ng-bar-fill" id="ng-fill"></span></span></span></div>
+      <div class="ng-row-basic">ping: <span class="ng-ping" id="ng-ping">5</span> ms</div>
+      <div class="ng-row-advanced">in : <span id="ng-in">128</span> 2.11 k/s</div>
+      <div class="ng-row-advanced">out: <span id="ng-out">64</span> 1.02 k/s</div>
+      <div class="ng-row-advanced">lerp: <span class="ng-lerp" id="ng-lerp">100.0</span> ms</div>
+      <div class="ng-row-basic">loss: <span class="ng-loss" id="ng-loss-val">0</span> choke: 0</div>
+      <div class="ng-row-sv">sv: 3.4 +- 0.2 ms</div>
+    </div>
+
+    <h1>TF2 Voice Emulator</h1>
+    <p>Source Engine voice pipeline: vaudio_celt / Steam Voice → network → listener dsp_room</p>
+
+    <div class="upload-row">
+      <input id="file" type="file" accept="audio/*" aria-label="Audio file to process">
+      <button id="mic" type="button" title="Record from microphone (+voicerecord)">🎤 Mic</button>
+      <button id="process" disabled>Process Audio</button>
+      <button id="cancel-process" class="button-secondary" type="button" hidden>Cancel</button>
+      <button id="download" type="button" disabled>Download WAV</button>
+      <div id="source-status" class="source-status" role="status" aria-live="polite">Choose an audio file or record from the microphone.</div>
+      <progress id="process-progress" max="100" value="0" hidden aria-label="Audio processing progress"></progress>
+    </div>
+
+    <div class="preset-row">
+      <div class="preset-label">Quick Presets</div>
+      <button class="preset-btn" data-cmd="exec preset_modern">Modern (Steam Voice)</button>
+      <button class="preset-btn" data-cmd="exec preset_legacy">Legacy CELT</button>
+      <button class="preset-btn" data-cmd="exec preset_spam">Mic Spam (Tunnel)</button>
+      <button class="preset-btn" data-cmd="exec preset_sewers">2fort Sewers</button>
+      <button class="preset-btn" data-cmd="exec preset_laggy">Laggy 18% Loss</button>
+    </div>
+
+    <div class="mode-row">
+      <button id="advanced-toggle" class="preset-btn" type="button" aria-expanded="false" aria-controls="controls-wrapper">Show advanced controls</button>
+      <span>Quick presets cover the common sounds; advanced controls expose Source-style tuning.</span>
+    </div>
+
+    <div class="controls" id="controls-wrapper">
+
+      <div class="control control-wide">
+        <label for="codec">Codec [sv_voicecodec]</label>
+        <select id="codec">
+          <option value="celt_22" selected>vaudio_celt (22 kHz / 22 kbps)</option>
+          <option value="celt_44">vaudio_celt_high (44 kHz)</option>
+          <option value="steam">Steam Voice (Opus, 24 kHz)</option>
+          <option value="steam_48">Steam Voice Native (Opus, 48 kHz)</option>
+          <option value="speex">vaudio_speex (narrowband, 8 kHz)</option>
+        </select>
+      </div>
+
+      <div class="control control-wide">
+        <label for="listener_position">Listener Position [dsp_room auto]</label>
+        <select id="listener_position">
+          <option value="open" selected>Open / Outdoor (0)</option>
+          <option value="hallway">Hallway / Corridor (22)</option>
+          <option value="small_room">Small Room / Spawn (17)</option>
+          <option value="tunnel">Tunnel (6)</option>
+          <option value="tunnel_big">Big Tunnel (7)</option>
+          <option value="cavern">Cavern (24)</option>
+          <option value="hangar">Hangar / Warehouse (10)</option>
+          <option value="chamber">Concrete Chamber (19)</option>
+          <option value="water">Underwater (14)</option>
+          <option value="metal">Metal Room (4)</option>
+          <option value="manual">— Manual dsp_room below —</option>
+        </select>
+      </div>
+
+      <div class="control advanced-control">
+        <label for="gain">Mic Gain [voice_overdrive]</label>
+        <input id="gain" type="number" value="1.3" min="0.5" max="5.0" step="0.1">
+      </div>
+
+      <div class="control advanced-control">
+        <label for="voice_scale">Receiver Vol [voice_scale]</label>
+        <input id="voice_scale" type="number" value="1.0" min="0.0" max="2.0" step="0.05">
+      </div>
+
+      <div class="control advanced-control">
+        <label for="hp">Hi-Pass [dsp_hpf]</label>
+        <input id="hp" type="number" value="120" min="0" max="1000">
+      </div>
+
+      <div class="control advanced-control">
+        <label for="lp">Lo-Pass [dsp_lpf]</label>
+        <input id="lp" type="number" value="20000" min="1000" max="20000">
+      </div>
+
+      <div class="control advanced-control">
+        <label for="env">Manual dsp_room</label>
+        <select id="env">
+          <option value="0">0  – Off (NULL)</option>
+          <option value="1">1  – Generic (AUTO, dry)</option>
+          <option value="2">2  – Metal Small</option>
+          <option value="3">3  – Metal Medium</option>
+          <option value="4">4  – Metal Large</option>
+          <option value="5">5  – Tunnel Small</option>
+          <option value="6">6  – Tunnel Medium</option>
+          <option value="7">7  – Tunnel Large</option>
+          <option value="8">8  – Chamber Small</option>
+          <option value="9">9  – Chamber Medium</option>
+          <option value="10">10 – Chamber Large</option>
+          <option value="11">11 – Brite Small</option>
+          <option value="12">12 – Brite Medium</option>
+          <option value="13">13 – Brite Large</option>
+          <option value="14">14 – Water 1 (underwater)</option>
+          <option value="15">15 – Water 2</option>
+          <option value="16">16 – Water 3</option>
+          <option value="17">17 – Concrete Small</option>
+          <option value="18">18 – Concrete Medium</option>
+          <option value="19">19 – Concrete Large</option>
+          <option value="20">20 – Outside Small</option>
+          <option value="21">21 – Outside Medium</option>
+          <option value="22">22 – Outside Large</option>
+          <option value="23">23 – Cavern Small</option>
+          <option value="24">24 – Cavern Medium</option>
+          <option value="25">25 – Cavern Large</option>
+          <option value="26">26 – Weirdo 1</option>
+          <option value="27">27 – Weirdo 2</option>
+          <option value="28">28 – Weirdo 3</option>
+          <option value="29">29 – Weirdo 4</option>
+          <option value="99">99 – Custom (below)</option>
+        </select>
+      </div>
+
+      <div id="custom-env" class="control advanced-control">
+        <div class="section-label">dsp_custom settings</div>
+        <div class="custom-row">
+          <div class="custom-col">
+             <label for="c_dur">Time [dsp_custom_time]</label>
+             <input id="c_dur" type="number" value="1.5" step="0.1" min="0" max="6">
+          </div>
+          <div class="custom-col">
+             <label for="c_dec">Decay [dsp_custom_decay]</label>
+             <input id="c_dec" type="number" value="3.0" step="0.1" min="0.5" max="8">
+          </div>
+          <div class="custom-col">
+             <label for="c_mix">Mix [dsp_custom_mix]</label>
+             <input id="c_mix" type="number" value="25" min="0" max="100">
+          </div>
+        </div>
+      </div>
+
+      <div class="control advanced-control">
+        <label for="bits">Codec Bitrate [snd_bits, 16 = stock]</label>
+        <input id="bits" type="number" value="16" min="4" max="16">
+      </div>
+
+      <div class="control advanced-control">
+        <label for="frameMs">Frame [net_split ms]</label>
+        <input id="frameMs" type="number" value="20" min="10" max="100">
+      </div>
+
+      <div class="control advanced-control">
+        <label for="loss">Loss % [net_fakeloss]</label>
+        <input id="loss" type="number" value="0" min="0" max="40">
+      </div>
+
+      <div class="control advanced-control">
+        <label for="warble_on">MDCT Warble [snd_warble]</label>
+        <select id="warble_on">
+          <option value="1" selected>On (codec artifact)</option>
+          <option value="0">Off</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="ab-row">
+      <button id="ab-toggle" class="preset-btn" disabled>A/B: Wet</button>
+      <span class="ab-hint">Switch playback between processed (Wet) and original (Dry) for a direct comparison.</span>
+    </div>
+
+    <div class="viz-container">
+      <div class="scanlines"></div>
+      <canvas id="visualizer" aria-label="Audio visualizer"></canvas>
+      <div class="viz-modes" role="group" aria-label="Visualizer mode">
+        <button id="viz-bars" class="viz-mode active" type="button" aria-pressed="true" title="Frequency bars">BARS</button>
+        <button id="viz-spec" class="viz-mode" type="button" aria-pressed="false" title="Scrolling spectrogram">SPEC</button>
+      </div>
+    </div>
+
+    <audio id="preview" controls aria-label="Processed audio preview"></audio>
+    <!-- Hidden dry twin: plays muted in sync with the main player so the
+         A/B toggle is an instant unmute instead of a src swap. -->
+    <audio id="preview-dry" hidden></audio>
+
+    <details class="console-details" id="console-details">
+      <summary>Developer console</summary>
+      <div class="console-wrapper">
+        <div id="console-out" class="console-output" role="log" aria-live="off"></div>
+        <div class="console-input-row">
+          <span aria-hidden="true">]</span>
+          <!-- Input hint sits behind the real input -->
+          <div id="console-hint" aria-hidden="true"></div>
+          <input type="text" id="console-input" placeholder="" autocomplete="off" spellcheck="false" aria-label="Console input">
+          <button id="console-complete" type="button" title="Autocomplete (Tab)" aria-label="Autocomplete command">⇥</button>
+        </div>
+      </div>
+    </details>
+
+    <footer>
+      Local Browser Processing | Source Engine VOIP Simulation
+    </footer>
+  </div>
+
+  <script src="constants.js"></script>
+  <script src="audio.js"></script>
+  <script src="script.js"></script>
+  <script>
+    // Offline/PWA support — only meaningful over http(s), not file://
+    if ('serviceWorker' in navigator && location.protocol.indexOf('http') === 0) {
+      navigator.serviceWorker.register('sw.js').catch(function () {});
+      // When a new worker takes over an already-open tab, reload once so the
+      // page runs the fresh assets. Guarded so a first-ever install (no prior
+      // controller) doesn't reload, and it never loops.
+      var hadController = !!navigator.serviceWorker.controller, reloaded = false;
+      navigator.serviceWorker.addEventListener('controllerchange', function () {
+        if (reloaded || !hadController) return;
+        reloaded = true;
+        window.location.reload();
+      });
+    }
+  </script>
+</body>
+</html>
