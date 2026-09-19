@@ -13,7 +13,7 @@ pnpm dev
 
 For GitHub Pages, copy this project into your repository and enable Pages from the root of your publishing branch. No build is required. **Keep `.nojekyll`, `vendor/`, `opus-codec.mjs`, `audio-worker.js` and `mic-capture.js`** alongside the HTML, CSS, other scripts and icons. `node_modules/` is not needed on the website.
 
-Use HTTPS or localhost. Opening `index.html` as a local file does not reliably support codec modules or microphone capture. After the app and its service worker load, conversion works offline.
+Use HTTPS or localhost. Opening `index.html` as a local file does not reliably support codec modules or microphone capture. After the app and its service worker load, conversion works offline. Background cache updates do not automatically reload the page or discard loaded audio; refresh when ready to use updated page code.
 
 Choose a file or record, select a preset, process, and download the mono 16-bit PCM WAV. Microphone capture uses uncompressed PCM, avoiding an extra lossy codec pass. Limits: 100 MB / 10 minutes for files, 5 minutes for recording. Uploaded format support depends on the browser.
 
@@ -79,6 +79,10 @@ pnpm test:all
 ```
 
 Tests cover boundary pulse timing, partial frames, actual bitrates/packet sizes, packet parsing, native concealment, duration, silence, mute, determinism, pre-encoder filtering, bounded RMS leveling, all room presets 0–29, loss statistics, resampling and WAV structure. Paired-reference tests cover delay, polarity, gain, clock drift, repeated-phrase rejection, fractional-delay frequency preservation and silent-input rejection. Chromium checks cover sample content, worker parity, cancellation, PCM recording, offline conversion, configuration safety and accessibility. Automated microphone tests use synthetic input, not a physical device.
+
+Browser verification also covers all four combinations of 44.1/48 kHz input files and 44.1/48 kHz decoding contexts. WAV rate and frame count must match the decoded input; duration, PCM headers and tone pitch are checked independently. This avoids assuming that every computer's default audio rate is 48 kHz.
+
+Offline checks explicitly wait for an activated worker to control the page, exercise a real worker replacement with audio loaded, and verify that the source survives without a forced reload. A worker-activation timeout fails the test rather than being ignored.
 
 These tests establish implementation behavior, not perceptual equivalence to TF2. CI runs Node 22 and Chromium.
 

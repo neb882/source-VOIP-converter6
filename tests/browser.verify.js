@@ -27,6 +27,121 @@ function wavTone(seconds, rate = 48000, frequency = 440) {
   return buffer;
 }
 
+async function readRenderedWav(page) {
+  return page.evaluate(async () => {
+    const response = await fetch(document.getElementById('preview').src);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const text = (from, count) => String.fromCharCode(...bytes.slice(from, from + count));
+    const view = new DataView(bytes.buffer);
+    const rate = view.getUint32(24, true), frames = (bytes.length - 44) / 2;
+    let power = 0;
+    const crossings = [];
+    for (let i = 0; i < frames; i++) {
+      const value = view.getInt16(44 + i * 2, true) / 32768;
+      power += value * value;
+      // Ignore codec startup/end transients when checking the tone's pitch.
+      if (i > rate * .05 && i < frames - rate * .05) {
+        const previous = view.getInt16(44 + (i - 1) * 2, true) / 32768;
+        if (previous <= 0 && value > 0) crossings.push(i - 1 - previous / (value - previous));
+      }
+    }
+    return { size: bytes.length, riff: text(0, 4), wave: text(8, 4), rate, frames,
+      format: view.getUint16(20, true), channels: view.getUint16(22, true), bits: view.getUint16(34, true),
+      dataBytes: view.getUint32(40, true), rms: Math.sqrt(power / frames),
+      toneHz: crossings.length > 1 ? rate * (crossings.length - 1) / (crossings.at(-1) - crossings[0]) : null };
+  });
+}
+
+function checkRenderedTone(wav, source, label) {
+  check(wav.riff === 'RIFF' && wav.wave === 'WAVE' && wav.size > 44,
+    `${label}: populated PCM WAV`, `${wav.size} bytes`);
+  check(wav.format === 1 && wav.channels === 1 && wav.bits === 16 && wav.dataBytes === wav.frames * 2,
+    `${label}: mono 16-bit PCM header agrees with payload`);
+  // decodeAudioData resamples to AudioContext.sampleRate. The browser's
+  // default can be 44.1 kHz on CI and 48 kHz locally, regardless of file rate.
+  check(wav.rate === source.rate, `${label}: WAV preserves decoded playback rate`, `${wav.rate} Hz`);
+  check(wav.frames === source.length && wav.size === 44 + source.length * 2,
+    `${label}: conversion preserves every decoded input frame`, `${wav.frames} frames`);
+  // Separately guard duration so a wrong decoder length cannot validate itself.
+  // Chromium may round down by one sample during browser-side resampling.
+  check(Math.abs(wav.frames / wav.rate - .5) <= 1 / wav.rate + 1e-9,
+    `${label}: half-second fixture retains duration within one sample`);
+  check(wav.rms > .01 && wav.rms < .5, `${label}: audible, bounded samples`);
+  check(wav.toneHz !== null && Math.abs(wav.toneHz - 440) < 2,
+    `${label}: resampling preserves tone pitch`, `${wav.toneHz?.toFixed(2)} Hz`);
+}
+
+async function verifySampleRateMatrix(browser, base) {
+  console.log('\n[Browser 5] Explicit file-rate / decode-rate matrix');
+  for (const decodeRate of [44100, 48000]) {
+    const context = await browser.newContext({ serviceWorkers: 'block' });
+    try {
+      // A real AudioContext at the requested rate, not mocked decoded PCM.
+      // Keep production defaults unchanged; exercise both CI and local paths.
+      await context.addInitScript((sampleRate) => {
+        const NativeAudioContext = window.AudioContext;
+        window.AudioContext = class extends NativeAudioContext {
+          constructor(options = {}) { super({ ...options, sampleRate }); }
+        };
+      }, decodeRate);
+      const page = await context.newPage();
+      page.setDefaultTimeout(15000);
+      const errors = [];
+      page.on('pageerror', error => errors.push(error.message));
+      await page.goto(base, { waitUntil: 'domcontentloaded' });
+      for (const fileRate of [44100, 48000]) {
+        const label = `${fileRate} Hz file -> ${decodeRate} Hz browser`;
+        await page.locator('#file').setInputFiles({ name: `tone-${fileRate}.wav`, mimeType: 'audio/wav', buffer: wavTone(.5, fileRate) });
+        await page.waitForFunction(() => !document.getElementById('process').disabled);
+        const source = await page.evaluate(() => ({ rate: state.decodedSource.sampleRate,
+          length: state.decodedSource.length, contextRate: state.decodeCtx.sampleRate }));
+        check(source.contextRate === decodeRate && source.rate === decodeRate,
+          `${label}: requested browser decode rate is actually active`);
+        await page.locator('#process').click();
+        await page.waitForFunction(() => !document.getElementById('download').disabled, null, { timeout: 60000 });
+        checkRenderedTone(await readRenderedWav(page), source, label);
+        const log = await page.locator('#console-out').textContent();
+        check(log.includes('libopus 1.6.1, 32 kbps') && !log.includes('compatibility path'),
+          `${label}: real Opus conversion completes in the worker`);
+      }
+      check(errors.length === 0, `${decodeRate} Hz browser: no page errors`, errors.join('; '));
+    } finally { await context.close(); }
+  }
+}
+
+async function activateServiceWorker(page, scriptPath) {
+  // Activation and controller assignment are separate lifecycle events. Wait
+  // for BOTH, and fail on timeout rather than silently proceeding offline.
+  await page.evaluate(async (path) => {
+    const expected = new URL(path, location.href).href;
+    await navigator.serviceWorker.register(path);
+    await new Promise((resolve, reject) => {
+      let observed = null;
+      const cleanup = () => {
+        clearTimeout(timer);
+        navigator.serviceWorker.removeEventListener('controllerchange', inspect);
+        observed?.removeEventListener('statechange', inspect);
+      };
+      const inspect = () => {
+        const controller = navigator.serviceWorker.controller;
+        if (controller !== observed) {
+          observed?.removeEventListener('statechange', inspect);
+          observed = controller;
+          observed?.addEventListener('statechange', inspect);
+        }
+        if (controller?.scriptURL === expected && controller.state === 'activated') {
+          cleanup(); resolve();
+        }
+      };
+      const timer = setTimeout(() => {
+        cleanup(); reject(new Error(`Service worker did not activate and control the page: ${expected}`));
+      }, 30000);
+      navigator.serviceWorker.addEventListener('controllerchange', inspect);
+      inspect();
+    });
+  }, scriptPath);
+}
+
 async function main() {
   const root = path.join(__dirname, '..');
   const server = await createStaticServer(root);
@@ -88,25 +203,12 @@ async function main() {
     console.log('\n[Browser 3] Worker render and cancellation');
     await page.locator('#file').setInputFiles({ name: 'tone.wav', mimeType: 'audio/wav', buffer: wavTone(0.5) });
     await page.waitForFunction(() => !document.getElementById('process').disabled);
+    const decodedSource = await page.evaluate(() => ({ rate: state.decodedSource.sampleRate, length: state.decodedSource.length }));
     await page.locator('#process').click();
     await page.waitForFunction(() => !document.getElementById('download').disabled, null, { timeout: 60000 });
     check((await page.locator('#preview').getAttribute('src') || '').startsWith('blob:'), 'worker render creates playable output');
     check((await page.locator('#source-status').textContent()).includes('Ready'), 'completed render reports ready');
-    const renderedWav = await page.evaluate(async () => {
-      const response = await fetch(document.getElementById('preview').src);
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      const text = (from, count) => String.fromCharCode(...bytes.slice(from, from + count));
-      const view = new DataView(bytes.buffer);
-      let power = 0;
-      for (let i = 44; i < bytes.length; i += 2) power += (view.getInt16(i, true) / 32768) ** 2;
-      return { size: bytes.length, riff: text(0, 4), wave: text(8, 4), rate: view.getUint32(24, true),
-        rms: Math.sqrt(power / ((bytes.length - 44) / 2)) };
-    });
-    check(renderedWav.riff === 'RIFF' && renderedWav.wave === 'WAVE' && renderedWav.size > 44,
-      'worker output is a populated PCM WAV', `${renderedWav.size} bytes`);
-    check(renderedWav.rate === 48000, 'worker WAV header preserves playback rate', `${renderedWav.rate} Hz`);
-    check(renderedWav.size === 48044, 'Opus render preserves exact input duration');
-    check(renderedWav.rms > .01 && renderedWav.rms < .5, 'WAV contains audible, bounded samples');
+    checkRenderedTone(await readRenderedWav(page), decodedSource, 'Default browser');
     const consoleText = await page.locator('#console-out').textContent();
     check(!consoleText.includes('compatibility path'), 'dedicated audio worker completed the render');
     check(consoleText.includes('libopus 1.6.1, 32 kbps'), 'worker used the pinned real Opus codec');
@@ -172,36 +274,47 @@ async function main() {
     check(mobile.presetHeights.every((height) => height >= 44), 'mobile preset targets are at least 44px');
 
     await page.goto(`${base}/`, { waitUntil: 'networkidle' });
-    const sw = await page.evaluate(async () => {
-      if (!('serviceWorker' in navigator)) return { supported: false };
-      await navigator.serviceWorker.ready;
+    check(await page.evaluate(() => 'serviceWorker' in navigator), 'service worker is available');
+    await activateServiceWorker(page, 'sw.js');
+    await page.locator('#file').setInputFiles({ name: 'update-survival.wav', mimeType: 'audio/wav', buffer: wavTone(.5) });
+    await page.waitForFunction(() => state.sourceName === 'update-survival.wav' && !document.getElementById('process').disabled);
+    const beforeUpdate = await page.evaluate(async () => {
       await caches.open('unrelated-test-cache');
-      const registration = await navigator.serviceWorker.register('sw.js?cache-isolation-test=1');
-      const candidate = registration.installing || registration.waiting;
-      if (candidate && candidate.state !== 'activated') {
-        await Promise.race([
-          new Promise((resolve) => candidate.addEventListener('statechange', () => {
-            if (candidate.state === 'activated' || candidate.state === 'redundant') resolve();
-          })),
-          new Promise((resolve) => setTimeout(resolve, 10000))
-        ]);
-      }
-      const keys = await caches.keys();
-      return { supported: true, keys };
+      window.__sourceBeforeWorkerUpdate = state.decodedSource;
+      return { frames: state.decodedSource.length, controller: navigator.serviceWorker.controller.scriptURL };
     });
-    check(sw.supported, 'service worker is available');
-    check(sw.keys.includes('unrelated-test-cache'), 'activation preserves unrelated origin caches');
-    check(sw.keys.includes('tf2ve-v5'), 'current app shell cache is populated');
+    // A different URL forces a real worker replacement, even if its bytes
+    // match. Previously this triggered an automatic reload and lost the file.
+    await activateServiceWorker(page, 'sw.js?cache-isolation-test=1');
+    const afterUpdate = await page.evaluate(async () => ({
+      keys: await caches.keys(), controller: navigator.serviceWorker.controller.scriptURL,
+      sameSource: state.decodedSource === window.__sourceBeforeWorkerUpdate,
+      frames: state.decodedSource?.length, sourceName: state.sourceName,
+      processEnabled: !document.getElementById('process').disabled
+    }));
+    check(afterUpdate.controller !== beforeUpdate.controller, 'regression test performs a real service-worker replacement');
+    check(afterUpdate.sameSource && afterUpdate.frames === beforeUpdate.frames && afterUpdate.sourceName === 'update-survival.wav',
+      'worker replacement preserves the loaded audio without reloading');
+    check(afterUpdate.processEnabled, 'worker replacement leaves Process Audio enabled');
+    check(afterUpdate.keys.includes('unrelated-test-cache'), 'activation preserves unrelated origin caches');
+    check(afterUpdate.keys.includes('tf2ve-v6'), 'current app shell cache is populated');
+    // Restore the normal registration while still online. Otherwise reloading
+    // registers sw.js again and races another replacement against file loading.
+    await activateServiceWorker(page, 'sw.js');
+    check(await page.evaluate(() => state.decodedSource === window.__sourceBeforeWorkerUpdate),
+      'restoring the normal worker also preserves the loaded audio');
     await context.setOffline(true);
     await page.reload({ waitUntil: 'domcontentloaded' });
     check((await page.locator('h1').textContent()) === 'TF2 Voice Emulator', 'app shell starts offline');
     await page.locator('#file').setInputFiles({ name: 'offline-tone.wav', mimeType: 'audio/wav', buffer: wavTone(.3) });
-    await page.waitForFunction(() => !document.getElementById('process').disabled);
+    await page.waitForFunction(() => state.sourceName === 'offline-tone.wav' && state.decodedSource && !document.getElementById('process').disabled);
     await page.locator('#process').click();
     await page.waitForFunction(() => !document.getElementById('download').disabled);
     check((await page.locator('#console-out').textContent()).includes('libopus 1.6.1'), 'bundled real codec converts audio offline');
     await context.setOffline(false);
     check(pageErrors.length === 0, 'complete conversion and recording flow has no page errors', pageErrors.join('; '));
+
+    await verifySampleRateMatrix(browser, base);
 
     console.log(`\n${passed} browser checks passed`);
   } finally {

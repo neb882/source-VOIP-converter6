@@ -232,15 +232,9 @@
     // Offline/PWA support — only meaningful over http(s), not file://
     if ('serviceWorker' in navigator && location.protocol.indexOf('http') === 0) {
       navigator.serviceWorker.register('sw.js').catch(function () {});
-      // When a new worker takes over an already-open tab, reload once so the
-      // page runs the fresh assets. Guarded so a first-ever install (no prior
-      // controller) doesn't reload, and it never loops.
-      var hadController = !!navigator.serviceWorker.controller, reloaded = false;
-      navigator.serviceWorker.addEventListener('controllerchange', function () {
-        if (reloaded || !hadController) return;
-        reloaded = true;
-        window.location.reload();
-      });
+      // A worker update must not reload an active session: selected files,
+      // recordings and rendered audio only exist in memory. New page code
+      // takes effect on the user's next navigation or explicit refresh.
     }
   </script>
 </body>
