@@ -1,0 +1,74 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    devDependencies:
+      libopus-wasm:
+        specifier: 0.4.0
+        version: 0.4.0
+      mpg123-decoder:
+        specifier: 0.4.8
+        version: 0.4.8
+      playwright:
+        specifier: 1.61.1
+        version: 1.61.1
+
+packages:
+
+  '@eshaz/web-worker@1.2.1':
+    resolution: {integrity: sha512-v5AKAVtM0toVD2rDCGjzhySWlXG/sG5HVialdzrxFKTAnFZNCjQelX0n2tPK0tE86jf4s3hpWlpRtOh8OObktg==}
+
+  '@wasm-audio-decoders/common@9.0.1':
+    resolution: {integrity: sha512-s4KxPsxhD6e+EtjmHPzTmKJSJTEXHGYlBzUGGLN/plV01x3RecybW73nIMtdLLXL8k/zQ8HYFcA6d9lqCJcDjQ==}
+
+  fsevents@2.3.2:
+    resolution: {integrity: sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==}
+    engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
+    os: [darwin]
+
+  libopus-wasm@0.4.0:
+    resolution: {integrity: sha512-k7XznZMcDSgIl7uHdiCdIPaPfVLslf3C90jcJIEiC5OLK2Qy+M2CMmeAokDca6bbYRnSCVZ9/sUEOSfDrX60Qw==}
+    engines: {node: '>=22'}
+
+  mpg123-decoder@0.4.8:
+    resolution: {integrity: sha512-HXs8vbPjiFM0NOZ45T3C5i7mpYGEYhjH37SnFA907lOb9c93DQL40cDjerxj65IMwAYyPFq1aUjtDOjyR7O0gQ==}
+
+  playwright-core@1.61.1:
+    resolution: {integrity: sha512-h7Qlt6m4REp25qvIdvbDtVmD4LqVXfpRxhORv9L0jzETM05p4fuPJ3dKyuSXQxDSbXnmS79HAgi9589lGSpLkg==}
+    engines: {node: '>=18'}
+    hasBin: true
+
+  playwright@1.61.1:
+    resolution: {integrity: sha512-DWnY5o3YbLWK4GovuAVwpqL+1VwGNdUGrRr++8j8PtQQzvAVZUIMjKQ90fY689sEJZJBbZVw1rXaOKSTitkzPQ==}
+    engines: {node: '>=18'}
+    hasBin: true
+
+snapshots:
+
+  '@eshaz/web-worker@1.2.1': {}
+
+  '@wasm-audio-decoders/common@9.0.1':
+    dependencies:
+      '@eshaz/web-worker': 1.2.1
+
+  fsevents@2.3.2:
+    optional: true
+
+  libopus-wasm@0.4.0: {}
+
+  mpg123-decoder@0.4.8:
+    dependencies:
+      '@wasm-audio-decoders/common': 9.0.1
+
+  playwright-core@1.61.1: {}
+
+  playwright@1.61.1:
+    dependencies:
+      playwright-core: 1.61.1
+    optionalDependencies:
+      fsevents: 2.3.2
