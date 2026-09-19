@@ -1,97 +1,91 @@
 # TF2 Voice Emulator
 
-A browser-based emulation of the Source engine / Team Fortress 2 voice-chat pipeline. Drop in any audio file and it comes out the other end sounding like it was screamed through a clipped mic, crushed by `vaudio_celt`, sent over a lossy connection, and played back to a listener standing in a 2fort sewer.
+Local TF2-inspired voice conversion. The default Steam-inspired profile uses a **real bundled Opus encoder and decoder**. Legacy CELT-style and narrowband profiles are explicitly approximate effects. Audio stays on your computer; no uploads or runtime CDN dependencies.
 
-Everything runs locally in the browser — no uploads, no server, no Web Audio dependency in the processing path.
+## Run or publish
 
-## Quick start
-
-Serve the folder over HTTP, pick an audio file — or hit **🎤 Mic** and record yourself — then **Process Audio**. Use the quick presets (`Modern`, `Legacy CELT`, `Mic Spam`, `2fort Sewers`, `Laggy`) or open **Advanced controls** to tune individual settings. The A/B button switches instantly between processed and original audio, BARS/SPEC switches the visualizer, and the collapsible developer console accepts Source-style cvars (`help` lists them, commands chain with `;`, `alias` works).
+Development requires Node 22+ and pnpm:
 
 ```sh
-pnpm install
+pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-Opening `index.html` directly still works through a compatibility path, but serving it enables the processing worker, microphone permissions, installability, and offline support. Inputs are limited to 100 MB and 10 minutes to keep browser memory predictable; microphone recordings stop automatically at 5 minutes.
+For GitHub Pages, copy this project into your repository and enable Pages from the root of your publishing branch. No build is required. **Keep `.nojekyll`, `vendor/`, `opus-codec.mjs`, `audio-worker.js` and `mic-capture.js`** alongside the HTML, CSS, other scripts and icons. `node_modules/` is not needed on the website.
 
-Served over http(s) the page is an installable, offline-capable PWA. For the `steam` codec the pipeline uses the browser's **real Opus encoder** (WebCodecs) when available, falling back to the built-in emulation elsewhere (`snd_real_opus 0` forces the emulation).
+Use HTTPS or localhost. Opening `index.html` as a local file does not reliably support codec modules or microphone capture. After the app and its service worker load, conversion works offline.
 
-## How the pipeline works
+Choose a file or record, select a preset, process, and download the mono 16-bit PCM WAV. Microphone capture uses uncompressed PCM, avoiding an extra lossy codec pass. Limits: 100 MB / 10 minutes for files, 5 minutes for recording. Uploaded format support depends on the browser.
 
-The chain in `audio.js` mirrors the real engine path:
+## Processing and controls
 
-1. **Capture** — downmix to mono, mic gain, then a hard clip at full scale (the classic Windows "+20 dB mic boost" distortion).
-2. **Encode** — anti-aliased resample to the codec rate, sender AGC (Steam voice only), 0.85 pre-emphasis like CELT/Opus, then the sender band-limit filters.
-3. **Codec** — a transform-codec emulation with real CELT mechanics: per 512-sample frame, Bark-band energies are coarse (6 dB) + fine quantized with inter-frame prediction, band shapes are PVQ pulse-quantized under the true bit budget (`vaudio_celt`: 64 bytes/frame at 22050 Hz = exactly 22.05 kbps), and bit-starved bands are reconstructed by spectral folding — the actual source of CELT's low-bitrate warble and birdies.
-4. **Network** — frames are grouped into packets (`net_split` ms each) and dropped by a bursty Gilbert–Elliott loss model; the decoder conceals losses by repeating the last good spectrum with decay, like real CELT PLC.
-5. **Decode** — codec noise floor, matched de-emphasis, anti-imaged upsample to the playback rate.
-6. **Listener** — `voice_scale` gain, an underwater low-pass when submerged, then the `dsp_room` processor chain: DFR allpass diffusors, RVA parallel feedback combs (low-passed, optionally modulated), DLY echoes, AMP tremolo, and MDY modulated delays, with parameters transcribed verbatim from Valve's `dsp_presets.txt` for rooms 0–29.
+1. Average channels to mono; apply microphone gain and modeled saturation.
+2. Resample with a windowed-sinc filter.
+3. Apply capture high-pass and low-pass filters **before encoding**.
+4. Encode real Opus in 20 ms frames, group frames into simulated packets, drop packets with a seeded burst-loss model, and use the decoder's native packet-loss concealment. Sender encoding continues during loss.
+5. Remove the delay reported by the encoder and trim end padding to preserve duration. Real Opus receives no synthetic hiss or additional transform quantization.
+6. Optionally apply modeled RMS voice leveling to Steam profiles, then resample for playback; apply receiver gain, optional underwater/room effects and safety limiting.
 
-Renders are deterministic: the same input and settings always produce the identical output (the loss pattern is seeded).
-When served over HTTP(S), this pipeline runs in a dedicated worker so long renders do not monopolize the interface and can be cancelled immediately.
+`snd_bits` multiplies bitrate: 16 selects the profile's base bitrate; 8 selects half. It changes actual Opus packet sizes and decoded sound. `net_split` groups whole codec frames, rounding to a whole-frame count. `net_jitter` is an artistic crackle effect, not a full jitter-buffer simulation.
 
-## Codec profiles
+Quick presets reset bitrate, codec processing, modeled gain, grouping and jitter. Advanced controls can disable voice leveling to preserve dynamics. It operates after decoding and before user playback gain; the volume control and mute remain effective. The detector uses a 30 ms RMS envelope, 10 ms gain reduction and 50 ms recovery, with bounded gain and protection against boosting tiny codec silence residue. This is an empirical model, not Valve's recovered algorithm. Source-style console names are this app's controls, not exact copies of every game cvar.
 
-| `sv_voicecodec` | Rate | Frame | Bitrate | Notes |
-| --- | --- | --- | --- | --- |
-| `celt_22` | 22 050 Hz | 512 samples (23.2 ms) | 22.05 kbps | vaudio_celt, the classic TF2 sound |
-| `celt_44` | 44 100 Hz | 512 samples (11.6 ms) | 44.1 kbps | vaudio_celt_high |
-| `steam` | 24 000 Hz | ~21 ms | ~32 kbps | Steam voice (Opus era), with sender AGC |
-| `steam_48` | 48 000 Hz | ~21 ms | ~64 kbps | native-rate Steam voice (2021+); fullband codec, capture filtering modeled separately |
-| `speex` | 8 000 Hz | 32 ms | ~8 kbps | legacy narrowband |
+The status line identifies real Opus, an approximate effect, or codec bypass. Failed codec loading reports an error instead of silently changing the sound. `snd_real_opus 0` explicitly selects the approximate transform for Steam profiles; shared configurations retain this choice.
 
-`snd_bits` scales the per-frame byte budget (16 = stock rate; lower values starve the codec and get progressively more warbly).
+## Profiles and accuracy
 
-## Sharing and saving
+| Profile | Processing | Status |
+| --- | --- | --- |
+| Modern / `steam` | Real Opus, 24 kHz mono, 32 kbps, 20 ms | Steam-inspired historical baseline |
+| `steam_48` | Real Opus, 48 kHz mono, 64 kbps, 20 ms | Experimental; not a verified TF2-era preset |
+| `celt_22` | 22.05 kHz STFT/PVQ effect | Approximate, not original CELT |
+| `celt_44` | 44.1 kHz STFT/PVQ effect | Approximate, not original CELT |
+| `speex` | 8 kHz narrowband transform effect | Not real Speex/CELP |
 
-`writeconfig` copies a URL that encodes every setting in the hash — opening it restores the exact configuration. `preset_save <name>` / `preset_load <name>` / `preset_list` / `preset_delete <name>` manage named presets in localStorage, and console command history persists across sessions. `net_jitter <0-50>` adds late-packet crackle (buffer-starvation pops) on top of the burst-loss model.
+Modern follows the 24 kHz / 32 kbps observations in [this 2021 Steam voice investigation](https://zhenyangli.me/posts/reversing-steam-voice-codec/), not a claim about every game version. Runtime: **libopus 1.6.1 via libopus-wasm 0.4.0**, newer than the supplied 2024 reference. Settings: VOIP application, automatic signal selection, constant bitrate, complexity 10, no DTX or in-band FEC. These are reproducible choices, not all verified Valve settings.
 
-## Hosting
+The Modern and Laggy presets now use unity input gain and a gentler 40 Hz high-pass filter. These and RMS voice leveling improve measured bass balance and level variation against the supplied 2026 loopback/music pairs. The 11 kHz low-pass and codec configuration are unchanged. See [the reproducible comparison notes](tests/REFERENCE_2026.md).
 
-Everything is static: push to GitHub, enable **Settings → Pages → Deploy from branch**, and it's live. The included service worker (`sw.js`) makes it work offline and installable on phones. A GitHub Action (`.github/workflows/test.yml`) runs the verification suite on every push.
+Capture gain, EQ, voice leveling and room processing remain models. Room values come from [Valve's preset data mirrored by Facepunch](https://github.com/Facepunch/garrysmod/blob/master/garrysmod/scripts/dsp_presets.txt); copied parameters do not reproduce the engine's processor implementations. Legacy transform budgets are estimates, not real encoded bitstreams. Exact historical matching still requires matching codec versions, capture processing and engine validation.
 
-## Files
+The same decoded PCM, settings and pinned runtime produce repeatable conversion. Compressed-file decoding and microphone hardware can vary between browsers/devices.
 
-`audio.js` is the pure-DSP core (FFT, resampler, transform codec, Source DSP processors). `audio-worker.js` runs that same core off the main thread. `constants.js` holds the codec profiles and Valve DSP preset data. `script.js` is the UI glue: validated config, console, cvars, visualizer, and net graph. `tests/verify.js` covers the DSP core; `tests/browser.verify.js` covers the complete browser/PWA flow.
+## Reference recordings
+
+The owner attributes `real tf2 VOIP recording 2024.mp3` to [this TF2 video](https://www.youtube.com/watch?v=nqXpT5uNdT8). The supplied clip is approximately 59.98 seconds, stereo, 44.1 kHz, with game audio mixed in. That rate describes the MP3, not the voice codec. The audio is not distributed with this project.
+
+```sh
+pnpm analyze:reference "path/to/recording.mp3" "https://www.youtube.com/watch?v=nqXpT5uNdT8"
+```
+
+The analyzer reports mixed levels and centered listening candidates using averaged spectral power. Centered game sounds survive its mid/side gate, and energy rolloff does not identify a voice filter cutoff. It makes **no automatic codec, bitrate or filter recommendations**. Re-encoding this already-compressed mix is not a fidelity comparison.
+
+The owner also supplied `tf2 VOIP test 2026 pure.mp3`: approximately 170.76 seconds, 48 kHz stereo, effectively mono. They recorded it using `voice_loopback 1` in a private server, playing two supplied music MP3s through a virtual audio cable, with default game settings and unchanged volume. Those exact source files make a paired comparison possible. None of the recordings or music files is distributed here.
+
+```sh
+pnpm compare:reference "path/to/loopback.mp3" "path/to/source-one.mp3" "path/to/source-two.mp3"
+```
+
+The paired tool finds repeated timeline-consistent matches, estimates timing drift, corrects fractional timing with a band-limited filter, and compares aligned spectra and short-time levels. It checks both stereo-average and left-channel input because the cable's channel routing is unverified. Spectral gain is normalized at 300–3000 Hz to separate volume from tonal balance; this is not perceptual loudness matching. It retains the former preset as a reproducible baseline and also reports second-half consistency checks, **not an independent holdout validation**. The automated alignment tests do not need the private audio.
+
+Paired music checks have now been performed, but this is not proof of an exact TF2 codec match. Loopback does not validate a real network's packet-loss behavior, MP3 capture adds another lossy stage, and capture/channel settings are not fully known. For further validation, record paired **lossless speech** before and after TF2, with unrelated game sounds muted, and record TF2/Steam versions, codec, capture settings, gain and room state. Compare level-matched speech, sibilants, quiet passages, clipping and loss.
 
 ## Tests
 
-Run the fast DSP suite under plain Node:
-
-```
+```sh
 pnpm test
-```
-
-Run the full DSP and Chromium integration suite with:
-
-```
 pnpm exec playwright install chromium
 pnpm test:all
 ```
 
-The tests check level sanity through every stage, codec bitrate behaviour, bass retention, every room preset, burst-loss statistics, PLC, AGC, band-limiting, determinism, malformed options, resampling, and WAV integrity. Browser checks cover malformed share links and storage, accessible labeling, safe console rendering, worker processing and cancellation, responsive layout, cache isolation, and offline startup.
+Tests cover boundary pulse timing, partial frames, actual bitrates/packet sizes, packet parsing, native concealment, duration, silence, mute, determinism, pre-encoder filtering, bounded RMS leveling, all room presets 0–29, loss statistics, resampling and WAV structure. Paired-reference tests cover delay, polarity, gain, clock drift, repeated-phrase rejection, fractional-delay frequency preservation and silent-input rejection. Chromium checks cover sample content, worker parity, cancellation, PCM recording, offline conversion, configuration safety and accessibility. Automated microphone tests use synthetic input, not a physical device.
 
-For a local mixed-gameplay reference recording, run:
+These tests establish implementation behavior, not perceptual equivalence to TF2. CI runs Node 22 and Chromium.
 
-```
-pnpm analyze:reference "path/to/recording.mp3"
-```
+`pnpm vendor:opus` copies the pinned runtime and notices verbatim; `pnpm test:vendor` checks the vendored files against the installed dependency. The runtime and licenses are required distribution files.
 
-The report identifies centered speech-like time windows, dynamics, stereo separation, spectral rolloff, and a conservative Modern-preset low-pass suggestion. Reference audio remains local and is never copied into the project.
+## Files and licensing
 
-## Browser support
+`audio.js` orchestrates DSP; `opus-codec.mjs` handles packets and delay; `audio-worker.js` keeps processing cancellable; `mic-capture.js` records PCM. `constants.js` contains presets and `script.js` the interface. Tests and local tooling are under `tests/`.
 
-Current Chromium, Firefox, and Safari releases support the emulated codec path. Real Opus requires the browser WebCodecs audio encoder/decoder; the app reports when it falls back to the deterministic transform emulation. Microphone capture and PWA installation require a secure context (`https://` or localhost).
-
-## Accuracy notes and sources
-
-Codec framing and rates: [Reversing Steam Voice Codec](https://zhenyangli.me/posts/reversing-steam-voice-codec/) and the [voicesend CELT config](https://github.com/arthurdead/voicesend/blob/master/voicecodec_celt.cpp) (22 050 Hz / 512 samples / 64 bytes). DSP room parameters: [Valve's dsp_presets.txt](https://raw.githubusercontent.com/Facepunch/garrysmod/master/garrysmod/scripts/dsp_presets.txt) via the Facepunch mirror.
-
-The supplied mixed 2024 reference supports a centered voice bandwidth reaching roughly 10–11 kHz in its strongest high-band windows, with most speech energy below 5 kHz. Accordingly, the Modern preset uses a 12 kHz sender low-pass while retaining the engine-era 48 kHz Opus profile. Because game audio is baked into that recording, it is treated as a calibration guide rather than a bit-exact ground truth.
-
-The codec stage reproduces CELT's artifact mechanics (band energy quantization, PVQ, folding) on an STFT rather than an MDCT, so it is not bit-exact with the real encoder — compiling libopus/CELT to WASM would close that last gap.
-
-## License
-
-MIT. TF2, Source, Steam, and Team Fortress are trademarks of Valve Corporation; this independent emulator is not affiliated with Valve.
+Application code: MIT. Codec notices: `vendor/libopus/LICENSE`, `COPYING.opus` and `THIRD_PARTY_NOTICES.md`. TF2, Source and Steam are Valve trademarks. This independent tool is not affiliated with Valve.

@@ -201,11 +201,10 @@ const TF2_DATA = {
  * `codec` matches a key in CODEC_PROFILES, `position` matches LISTENER_POSITIONS.
  * ------------------------------------------------------------------------- */
 const PRESETS = {
-  // Modern TF2 (2021+): native-rate Steam Voice (Opus @ 48 kHz), open air.
-  // The supplied mixed 2024 reference has centered voice energy extending to
-  // roughly 10.7 kHz but no reliable content above 12 kHz, so the preset uses
-  // a 12 kHz sender low-pass while the codec profile remains native/fullband.
-  modern:  { codec: 'steam_48',        position: 'open',    hp: 120, lp: 12000, voice_scale: 1.0, gain: 1.3, loss: 0  },
+  // Steam-inspired baseline: the cited 2021 reverse engineering observed
+  // 24 kHz / 32 kbps. Capture EQ/gain are adjustable modeling choices;
+  // the mixed 2024 reference does not establish them or an exact Valve build.
+  modern:  { codec: 'steam',           position: 'open',    hp: 40,  lp: 11000, voice_scale: 1.0, gain: 1.0, loss: 0  },
   // Classic CELT-era TF2: 22 kHz codec, smaller spaces by default.
   legacy:  { codec: 'celt_22',         position: 'hallway', hp: 200, lp: 8000,  voice_scale: 1.0, gain: 1.6, loss: 0  },
   // Loud mic-spam: pushed gain, in a tunnel for extra reverb drama.
@@ -213,14 +212,14 @@ const PRESETS = {
   // 2fort sewers micspam classic
   sewers:  { codec: 'celt_22',         position: 'water',   hp: 80,  lp: 9000,  voice_scale: 1.0, gain: 2.0, loss: 0  },
   // Terrible connection
-  laggy:   { codec: 'steam',           position: 'open',    hp: 120, lp: 11000, voice_scale: 1.0, gain: 1.3, loss: 18 }
+  laggy:   { codec: 'steam',           position: 'open',    hp: 40,  lp: 11000, voice_scale: 1.0, gain: 1.0, loss: 18 }
 };
 
 // Legacy alias so older console output still matches
 const presets = PRESETS;
 
 /* -------------------------------------------------------------------------
- * Codec profiles — parameters match the real Source engine codecs:
+ * Codec profiles — historical rate references plus modeling choices:
  *
  *   vaudio_celt      : CELT @ 22050 Hz, 512-sample frames (23.2 ms),
  *                      64 bytes/frame = exactly 22.05 kbps
@@ -231,41 +230,40 @@ const presets = PRESETS;
  *   vaudio_speex     : legacy Speex narrowband, 8 kHz, ~8 kbps
  *
  *   sampleRate    : codec's internal rate
- *   frameSamples  : samples per codec frame (power of two; = STFT hop)
- *   bytesPerFrame : bit budget per frame at stock quality (snd_bits 16)
+ *   frameSamples  : hop for the approximate transform only; real Opus is 20 ms
+ *   bytesPerFrame : estimated transform budget, not an encoded packet size
  *   bandLimit     : decoder low-pass edge (Hz)
  *   preEmphasis   : codec pre-emphasis coefficient (CELT/Opus use 0.85),
  *                   matched by de-emphasis at decode
  *   noiseFloor    : tiny additive decoder noise (0..1)
- *   agc           : sender-side automatic gain control (Steam voice)
+ *   agc           : optional modeled receive-side voice leveling
  * ------------------------------------------------------------------------- */
 const CODEC_PROFILES = {
   celt_22: {
-    displayName: 'vaudio_celt (22 kHz / 22 kbps)',
+    displayName: 'CELT-style approximation (22 kHz)',
     sampleRate: 22050, frameSamples: 512, bytesPerFrame: 64,
     bandLimit: 10800, preEmphasis: 0.85, noiseFloor: 0.0009, agc: false
   },
   celt_44: {
-    displayName: 'vaudio_celt_high (44.1 kHz / 44 kbps)',
+    displayName: 'CELT-style approximation (44.1 kHz)',
     sampleRate: 44100, frameSamples: 512, bytesPerFrame: 64,
     bandLimit: 20000, preEmphasis: 0.85, noiseFloor: 0.0003, agc: false
   },
   steam: {
-    displayName: 'Steam Voice (Opus, 24 kHz / 32 kbps)',
+    displayName: 'Steam-inspired Opus (24 kHz / 32 kbps)',
     sampleRate: 24000, frameSamples: 512, bytesPerFrame: 84,
     bandLimit: 11800, preEmphasis: 0.85, noiseFloor: 0.0005, agc: true,
-    webcodecs: 'opus'   // audio.js uses the real Opus codec when available
+    webcodecs: 'opus', opusBitrate: 32000 // historical key; now uses bundled libopus
   },
-  // Post-2021 "native sampling rate" Steam voice: Opus at 48 kHz. Keep the
-  // codec fullband; capture-device and preset filtering are modeled separately.
+  // Optional fullband profile, NOT a verified TF2-era or native-rate preset.
   steam_48: {
-    displayName: 'Steam Voice Native (Opus, 48 kHz)',
+    displayName: 'Fullband Opus (48 kHz / 64 kbps, experimental)',
     sampleRate: 48000, frameSamples: 1024, bytesPerFrame: 170,
     bandLimit: 20000, preEmphasis: 0.85, noiseFloor: 0.0004, agc: true,
     webcodecs: 'opus', opusBitrate: 64000
   },
   speex: {
-    displayName: 'vaudio_speex (narrowband, 8 kHz)',
+    displayName: 'Narrowband effect (8 kHz, not real Speex)',
     sampleRate: 8000, frameSamples: 256, bytesPerFrame: 32,
     bandLimit: 3600, preEmphasis: 0.45, noiseFloor: 0.0020, agc: false
   }

@@ -24,7 +24,7 @@
     </div>
 
     <h1>TF2 Voice Emulator</h1>
-    <p>Source Engine voice pipeline: vaudio_celt / Steam Voice → network → listener dsp_room</p>
+    <p>TF2-inspired voice conversion: real Opus, legacy codec effects, and room acoustics.</p>
 
     <div class="upload-row">
       <input id="file" type="file" accept="audio/*" aria-label="Audio file to process">
@@ -55,11 +55,11 @@
       <div class="control control-wide">
         <label for="codec">Codec [sv_voicecodec]</label>
         <select id="codec">
-          <option value="celt_22" selected>vaudio_celt (22 kHz / 22 kbps)</option>
-          <option value="celt_44">vaudio_celt_high (44 kHz)</option>
-          <option value="steam">Steam Voice (Opus, 24 kHz)</option>
-          <option value="steam_48">Steam Voice Native (Opus, 48 kHz)</option>
-          <option value="speex">vaudio_speex (narrowband, 8 kHz)</option>
+          <option value="steam" selected>Steam-inspired Opus (24 kHz / 32 kbps)</option>
+          <option value="steam_48">Fullband Opus (48 kHz / 64 kbps, experimental)</option>
+          <option value="celt_22">CELT-style effect (22 kHz, approximate)</option>
+          <option value="celt_44">CELT-style effect (44 kHz, approximate)</option>
+          <option value="speex">Narrowband effect (8 kHz, not real Speex)</option>
         </select>
       </div>
 
@@ -82,7 +82,7 @@
 
       <div class="control advanced-control">
         <label for="gain">Mic Gain [voice_overdrive]</label>
-        <input id="gain" type="number" value="1.3" min="0.5" max="5.0" step="0.1">
+        <input id="gain" type="number" value="1.0" min="0.5" max="5.0" step="0.1">
       </div>
 
       <div class="control advanced-control">
@@ -92,7 +92,7 @@
 
       <div class="control advanced-control">
         <label for="hp">Hi-Pass [dsp_hpf]</label>
-        <input id="hp" type="number" value="120" min="0" max="1000">
+        <input id="hp" type="number" value="40" min="0" max="1000">
       </div>
 
       <div class="control advanced-control">
@@ -156,12 +156,20 @@
       </div>
 
       <div class="control advanced-control">
+        <label for="agc">Steam voice leveling [snd_agc]</label>
+        <select id="agc">
+          <option value="1" selected>Reference-tuned RMS leveling</option>
+          <option value="0">Off (preserve input dynamics)</option>
+        </select>
+      </div>
+
+      <div class="control advanced-control">
         <label for="bits">Codec Bitrate [snd_bits, 16 = stock]</label>
         <input id="bits" type="number" value="16" min="4" max="16">
       </div>
 
       <div class="control advanced-control">
-        <label for="frameMs">Frame [net_split ms]</label>
+        <label for="frameMs">Packet grouping [net_split ms]</label>
         <input id="frameMs" type="number" value="20" min="10" max="100">
       </div>
 
@@ -171,10 +179,10 @@
       </div>
 
       <div class="control advanced-control">
-        <label for="warble_on">MDCT Warble [snd_warble]</label>
+        <label for="warble_on">Codec processing [snd_warble]</label>
         <select id="warble_on">
-          <option value="1" selected>On (codec artifact)</option>
-          <option value="0">Off</option>
+          <option value="1" selected>On</option>
+          <option value="0">Bypass codec (filters remain)</option>
         </select>
       </div>
     </div>

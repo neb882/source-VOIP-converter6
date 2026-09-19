@@ -8,6 +8,9 @@ importers:
 
   .:
     devDependencies:
+      libopus-wasm:
+        specifier: 0.4.0
+        version: 0.4.0
       mpg123-decoder:
         specifier: 0.4.8
         version: 0.4.8
@@ -27,6 +30,10 @@ packages:
     resolution: {integrity: sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==}
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
     os: [darwin]
+
+  libopus-wasm@0.4.0:
+    resolution: {integrity: sha512-k7XznZMcDSgIl7uHdiCdIPaPfVLslf3C90jcJIEiC5OLK2Qy+M2CMmeAokDca6bbYRnSCVZ9/sUEOSfDrX60Qw==}
+    engines: {node: '>=22'}
 
   mpg123-decoder@0.4.8:
     resolution: {integrity: sha512-HXs8vbPjiFM0NOZ45T3C5i7mpYGEYhjH37SnFA907lOb9c93DQL40cDjerxj65IMwAYyPFq1aUjtDOjyR7O0gQ==}
@@ -51,6 +58,8 @@ snapshots:
 
   fsevents@2.3.2:
     optional: true
+
+  libopus-wasm@0.4.0: {}
 
   mpg123-decoder@0.4.8:
     dependencies:

@@ -26,7 +26,8 @@ self.addEventListener('message', async (event) => {
       samples: result.samples.buffer,
       sampleRate: result.sampleRate,
       blob: result.blob,
-      realOpus: result.realOpus
+      realOpus: result.realOpus,
+      codecInfo: result.codecInfo
     }, [result.samples.buffer]);
   } catch (error) {
     self.postMessage({

@@ -1,35 +1,17 @@
-/* =========================================================================
- * TF2 Voice Emulator — audio.js  (authentic DSP core, v3)
+/* TF2 Voice Emulator — local DSP and codec orchestration.
  *
- * Pure-DSP module, no Web Audio dependency: deterministic and testable
- * under Node (see tests/verify.js). Consumes CODEC_PROFILES, DSP_PRESETS,
- * LISTENER_POSITIONS from constants.js. Public surface unchanged:
+ * Capture gain/saturation -> resampling -> capture EQ
+ * -> real libopus OR explicitly approximate legacy transform -> packet loss
+ * and concealment -> optional voice leveling -> playback resampling
+ * -> listener gain / modeled room DSP.
  *
- *   TF2Audio.process(audioBuffer, opts) -> Promise<{ samples, sampleRate, blob }>
- *   TF2Audio.encodeWav(samples, rate)   -> Blob (audio/wav)
- *   TF2Audio.bufferToMono(buffer)       -> Float32Array
+ * Real Opus lives in opus-codec.mjs. The legacy transform and room processors
+ * are effects inspired by Source; they are not Valve's implementations.
+ * Same decoded PCM + settings + pinned runtime gives repeatable output.
  *
- * Pipeline (mirrors the real Source voice path):
- *
- *   [capture]  downmix -> mic gain -> hard clip (ADC/mic-boost clipping)
- *   [encode]   anti-aliased resample to codec rate -> (AGC, Steam voice only)
- *              -> pre-emphasis (0.85, like CELT/Opus) -> band-limit ->
- *              TRANSFORM CODEC: per 512-sample frame, band energies are
- *              coarse+fine quantized and band shapes are PVQ-quantized
- *              under the real bit budget (vaudio_celt: 64 bytes/frame at
- *              22050 Hz = 22.05 kbps). Bit-starved bands use spectral
- *              folding — the actual source of CELT's "birdie"/warble sound.
- *   [network]  frames grouped into packets (net_split ms per packet);
- *              packets dropped by a bursty Gilbert-Elliott loss model;
- *              decoder PLC repeats the last good spectrum with decay.
- *   [decode]   noise floor -> matched de-emphasis -> upsample to playback.
- *   [listener] voice_scale -> underwater low-pass (if submerged) ->
- *              Source DSP chain: DFR/RVA/DLY/AMP/MDY processors with
- *              Valve's real dsp_presets.txt parameters -> soft limit.
- *
- * Deterministic: same input + settings -> identical output. Pass opts.seed
- * to vary the packet-loss pattern.
- * ========================================================================= */
+ * TF2Audio.process(buffer, opts) -> { samples, sampleRate, blob, codecInfo }
+ * TF2Audio.encodeWav(samples, rate) -> 16-bit mono WAV
+ */
 
 (function () {
   'use strict';
@@ -276,19 +258,20 @@
     return out;
   }
 
-  // Simple AGC modelling Steam voice preprocessing: slow gain rise, fast
-  // gain drop, targets ~-18 dBFS RMS.
-  function applyAGC(samples, rate) {
-    const target = 0.12;
-    const envA = Math.exp(-1 / (0.050 * rate));   // 50 ms envelope
-    const upA  = Math.exp(-1 / (0.400 * rate));   // gain rises slowly
-    const dnA  = Math.exp(-1 / (0.015 * rate));   // gain drops fast
+  // Modeled receive-side leveling, informed by paired 2026 loopback/music
+  // recordings, NOT Valve's recovered implementation. RMS detection after
+  // decoding avoids making bass filtering increase output volume swings.
+  // Ignore the codec's tiny silence residual instead of amplifying it.
+  function applyVoiceLevel(samples, rate) {
+    const target = 0.10;
+    const envA = Math.exp(-1 / (0.030 * rate));
+    const upA  = Math.exp(-1 / (0.050 * rate));
+    const dnA  = Math.exp(-1 / (0.010 * rate));
     const out = new Float32Array(samples.length);
-    let env = target, gain = 1;
+    let energy = 0, gain = 1;
     for (let i = 0; i < samples.length; i++) {
-      const a = Math.abs(samples[i]);
-      env = Math.max(a, env * envA + a * (1 - envA));
-      const want = clamp(target / Math.max(env, 1e-4), 0.25, 6);
+      energy = energy * envA + samples[i] * samples[i] * (1 - envA);
+      const want = energy < 1e-8 ? 1 : clamp(target / Math.sqrt(energy), 0.05, 10);
       const alpha = want < gain ? dnA : upA;
       gain = gain * alpha + want * (1 - alpha);
       out[i] = samples[i] * gain;
@@ -299,15 +282,15 @@
   /* ==================================================================== */
   /* TRANSFORM CODEC EMULATION                                            */
   /*                                                                      */
-  /* CELT/Opus are MDCT codecs: per frame they quantize each critical     */
+  /* CELT-inspired effect: per frame we quantize each critical           */
   /* band's energy (coarse 6 dB steps + fine bits) and the band's shape   */
   /* as a PVQ pulse vector, under a fixed bit budget. Bands that get no   */
   /* shape bits are reconstructed by FOLDING spectrum up from lower       */
   /* bands — that folding is the signature low-bitrate warble/birdies.    */
   /*                                                                      */
-  /* We do the same thing on an STFT (sqrt-Hann, 50% overlap, hop =       */
-  /* codec frame = 512 samples for vaudio_celt). Not bit-exact CELT, but  */
-  /* the same artifact mechanics under the same 64-byte/frame budget.     */
+  /* This approximation uses an STFT (sqrt-Hann, 50% overlap, hop =      */
+  /* 512 samples for the CELT-style presets). This is neither bit-exact  */
+  /* CELT nor a verified perceptual match; no real bitstream is emitted. */
   /* ==================================================================== */
 
   // Bark-style band edges (Hz), same layout family CELT uses.
@@ -551,13 +534,18 @@
   /* ------------------------------------------------------------------ */
 
   function buildLossMask(nFrames, framesPerPacket, lossPct, rand) {
-    const p = clamp(lossPct / 100, 0, 1);
+    nFrames = Math.max(0, Math.floor(finiteOr(nFrames, 0)));
+    framesPerPacket = Math.max(1, Math.round(finiteOr(framesPerPacket, 1)));
+    rand = typeof rand === 'function' ? rand : mulberry32(0xC0FFEE);
+    const p = clamp(finiteOr(lossPct, 0) / 100, 0, 1);
     if (p <= 0 || nFrames <= 0) return null;
     const mask = new Uint8Array(nFrames);
     if (p >= 1) { mask.fill(1); return mask; }
     const meanBurst = 2.2;                       // packets per loss burst (avg)
-    const pBG = 1 / meanBurst;                   // leave bad state
-    const pGB = Math.min(0.98, pBG * p / (1 - p)); // enter bad state
+    // At high loss rates, increase burst length instead of clipping the
+    // requested stationary loss probability to ~68%.
+    const pBG = Math.min(1 / meanBurst, 0.98 * (1 - p) / p);
+    const pGB = pBG * p / (1 - p);
     let bad = rand() < p;
     for (let f = 0; f < nFrames; f += framesPerPacket) {
       if (bad) {
@@ -586,126 +574,25 @@
     return out;
   }
 
-  function rmsOf(x) {
-    let s = 0;
-    for (let i = 0; i < x.length; i++) s += x[i] * x[i];
-    return Math.sqrt(s / Math.max(1, x.length));
-  }
-
-  // Steep (-36 dB/oct) high-passed RMS — used to detect narrowband results
-  // without bass leakage skewing the comparison.
-  function steepHfRms(x, rate, f0) {
-    let y = x;
-    for (let i = 0; i < 3; i++) y = applyBiquad(y, biquadCoefs('highpass', rate, f0, 0.707));
-    return rmsOf(y);
-  }
-
-  /* Real Opus round-trip via WebCodecs (browser-only). Used for the
-   * Steam-voice profile when available: genuine Opus coloration instead of
-   * the emulation. Returns null on any failure — including a result that
-   * lost its top octaves (some encoders pick a narrowband VOIP mode) — so
-   * callers can fall back to the emulation. */
-  async function realOpusRoundTrip(samples, rate, bitrate) {
-    if (typeof AudioEncoder === 'undefined' || typeof AudioDecoder === 'undefined') return null;
-    let encoder = null, decoder = null;
-    let outs = [];
-    try {
-      // Encode at Opus's native 48 kHz — this is what Steam itself does —
-      // and resample back to the profile rate afterwards. Encoding at other
-      // rates pushes some browser encoders into narrowband VOIP modes.
-      const encRate = 48000;
-      const support = await AudioEncoder.isConfigSupported({
-        codec: 'opus', sampleRate: encRate, numberOfChannels: 1, bitrate
+  // The same pinned codec runs in browsers, workers, and the Node tests.
+  // Tests inject the module because their DSP sandbox has no import loader.
+  let opusModulePromise;
+  function loadOpusModule() {
+    if (typeof TF2Opus !== 'undefined') return Promise.resolve(TF2Opus);
+    if (!opusModulePromise) {
+      opusModulePromise = import('./opus-codec.mjs').catch(error => {
+        opusModulePromise = null;
+        throw new Error('Real Opus could not load. Serve the complete folder over HTTP(S). ' +
+          'No approximate conversion was substituted. ' + error.message);
       });
-      if (!support || !support.supported) return null;
-
-      const up = resampleSinc(samples, rate, encRate);
-
-      const chunks = [];
-      let failed = false;
-      encoder = new AudioEncoder({
-        output: (c) => chunks.push(c),
-        error: () => { failed = true; }
-      });
-      try {
-        // Hint the fullband music path; unknown members are ignored by
-        // implementations that don't support them.
-        encoder.configure({ codec: 'opus', sampleRate: encRate, numberOfChannels: 1,
-                            bitrate, opus: { application: 'audio', signal: 'music' } });
-      } catch (cfgErr) {
-        encoder.configure({ codec: 'opus', sampleRate: encRate, numberOfChannels: 1, bitrate });
-      }
-      const frameLen = Math.round(encRate * 0.02);               // 20 ms frames
-      for (let off = 0; off < up.length; off += frameLen) {
-        const n = Math.min(frameLen, up.length - off);
-        const data = up.slice(off, off + n);
-        const ad = new AudioData({
-          format: 'f32', sampleRate: encRate, numberOfFrames: n,
-          numberOfChannels: 1, timestamp: Math.round(off / encRate * 1e6), data
-        });
-        try { encoder.encode(ad); }
-        finally { ad.close(); }
-      }
-      await encoder.flush();
-      encoder.close();
-      encoder = null;
-      if (failed || !chunks.length) return null;
-
-      outs = [];
-      decoder = new AudioDecoder({
-        output: (a) => outs.push(a),
-        error: () => { failed = true; }
-      });
-      decoder.configure({ codec: 'opus', sampleRate: encRate, numberOfChannels: 1 });
-      for (const c of chunks) decoder.decode(c);
-      await decoder.flush();
-      decoder.close();
-      decoder = null;
-      if (failed || !outs.length) return null;
-
-      let total = 0;
-      for (const a of outs) total += a.numberOfFrames;
-      const dec = new Float32Array(total);
-      let w = 0;
-      for (const a of outs) {
-        const tmp = new Float32Array(a.numberOfFrames);
-        a.copyTo(tmp, { planeIndex: 0, format: 'f32-planar' });
-        dec.set(tmp, w);
-        w += a.numberOfFrames;
-        a.close();
-      }
-      outs = [];
-      // Align to the encoder input length (lookahead lands at the head),
-      // then bring the result back to the profile rate.
-      let aligned;
-      if (dec.length >= up.length) {
-        const offset = dec.length - up.length;
-        aligned = dec.slice(offset, offset + up.length);
-      } else {
-        aligned = new Float32Array(up.length);
-        aligned.set(dec);
-      }
-      const down = resampleSinc(aligned, encRate, rate);
-      const out = down.length === samples.length ? down : (() => {
-        const o = new Float32Array(samples.length);
-        o.set(down.subarray(0, Math.min(down.length, samples.length)));
-        return o;
-      })();
-
-      // Leak-proof narrowband check: steep-filtered HF must survive within
-      // ~9 dB of the input, otherwise the encoder went phone-band and the
-      // emulation will sound far more authentic.
-      const hfIn = steepHfRms(samples, rate, 4500);
-      const hfOut = steepHfRms(out, rate, 4500);
-      if (hfIn > 1e-4 && hfOut < hfIn * 0.35) return null;
-      return out;
-    } catch (e) {
-      return null;
-    } finally {
-      try { if (encoder && encoder.state !== 'closed') encoder.close(); } catch (e) {}
-      try { if (decoder && decoder.state !== 'closed') decoder.close(); } catch (e) {}
-      for (const output of outs) { try { output.close(); } catch (e) {} }
     }
+    return opusModulePromise;
+  }
+
+  // Compatibility helper for external callers; no browser-dependent fallback.
+  async function realOpusRoundTrip(samples, rate, bitrate, options = {}) {
+    const opus = await loadOpusModule();
+    return (await opus.roundTrip(samples, rate, bitrate, options)).samples;
   }
 
   function addNoiseFloor(samples, level, rand) {
@@ -949,9 +836,10 @@
    *   listenerPos:  key of LISTENER_POSITIONS. Overrides dspRoom.
    *   dspRoom:      numeric id into DSP_PRESETS (when listenerPos absent)
    *   customEnv:    { duration, decay, mix } override for DSP_PRESETS[99]
-   *   micGain:      pre-codec gain (mic boost; >1 clips like a real mic) [1.2]
+   *   micGain:      pre-codec gain (mic boost; >1 can saturate input)   [1.0]
    *   voiceScale:   post-codec receiver gain (voice_scale)              [1.0]
-   *   hp / lp:      sender-side HP/LP in Hz                             [120 / 11000]
+   *   hp / lp:      sender-side HP/LP in Hz                             [40 / 11000]
+   *   agc:          modeled receive-side RMS leveling for Steam        [true]
    *   bits:         bitrate scale — 16 = stock rate (64 B/frame for     [16]
    *                 vaudio_celt), lower = starved and warbly
    *   lossPct:      simulated packet loss %                             [0]
@@ -964,11 +852,13 @@
    */
   async function process(audioBuffer, opts = {}) {
     if (!audioBuffer || typeof audioBuffer.getChannelData !== 'function' ||
-        !Number.isFinite(audioBuffer.sampleRate) || audioBuffer.sampleRate <= 0) {
+        !Number.isFinite(audioBuffer.sampleRate) || audioBuffer.sampleRate <= 0 ||
+        !Number.isInteger(audioBuffer.length) || audioBuffer.length < 0 ||
+        !Number.isInteger(audioBuffer.numberOfChannels) || audioBuffer.numberOfChannels < 1) {
       throw new TypeError('TF2Audio.process requires a valid AudioBuffer-like source.');
     }
     const codecKey = opts.codec || 'celt_22';
-    const codec = CODEC_PROFILES[codecKey] || CODEC_PROFILES.celt_22;
+    const codec = Object.hasOwn(CODEC_PROFILES, codecKey) ? CODEC_PROFILES[codecKey] : CODEC_PROFILES.celt_22;
 
     // Resolve listener position / dsp_room -> preset id (copy + merge 99)
     let dspId = 0;
@@ -992,9 +882,9 @@
     }
     const listenerCfg = opts.listenerPos ? LISTENER_POSITIONS[opts.listenerPos] : null;
 
-    const micGain      = clamp(finiteOr(opts.micGain, 1.2), 0, 20);
+    const micGain      = clamp(finiteOr(opts.micGain, 1.0), 0, 20);
     const voiceScale   = clamp(finiteOr(opts.voiceScale, 1.0), 0, 4);
-    const hp           = clamp(finiteOr(opts.hp, 120), 0, codec.sampleRate * 0.45);
+    const hp           = clamp(finiteOr(opts.hp, 40), 0, codec.sampleRate * 0.45);
     const lp           = clamp(finiteOr(opts.lp, Math.min(codec.bandLimit, 11000)), 100, codec.sampleRate * 0.49);
     const bits         = clamp(finiteOr(opts.bits, 16), 2, 32);
     const lossPct      = clamp(finiteOr(opts.lossPct, 0), 0, 100);
@@ -1005,7 +895,8 @@
     const srcRate = audioBuffer.sampleRate;
     const codecRate = codec.sampleRate;
     const playbackRate = Math.max(22050, srcRate);
-    const frameSamples = codec.frameSamples;
+    const useRealOpus = enableWarble && codec.webcodecs === 'opus' && opts.realCodec !== false;
+    const frameSamples = useRealOpus ? codecRate / 50 : codec.frameSamples;
     const frameDurMs = 1000 * frameSamples / codecRate;
     const netFrameMs = clamp(finiteOr(opts.frameMs, frameDurMs), 5, 200);
     const framesPerPacket = clamp(Math.round(netFrameMs / frameDurMs), 1, 8);
@@ -1016,6 +907,8 @@
 
     /* ---- 1) Capture: downmix + mic gain + ADC hard clip ---- */
     let samples = bufferToMono(audioBuffer);
+    const playbackLength = Math.round(samples.length * playbackRate / srcRate);
+    if (!samples.every(Number.isFinite)) throw new TypeError('Source PCM contains a non-finite sample.');
     if (micGain !== 1) {
       for (let i = 0; i < samples.length; i++) samples[i] *= micGain;
     }
@@ -1026,23 +919,10 @@
     report(0.05);
     await yieldUI();
 
-    /* ---- 2) Resample to codec rate; Steam voice runs AGC ---- */
+    /* ---- 2) Resample to codec rate ---- */
     samples = resampleSinc(samples, srcRate, codecRate);
-    if (codec.agc) samples = applyAGC(samples, codecRate);
 
-    // Steam profile: try the REAL Opus codec (WebCodecs) on the clean,
-    // un-emphasised signal — the engine feeds Opus raw PCM and Opus does
-    // its own internal pre-emphasis. When it succeeds we skip our own
-    // pre/de-emphasis and quantization entirely; the transform stage then
-    // only applies network loss + PLC on top of the genuine Opus render.
-    let realCoded = false;
-    if (enableWarble && codec.webcodecs === 'opus' && opts.realCodec !== false) {
-      const rt = await realOpusRoundTrip(samples, codecRate, codec.opusBitrate || 32000);
-      if (rt) { samples = rt; realCoded = true; }
-    }
-    if (!realCoded) samples = preEmphasis(samples, codec.preEmphasis);
-
-    /* ---- 3) Sender band-limit ---- */
+    /* ---- 3) Capture filters BEFORE either encoder ---- */
     if (hp > 10) {
       samples = applyBiquad(samples, biquadCoefs('highpass', codecRate, hp, 0.707));
     }
@@ -1052,12 +932,31 @@
     report(0.30);
     await yieldUI();
 
-    /* ---- 4) Transform codec + network loss + PLC ---- */
-    const nFrames = Math.ceil(samples.length / frameSamples) + 2;
-    const lossMask = buildLossMask(nFrames, framesPerPacket, lossPct, rand);
-    samples = await transformCodec(samples, codecRate, frameSamples,
-                                   enableWarble && !realCoded, bytesPerFrame, lossMask,
-                                   (f) => report(0.30 + 0.45 * Math.min(1, f)));
+    /* ---- 4) Encode -> lose packets -> decode / conceal loss ---- */
+    let codecInfo = { backend: enableWarble ? 'approximation' : 'bypass',
+      frameSamples, frameMs: frameDurMs, plc: 'spectral-approximation' };
+    if (useRealOpus) {
+      const opus = await loadOpusModule();
+      const bitrate = Math.round((codec.opusBitrate || 32000) * bits / 16);
+      const result = await opus.roundTrip(samples, codecRate, bitrate, {
+        makeLossMask: count => buildLossMask(count, framesPerPacket, lossPct, rand),
+        yieldControl: microYield,
+        onProgress: f => report(0.30 + 0.45 * f)
+      });
+      samples = result.samples;
+      codecInfo = result.info;
+    } else {
+      const nFrames = Math.ceil(samples.length / frameSamples) + 2;
+      const lossMask = buildLossMask(nFrames, framesPerPacket, lossPct, rand);
+      samples = preEmphasis(samples, codec.preEmphasis);
+      samples = await transformCodec(samples, codecRate, frameSamples,
+        enableWarble, bytesPerFrame, lossMask,
+        f => report(0.30 + 0.45 * Math.min(1, f)));
+      // This noise is an optional artistic part of the legacy approximation.
+      // Do not add synthetic hiss to real Opus or the clean bypass.
+      if (enableWarble && micGain > 0) samples = addNoiseFloor(samples, codec.noiseFloor, rand);
+      samples = deEmphasis(samples, codec.preEmphasis);
+    }
     report(0.75);
     await yieldUI();
 
@@ -1067,12 +966,17 @@
                                    frameSamples * framesPerPacket, jitterPct, rand);
     }
 
-    /* ---- 5) Decode: noise floor + matched de-emphasis ---- */
-    samples = addNoiseFloor(samples, codec.noiseFloor, rand);
-    if (!realCoded) samples = deEmphasis(samples, codec.preEmphasis);
+    /* ---- 5) Modeled voice leveling, before user playback volume ---- */
+    if (codec.agc && opts.agc !== false) samples = applyVoiceLevel(samples, codecRate);
 
     /* ---- 6) Upsample to playback rate ---- */
     samples = resampleSinc(samples, codecRate, playbackRate);
+    // Two rounded resampling lengths can otherwise drop/add a source sample.
+    if (samples.length !== playbackLength) {
+      const aligned = new Float32Array(playbackLength);
+      aligned.set(samples.subarray(0, playbackLength));
+      samples = aligned;
+    }
     report(0.85);
     await yieldUI();
 
@@ -1097,7 +1001,7 @@
 
     const blob = encodeWav(samples, playbackRate);
     report(1);
-    return { samples, sampleRate: playbackRate, blob, realOpus: realCoded };
+    return { samples, sampleRate: playbackRate, blob, realOpus: useRealOpus, codecInfo };
   }
 
   /* ------------------------------------------------------------------ */
@@ -1141,6 +1045,7 @@
     resampleLinear,
     resampleSinc,
     softLimit,
+    applyVoiceLevel,
     hardClip,
     biquadCoefs,
     applyBiquad,

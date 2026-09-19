@@ -50,6 +50,7 @@ const els = {
   hp:        document.getElementById('hp'),
   lp:        document.getElementById('lp'),
   bits:      document.getElementById('bits'),
+  agc:       document.getElementById('agc'),
   loss:      document.getElementById('loss'),
   frameMs:   document.getElementById('frameMs'),
   warble:    document.getElementById('warble_on'),
@@ -82,8 +83,8 @@ const state = {
   vizMode: 'bars',       // 'bars' or 'spec' (spectrogram)
   sourceName: null,      // name of the loaded clip (file or mic)
   netJitter: 0,          // net_jitter cvar (console-only)
-  realOpus: 1,           // snd_real_opus: WebCodecs Opus for the steam codec
-  recorder: null,        // active MediaRecorder
+  realOpus: 1,           // snd_real_opus: bundled libopus; 0 explicitly selects approximation
+  recorder: null,        // active PCM capture session
   recTick: null,         // recording timer interval
   processing: false,
   worker: null,
@@ -303,7 +304,7 @@ const cvars = {
     }
   },
   'snd_real_opus': {
-    val: 1, help: 'Use real Opus (WebCodecs) for the steam codec when available',
+    val: 1, help: 'Use bundled real Opus; 0 explicitly selects an approximate effect',
     action: (v) => {
       const n = parseInt(v);
       if (!isNaN(n)) state.realOpus = n ? 1 : 0;
@@ -482,6 +483,7 @@ const cvars = {
   'dsp_hpf':         { help: 'Sender high-pass filter cutoff', link: 'hp' },
   'dsp_lpf':         { help: 'Sender low-pass filter cutoff',  link: 'lp' },
   'snd_bits':        { help: 'Codec bitrate scale (16 = stock)', link: 'bits' },
+  'snd_agc':         { help: 'Reference-tuned RMS voice leveling for Steam profiles (0 = off)', link: 'agc' },
   'net_fakeloss':    { help: 'Simulated packet loss %',        link: 'loss' },
   'net_split':       { help: 'Packet frame size in ms',        link: 'frameMs' },
   'snd_warble':      { help: 'Enable codec quantization (0 = clean)', link: 'warble_on' },
@@ -641,6 +643,12 @@ function runPreset(name) {
   execCommand(`voice_scale ${p.voice_scale}`);
   execCommand(`voice_overdrive ${p.gain}`);
   execCommand(`net_fakeloss ${p.loss}`);
+  execCommand('snd_bits 16');
+  execCommand('snd_warble 1');
+  execCommand('snd_agc 1');
+  execCommand('snd_real_opus 1');
+  execCommand('net_split 20');
+  execCommand('net_jitter 0');
   state.sv_cheats = tempCheats;
 }
 
@@ -707,12 +715,16 @@ const CONFIG_FIELDS = [
   configControl('hp', els.hp),
   configControl('lp', els.lp),
   configControl('bits', els.bits),
+  configControl('agc', els.agc),
   configControl('frame', els.frameMs),
   configControl('loss', els.loss),
   configControl('warble', els.warble),
   configControl('cdur', els.cDur),
   configControl('cdec', els.cDec),
   configControl('cmix', els.cMix),
+  ['real', () => String(state.realOpus),
+    v => { state.realOpus = Number(v); cvars.snd_real_opus.val = Number(v); },
+    v => ['0', '1'].includes(String(v)) ? String(v) : null],
   ['jit', () => String(state.netJitter),
     (v) => { state.netJitter = Number(v); },
     (v) => { const n = Number(v); return Number.isFinite(n) ? String(Math.min(50, Math.max(0, n))) : null; }]
@@ -799,43 +811,44 @@ function deletePreset(name) {
 /* Source loading (file or microphone)                                */
 /* ------------------------------------------------------------------ */
 
+function mountSource(mono, sampleRate, name) {
+  const duration = mono.length / sampleRate;
+  if (!Number.isFinite(duration) || duration <= 0) throw new Error('the clip has no decodable audio');
+  if (duration > MAX_AUDIO_SECONDS) throw new Error('the clip exceeds the 10 minute limit');
+  state.sourceName = name;
+  if (state.dryBlob) URL.revokeObjectURL(state.dryBlob);
+  if (state.lastBlob) URL.revokeObjectURL(state.lastBlob);
+  state.lastBlob = null;
+  state.processedBuffer = null;
+  state.decodedSource = { sampleRate, duration, length: mono.length,
+    numberOfChannels: 1, getChannelData: () => mono };
+  state.dryBlob = URL.createObjectURL(TF2Audio.encodeWav(mono, sampleRate));
+  els.process.disabled = false;
+  els.dl.disabled = true;
+  els.audio.pause();
+  els.audio.removeAttribute('src');
+  els.audio.load();
+  if (els.audioDry) { els.audioDry.pause(); els.audioDry.removeAttribute('src'); els.audioDry.load(); }
+  els.abToggle.disabled = true;
+  els.abToggle.textContent = 'A/B: Wet';
+  state.abMode = 'wet';
+  setStatus(`${name} · ${duration.toFixed(1)}s · ${sampleRate.toLocaleString()} Hz`, 'success');
+  logLine(`FS_MountFile: "${name}" (${duration.toFixed(1)}s) mounted.`, 'sys');
+}
+
+let sourceLoadId = 0;
 async function loadSourceFromArrayBuffer(ab, name) {
+  const id = ++sourceLoadId;
+  els.process.disabled = true;
   try {
     setStatus(`Decoding ${name}…`);
-    // Reuse one decode context — creating a new AudioContext per file leaks
-    // hardware contexts and starts failing after ~6 loads in Chrome.
     if (!state.decodeCtx) state.decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
     const decoded = await state.decodeCtx.decodeAudioData(ab);
-    if (!Number.isFinite(decoded.duration) || decoded.duration <= 0) throw new Error('the clip has no decodable audio');
-    if (decoded.duration > MAX_AUDIO_SECONDS) {
-      throw new Error(`clip is ${decoded.duration.toFixed(0)}s; the limit is ${MAX_AUDIO_SECONDS / 60} minutes`);
-    }
-    state.sourceName = name;
-    if (state.dryBlob) URL.revokeObjectURL(state.dryBlob);
-    if (state.lastBlob) URL.revokeObjectURL(state.lastBlob);
-    state.lastBlob = null;
-    // Keep one mono copy rather than retaining the decoded multichannel buffer.
-    const mono = TF2Audio.bufferToMono(decoded);
-    state.decodedSource = {
-      sampleRate: decoded.sampleRate,
-      duration: decoded.duration,
-      length: mono.length,
-      numberOfChannels: 1,
-      getChannelData: () => mono
-    };
-    state.dryBlob = URL.createObjectURL(TF2Audio.encodeWav(mono, decoded.sampleRate));
-    els.process.disabled = false;
-    els.dl.disabled = true;
-    els.audio.removeAttribute('src');
-    els.audio.load();
-    // The old processed render no longer matches this source — disable A/B
-    // until the next render finishes.
-    els.abToggle.disabled = true;
-    els.abToggle.textContent = 'A/B: Wet';
-    state.abMode = 'wet';
-    setStatus(`${name} · ${decoded.duration.toFixed(1)}s · ${decoded.sampleRate.toLocaleString()} Hz`, 'success');
-    logLine(`FS_MountFile: "${name}" (${decoded.duration.toFixed(1)}s) mounted.`, 'sys');
+    if (id !== sourceLoadId) return; // A newer selection superseded this decode.
+    if (decoded.duration > MAX_AUDIO_SECONDS) throw new Error('the clip exceeds the 10 minute limit');
+    mountSource(TF2Audio.bufferToMono(decoded), decoded.sampleRate, name);
   } catch (e) {
+    if (id !== sourceLoadId) return;
     logLine(`decodeAudioData failed: ${e.message}`, 'err');
     setStatus(`Could not load audio: ${e.message}`, 'error');
     state.decodedSource = null;
@@ -844,49 +857,84 @@ async function loadSourceFromArrayBuffer(ab, name) {
 }
 
 async function startRecord() {
-  if (state.recorder) return logLine('VoiceRecord: already recording.', 'err');
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined') {
-    return logLine('VoiceRecord: microphone capture unavailable in this browser.', 'err');
+  if (state.recorder || state.processing) return;
+  if (!navigator.mediaDevices?.getUserMedia || typeof AudioWorkletNode === 'undefined') {
+    setStatus('Uncompressed microphone capture requires HTTPS or localhost and AudioWorklet support.', 'error');
+    return;
   }
+  const session = { stop: () => { session.stopRequested = true; } };
+  state.recorder = session;
+  ++sourceLoadId;
+  els.process.disabled = true;
+  els.file.disabled = true;
+  els.mic.textContent = '⏹ Connecting…';
+  let stream, context, source, capture, finished = false;
+  const parts = [];
+  const cleanup = async () => {
+    if (finished) return;
+    finished = true;
+    stream?.getTracks().forEach(t => t.stop());
+    source?.disconnect();
+    capture?.disconnect();
+    if (context && context.state !== 'closed') await context.close();
+    if (state.recorder === session) state.recorder = null;
+    clearInterval(state.recTick); state.recTick = null;
+    els.mic.textContent = '🎤 Mic';
+    els.mic.classList.remove('recording');
+    els.file.disabled = false;
+    els.process.disabled = !state.decodedSource;
+  };
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
     });
-    const rec = new MediaRecorder(stream);
-    const parts = [];
-    rec.ondataavailable = (e) => { if (e.data && e.data.size) parts.push(e.data); };
-    rec.onstop = async () => {
-      stream.getTracks().forEach(t => t.stop());
-      state.recorder = null;
-      clearInterval(state.recTick); state.recTick = null;
-      if (els.mic) { els.mic.textContent = '🎤 Mic'; els.mic.classList.remove('recording'); }
-      const blob = new Blob(parts, { type: rec.mimeType || 'audio/webm' });
-      if (!blob.size) return logLine('VoiceRecord: empty capture.', 'err');
-      await loadSourceFromArrayBuffer(await blob.arrayBuffer(), 'voice_loopback');
+    context = new (window.AudioContext || window.webkitAudioContext)();
+    await context.audioWorklet.addModule('mic-capture.js');
+    source = context.createMediaStreamSource(stream);
+    capture = new AudioWorkletNode(context, 'mic-capture', {
+      processorOptions: { maxSamples: MAX_RECORDING_SECONDS * context.sampleRate }
+    });
+    capture.onprocessorerror = async () => {
+      await cleanup();
+      setStatus('Microphone capture failed. Please record again.', 'error');
     };
-    rec.start();
-    state.recorder = rec;
-    const t0 = performance.now();
-    if (els.mic) {
-      els.mic.classList.add('recording');
-      els.mic.textContent = '⏹ 0s';
-      state.recTick = setInterval(() => {
-        const elapsed = (performance.now() - t0) / 1000;
-        els.mic.textContent = `⏹ ${elapsed.toFixed(0)}s`;
-        if (elapsed >= MAX_RECORDING_SECONDS && state.recorder) stopRecord();
-      }, 250);
-    }
-    logLine('+voicerecord', 'cmd');
+    capture.port.onmessage = async e => {
+      if (finished) return;
+      if (e.data.type === 'samples') parts.push(e.data.data);
+      if (e.data.type === 'complete') {
+        const rate = context.sampleRate;
+        await cleanup();
+        const length = parts.reduce((sum, part) => sum + part.length, 0);
+        if (!length) { setStatus('The microphone recording was empty.', 'error'); return; }
+        const mono = new Float32Array(length);
+        let offset = 0;
+        for (const part of parts) { mono.set(part, offset); offset += part.length; }
+        mountSource(mono, rate, 'microphone');
+      }
+    };
+    source.connect(capture);
+    capture.connect(context.destination); // Worklet outputs silence, never live mic monitoring.
+    session.stop = () => { capture.port.postMessage('stop'); };
+    await context.resume();
+    if (session.stopRequested) session.stop();
+    const started = performance.now();
+    els.mic.classList.add('recording');
+    state.recTick = setInterval(() => {
+      const elapsed = (performance.now() - started) / 1000;
+      els.mic.textContent = `⏹ ${elapsed.toFixed(0)}s`;
+      if (elapsed >= MAX_RECORDING_SECONDS) session.stop();
+    }, 250);
+    setStatus('Recording uncompressed audio…');
+    logLine('+voicerecord (PCM capture)', 'cmd');
   } catch (e) {
-    logLine(`VoiceRecord: mic access denied — ${e.message}`, 'err');
+    await cleanup();
     setStatus(`Microphone unavailable: ${e.message}`, 'error');
+    logLine(`VoiceRecord: ${e.message}`, 'err');
   }
 }
 
 function stopRecord() {
-  if (!state.recorder) return logLine('VoiceRecord: not recording.', 'err');
-  logLine('-voicerecord', 'cmd');
-  state.recorder.stop();
+  if (state.recorder) state.recorder.stop();
 }
 
 if (els.mic) els.mic.addEventListener('click', () => {
@@ -980,7 +1028,17 @@ els.file.addEventListener('change', async () => {
     els.file.value = '';
     return;
   }
-  await loadSourceFromArrayBuffer(await f.arrayBuffer(), f.name);
+  const selection = ++sourceLoadId;
+  els.process.disabled = true;
+  try {
+    const bytes = await f.arrayBuffer();
+    if (selection !== sourceLoadId) return;
+    await loadSourceFromArrayBuffer(bytes, f.name);
+  } catch (error) {
+    if (selection !== sourceLoadId) return;
+    setStatus(`Could not read audio: ${error.message}`, 'error');
+    els.process.disabled = !state.decodedSource;
+  }
 });
 
 /* ------------------------------------------------------------------ */
@@ -1027,7 +1085,8 @@ function processInWorker(source, opts) {
           samples: new Float32Array(message.samples),
           sampleRate: message.sampleRate,
           blob: message.blob,
-          realOpus: message.realOpus
+          realOpus: message.realOpus,
+          codecInfo: message.codecInfo
         });
       } else if (message.type === 'error') {
         cleanup();
@@ -1105,6 +1164,7 @@ els.process.addEventListener('click', async () => {
       hp:          Number(els.hp.value),
       lp:          Number(els.lp.value),
       bits:        Number(els.bits.value),
+      agc:         els.agc.value === '1',
       lossPct:     Number(els.loss.value),
       frameMs:     Number(els.frameMs.value),  // net_split — previously never passed
       enableWarble: els.warble.value === '1',
@@ -1120,14 +1180,14 @@ els.process.addEventListener('click', async () => {
     logLine(`MIX: codec=${opts.codec} pos=${opts.listenerPos || 'manual:'+opts.dspRoom} gain=${opts.micGain} vs=${opts.voiceScale}`);
 
     const t0 = performance.now();
-    const { samples, sampleRate, blob, realOpus } = await runAudioProcess(state.decodedSource, opts);
+    const { samples, sampleRate, blob, realOpus, codecInfo } = await runAudioProcess(state.decodedSource, opts);
     const took = Math.round(performance.now() - t0);
 
-    // Make the codec path visible — helps debug browser WebCodecs quirks.
+    // Report the actual processing path, including explicit approximations.
     if (codecKey === 'steam' || codecKey === 'steam_48') {
       logLine(realOpus
-        ? 'S_Voice: real Opus encoder (WebCodecs) active'
-        : 'S_Voice: transform emulation (WebCodecs unavailable or rejected)', 'sys');
+        ? `S_Voice: ${codecInfo.version}, ${codecInfo.bitrate / 1000} kbps, 20 ms frames, native PLC`
+        : 'S_Voice: approximate effect or codec bypass selected', 'sys');
     }
 
     state.processedBuffer = samples;
@@ -1153,7 +1213,9 @@ els.process.addEventListener('click', async () => {
     els.dl.disabled = false;
 
     drawStaticWaveform();
-    setStatus(`Ready · rendered in ${(took / 1000).toFixed(1)}s · ${sampleRate.toLocaleString()} Hz`, 'success');
+    const method = realOpus ? `Real Opus · ${codecInfo.bitrate / 1000} kbps`
+      : (opts.enableWarble ? 'Approximate codec effect' : 'Codec bypassed');
+    setStatus(`Ready · ${method} · ${(took / 1000).toFixed(1)}s render · ${sampleRate.toLocaleString()} Hz`, 'success');
     logLine(`ChangeLevel: rendered ${samples.length} samples @ ${sampleRate}Hz in ${took}ms`, 'sys');
     logLine(`Net_SendPacket: reliable stream ready.`);
   } catch (e) {
@@ -1189,20 +1251,23 @@ els.abToggle.addEventListener('click', () => {
   // Both elements play in sync; A/B is an instant mute swap — no re-buffering.
   els.audio.muted = !wetAudible;
   els.audioDry.muted = wetAudible;
-  syncDry();
+  syncDry(true);
   els.abToggle.textContent = wetAudible ? 'A/B: Wet' : 'A/B: Dry';
 });
 
 // Keep the hidden dry twin locked to the main (wet) transport.
-function syncDry() {
+function syncDry(force = false) {
   if (!els.audioDry || !els.audioDry.src) return;
   const d = els.audioDry.duration;
   const t = Math.min(els.audio.currentTime,
     isFinite(d) && d > 0 ? Math.max(0, d - 0.01) : els.audio.currentTime);
   try {
-    if (Math.abs(els.audioDry.currentTime - t) > 0.06) els.audioDry.currentTime = t;
+    if (force || Math.abs(els.audioDry.currentTime - t) > 0.02) els.audioDry.currentTime = t;
   } catch (e) { /* metadata not ready yet */ }
 }
+
+els.audio.addEventListener('volumechange', () => { if (els.audioDry) els.audioDry.volume = els.audio.volume; });
+els.audio.addEventListener('ratechange', () => { if (els.audioDry) els.audioDry.playbackRate = els.audio.playbackRate; });
 
 /* ------------------------------------------------------------------ */
 /* Visualizer                                                         */

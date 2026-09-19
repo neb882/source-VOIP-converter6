@@ -5,17 +5,21 @@
   "description": "Browser-based Source Engine and TF2 voice-chat pipeline emulator.",
   "scripts": {
     "dev": "node tests/static-server.js",
-    "test": "node tests/verify.js",
+    "test": "node tests/verify.js && node tests/opus.verify.mjs && node tests/reference.verify.mjs",
+    "vendor:opus": "node tests/vendor-opus.mjs",
+    "test:vendor": "node tests/vendor-opus.mjs --check",
     "test:browser": "node tests/browser.verify.js",
-    "test:all": "pnpm test && pnpm test:browser",
-    "analyze:reference": "node tests/reference.analyze.mjs"
+    "test:all": "pnpm test:vendor && pnpm test && pnpm test:browser",
+    "analyze:reference": "node tests/reference.analyze.mjs",
+    "compare:reference": "node tests/reference.compare.mjs --compact"
   },
   "devDependencies": {
+    "libopus-wasm": "0.4.0",
     "mpg123-decoder": "0.4.8",
     "playwright": "1.61.1"
   },
   "packageManager": "pnpm@10.13.1",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }
