@@ -1,57 +1,103 @@
-# Paired 2026 TF2 loopback check
+# Paired 2026 TF2 loopback: what the recording shows
 
-Measured locally on 2026-09-19. No source music, recording, or derived audio is distributed with this project.
+Measured locally on 2026-09-24/25. No source music, recording or derived audio is distributed with this project.
 
 ## Provenance
 
-The owner reports default TF2 voice settings, `voice_loopback 1` on a private server, and playback of the two exact supplied MP3s into a virtual audio cable. They did not change volume between songs. The recording application, cable channel mapping, explicit codec cvar/version and any capture processing are not independently established.
+The owner reports default TF2 voice settings, `voice_loopback 1` on a private server, and playback of the two exact supplied MP3s into a virtual audio cable. They did not change volume between songs. The recording application, cable channel mapping and any OS-level processing are not independently established.
 
 | Supplied file | Decoded format / duration | SHA-256 |
 | --- | --- | --- |
 | tf2 VOIP test 2026 pure.mp3 | 48 kHz stereo / 170.76 s | `d538ade4cfecb7530bf0748c31519c70c974e82054fb5726c18cb52ed5cd9f6e` |
 | Joni Mitchell - River.mp3 | 44.1 kHz stereo / 250.17 s | `c450847c6d1967d5608a731a356c839ad937fd20fbdb974a38bca202b7569ae4` |
 | Ke$ha - Take It Off.mp3 | 44.1 kHz stereo / 215.61 s | `3b76981443496cdf6f8b23b1e3a1e2507ddc3aa7f11a5fdf1d22315b512f28da` |
+| real tf2 VOIP recording 2024.mp3 | 44.1 kHz stereo / 59.98 s | `3bb37d8dad4800debd0282c2c4b62a8df4bf6922f737a4e68b395b161e45e543` |
 
-The loopback recording decodes without reported errors, is effectively mono (L/R correlation 0.999972), and peaks at approximately -13.63 dBFS. Lack of full-scale samples does **not** rule out clipping earlier in the playback/capture chain.
+The loopback file is effectively mono (L/R correlation 0.99997), was written by FFmpeg/LAME as VBR MP3 (about 147 kbps), and contains two talk spurts: River at 0.82–58.5 s and Take It Off at 81.2–163.8 s. Between spurts the file is digital zero; spurts start and stop abruptly with no fade. There are no dropouts inside either spurt.
 
-## Method
+## Findings
 
-Run after installing the project's pinned development dependencies:
+Each source was located by waveform cross-correlation and aligned in 0.5–1 s blocks. The recording runs about 450 ppm fast against the sources and wanders by ±1.5 ms, so coherence was measured in 0.1 s blocks with local re-alignment.
 
-```sh
-pnpm compare:reference "path/to/loopback.mp3" "path/to/source-one.mp3" "path/to/source-two.mp3"
-```
+### 1. The voice is hard-clipped at a fixed ceiling
 
-Use single quotes around filenames containing `$` in PowerShell. The tool reads files locally and prints JSON; it uploads nothing and never edits the inputs.
-
-The coarse search uses four-second normalized waveform correlation after anti-aliased downsampling and a 100 Hz high-pass. Repeated musical phrases can create stronger but wrong matches, so at least three matches must share a continuous timeline. A robust linear fit estimates offset and small clock drift. A windowed-sinc fractional-delay filter corrects timing without the high-frequency attenuation introduced by linear interpolation.
-
-Matched reference intervals were 6–54 s for River and 90–150 s for Take It Off. Their source intervals are approximately 57.158–105.192 s and 10.214–70.242 s respectively. Three additional two-second, 24 kHz waveform checks per song produced correlations of 0.623–0.834 and 0.510–0.717, with remaining offsets under 5 ms. Those correlations verify passage identity; they are **not** fidelity scores.
-
-Analysis uses a common 24 kHz rate, 2048-point Hann spectra with 50% overlap, and 250 ms RMS blocks. Spectral comparisons use the summed 300–3000 Hz power to remove recording-volume differences. This is not perceptual loudness matching. No unique codec bitrate, capture filter, AGC implementation or channel routing can be inferred from these metrics alone.
-
-## Before and after
-
-These are the app's normal stereo-average input results, not the more favorable left-channel-only results. Level variation is the P90 minus P10 of 250 ms RMS levels over each matched passage; it is not a standard integrated loudness or dynamic-range rating.
-
-| Paired passage | Recorded TF2 level variation | Previous Modern | Updated Modern |
+| | River passage | Take It Off passage | Sources |
 | --- | ---: | ---: | ---: |
-| River | 2.09 dB | 6.03 dB | 2.62 dB |
-| Take It Off | 1.89 dB | 5.60 dB | 2.69 dB |
+| Clip ceiling (99.5th percentile of \|y\|) | −16.4 dBFS | −16.3 dBFS | — |
+| Samples within 5% of the ceiling | 13.6% | 12.8% | — |
+| Spread of 256-sample block peaks (P90−P10) | 0.56 dB | 0.45 dB | 8.5–16 dB |
+| Mean \|y\| ÷ ceiling | 0.49 | 0.52 | — |
+| Crest factor (ceiling ÷ RMS) | 4.7 dB | 4.3 dB | 6.4–8.6 dB |
 
-| Absolute 40–80 Hz band-balance error, relative to the 300–3000 Hz anchor | Previous Modern | Updated Modern |
+Runs of 20+ consecutive samples sit flat at the ceiling. Almost every 5 ms block reaches it. The ceiling is well below 0 dBFS, which reflects game/OS volume after the clip. It is not headroom in the voice path.
+
+### 2. A block auto-gain drives the mean to half of full scale
+
+River's source is about 10 dB quieter than Take It Off's. Both nevertheless come out at the same level with the same clip statistics. Over 100 ms blocks, the output mean stays at −5.5 to −6.6 dB re the ceiling (0.47–0.53; a target of 0.5 is −6.0 dB) across 24 dB of input level. The implied gain peaks at about 24 dB for the quietest River passages.
+
+The fastest gain changes line up with 128-sample blocks at 44.1 kHz. The high-frequency envelope has spectral lines at 344.66 Hz and 689.3 Hz, which is 44100/128 and its harmonic, shifted by the measured clock offset. These lines are strongest in one River window and weaker elsewhere. With longer blocks (256–1024), the model no longer reproduces the 0.45 dB block-peak spread.
+
+This matches the receiver-side voice auto-gain remembered from the Source engine's `voice.cpp`. That code (`voice_avggain`, `voice_maxgain`) is **not** in the public Source SDK 2013, so the gain law used here is fitted to this recording, not transcribed.
+
+### 3. The clipping happens after decoding, at 44.1 kHz
+
+The recording has noise-like energy at 12–19.5 kHz: −29 to −41 dB relative to 300–3000 Hz on Take It Off. Both source MP3s have nothing above 16 kHz, and Opus at 24 kHz codes nothing above 12 kHz. Four alternative explanations were ruled out:
+- **Not transmitted source content.** It has no coherence with the source at the same frequency.
+- **Not a resampling image.** Simulated linear-interpolation images of this music correlate 0.97–1.0 with their exact mirror band (24 kHz − f). The recording's HF bands correlate non-specifically: best with 11–12 kHz, 0.58–0.93.
+- **Not the recording's MP3 encoding.** Re-encoding a clean simulation with LAME at 128–192 kbps adds less than −75 dB there.
+- **Not a 48 kHz Opus stream.** Fullband CELT noise filling puts shelves at the wrong levels, and no 48 kHz configuration matched.
+
+Clipping the decoded signal at 44.1 kHz reproduces the shelf's level and shape. The Source SDK's `public/soundsystem/snd_device.h` fixes the hardware mix rate at `SOUND_DMA_SPEED 44100`. `public/steam/isteamuser.h` documents that `DecompressVoice` outputs 16-bit PCM at any requested rate from 11025 to 48000, and recommends the output device's rate.
+
+### 4. The codec is 24 kHz Opus in SILK/CELT hybrid mode
+
+- **Band edge:** the passband ends at about 11.5–12 kHz.
+- **Crossover:** coherence has a hole at 8 kHz (0.03 against 0.14–0.22 either side), at the crossover between SILK and CELT in hybrid mode. libopus reproduces the hole with the `voice` signal hint. At 32 kbps with automatic signal detection, libopus 1.6.1 codes this music CELT-only, and the hole disappears.
+- **High-band level:** above 7.8 kHz the recording is about 2.5 dB lower relative to libopus 1.6.1. Neither VBR nor complexity explains it, so the likely cause is a different (older) libopus in Steam.
+- **Bitrate:** within 16–40 kbps, bitrate barely changes these measurements. 32 kbps is kept from the cited 2021 reverse engineering.
+
+## Model
+
+| Stage | Setting | Basis |
+| --- | --- | --- |
+| Codec | Opus 24 kHz mono, VOIP, signal=voice, 32 kbps CBR, 20 ms, libopus 1.6.1 | band edge, hybrid crossover, 2021 reverse engineering |
+| Profile EQ | −2.5 dB above 7.8 kHz, band edge from 11.8 kHz (95-tap FIR at 24 kHz) | fitted |
+| Voice rate | 44.1 kHz | block-rate lines, clip products above 12 kHz, SDK mix rate |
+| Auto-gain | 128-sample blocks; next gain = min(16, 0.5 ÷ mean\|x\|) × voice_scale, ramped linearly across the following block; int16 clamp | clip statistics, level tracking; cap fitted |
+| Output stage | 3-tap `[0.1, 0.8, 0.1]` at 44.1 kHz | fitted to the 13–18 kHz slope |
+
+Joint fit of the spectral calibration: 1.1 dB RMS error over 1.5–18 kHz for both songs. Fit of the cap: 0.54 dB RMS on half-second levels at 16×, versus 0.93 dB at 10×.
+
+## Results
+
+From `pnpm compare:reference` with the app's JS pipeline, stereo-average input, 48 kHz analysis:
+
+| | River | Take It Off |
 | --- | ---: | ---: |
-| River | 10.47 dB | 2.91 dB |
-| Take It Off | 8.85 dB | 0.42 dB |
+| Spectrum, rendered − recorded, 40 Hz–19 kHz bands | within ±1.4 dB (16–19 kHz +2.4) | within ±1.0 dB |
+| Half-second level tracking, RMS deviation / correlation | 0.55 dB / 0.77 | 0.42 dB / 0.88 |
+| Clipped samples, rendered vs recorded | 11.7% vs 13.6% | 14.1% vs 13.3% |
+| Mean ÷ ceiling, rendered vs recorded | 0.47 vs 0.49 | 0.51 vs 0.53 |
+| Crest, rendered vs recorded | 5.1 vs 4.7 dB | 4.5 vs 4.3 dB |
 
-The previous baseline is reproduced in the comparison tool: 1.3 input gain, modeled pre-encoder peak AGC, 120 Hz high-pass, and the same real Opus configuration. Updated Modern uses unity input gain, a 40 Hz high-pass and post-decoder RMS leveling. Opus stays 24 kHz mono / 32 kbps / 20 ms; the 11 kHz low-pass is unchanged. A few milliseconds of residual alignment error is acceptable for these pooled spectra and 250 ms statistics, but not for samplewise error or codec identification.
+The same tool renders a variant with the receiver auto-gain off. It misses badly: 0.7% clipped, 3–4 dB level-tracking error, and a high-frequency shelf 20–60 dB too low. The previous app version (RMS leveling after the codec, no clamp, 11 kHz capture low-pass) had no mechanism for any of findings 1–3.
 
 ## What remains unverified
 
-- Improvements are not uniform across every band. With stereo-average input, River still has about 4.6 dB too much 80–120 Hz energy relative to the anchor, and remaining high-band differences. Left-only input matches portions of River better, but cable routing is unknown; the app still averages stereo rather than silently choosing a channel.
-- Both excerpts were used during tuning. Second-half results are consistency checks, **not an independent holdout**. Independent paired speech, additional music, silence/onsets and different capture levels are still needed.
-- The files are MP3, including the final recording. Capture compression, device processing, channel routing and game playback volume remain confounding factors.
-- `voice_loopback` is a local test, not evidence for behavior under real network loss. Native Opus loss concealment and the app's simulated packet-loss model have separate synthetic tests.
-- The revised leveling stage is a bounded empirical model, not recovered Valve code. It remains optional. This check does not establish the actual TF2 Opus version, bitrate, encoder settings, or exact internal DSP order.
+- **Short-term level variation.** The recording varies more at the 100 ms scale than the model (P90−P10 2.2 dB vs 0.8 dB on Take It Off). The extra variation correlates with input crest factor. Neither a peak term in the gain law nor longer blocks fixed it without breaking the clip statistics.
+- **Where the extra gain comes from.** The cap of 16 is an effective value. It is also consistent with a Source default of 10 plus about 4 dB elsewhere in the capture path.
+- **High-band trim.** The −2.5 dB trim is attributed to a libopus version difference, which is not confirmed.
+- **Recording chain.** The small post-clip roll-off may come from the recording chain rather than the game.
+- **Single recording.** This is one default-settings recording of music through a virtual cable. Paired speech, a real network with loss, other volume settings and other clients are still unmeasured.
+- **Legacy profiles.** They reuse the receiver model at their historical voice rates, with a linear-interpolation mixer. They are not validated against recordings.
+- **Room presets** are not validated against recordings.
+- **The 2024 gameplay recording** mixes game audio and so cannot be paired. Its late passages show compressed block peaks (about 1.5 dB spread) and mean/ceiling up to 0.44, which is consistent with the model but not proof.
 
-The change is supported as a closer match to the measured bass and level behavior of these pairs, not as bit-exact or universally perceptually equivalent TF2 emulation.
+## Reproduce
+
+```sh
+pnpm install --frozen-lockfile
+pnpm compare:reference 'path/to/tf2 VOIP test 2026 pure.mp3' 'path/to/Joni Mitchell - River.mp3' 'path/to/Ke$ha - Take It Off.mp3'
+```
+
+Use single quotes around filenames containing `$` in PowerShell. The tool reads files locally, prints JSON, and uploads nothing. A full run takes a few minutes.

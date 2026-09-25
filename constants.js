@@ -2,21 +2,22 @@
  * TF2 Voice Emulator — constants.js
  *
  * Data-only module. Exposes globals for other scripts to consume:
- *   TF2_DATA       — names, weapons, chat lines, errors, system, achievements
- *   PRESETS        — quick processing presets (modern / legacy / spam)
- *   CODEC_PROFILES — vaudio_celt, vaudio_celt_high, steam (Opus), vaudio_speex
- *   DSP_PRESETS    — Source engine dsp_room presets 0-29, transcribed from
- *                    Valve's actual scripts/dsp_presets.txt (see comments)
+ *   TF2_DATA           — names, weapons, chat lines, errors, system, achievements
+ *   PRESETS            — quick processing presets (modern / legacy / spam ...)
+ *   CODEC_PROFILES     — real libopus configurations for each voice codec
+ *   VOICE_ENGINE       — receiver-side voice path (auto-gain, mixer, output)
+ *   DSP_PRESETS        — Source engine dsp_room presets 0-29, transcribed from
+ *                        Valve's scripts/dsp_presets.txt (see comments)
  *   LISTENER_POSITIONS — map-location → dsp_room mappings
- *   FCVAR          — Source cvar flag bits
+ *   FCVAR              — Source cvar flag bits
  *
  * References:
  *   - Valve dsp_presets.txt (via the Facepunch garrysmod mirror) — the RVA/
  *     DFR/DLY/AMP/MDY processor parameters below are copied verbatim.
- *   - zhenyangli.me "Reversing Steam Voice Codec" — codec lineup & rates.
- *   - vaudio_celt: CELT @ 22050 Hz, 512-sample frames, 64 bytes/frame
- *     (= exactly 22.05 kbps). celt_high: same at 44.1 kHz. Steam voice:
- *     Opus, 24 kHz mono. Speex: legacy 8 kHz narrowband.
+ *   - zhenyangli.me "Reversing Steam Voice Codec" — Steam voice is Opus at
+ *     24 kHz mono.
+ *   - tests/REFERENCE_2026.md — paired loopback measurements behind the
+ *     Steam profile and VOICE_ENGINE values.
  * ========================================================================= */
 
 const TF2_DATA = {
@@ -199,74 +200,98 @@ const TF2_DATA = {
 /* -------------------------------------------------------------------------
  * Quick processing presets (keyed into `exec preset_<name>`)
  * `codec` matches a key in CODEC_PROFILES, `position` matches LISTENER_POSITIONS.
+ * hp 0 / lp 20000 leave the optional sender filters off: the measured TF2
+ * path has no capture EQ beyond Opus's own voice high-pass and band edge.
+ * gain > 1 overdrives the sender's int16 capture before encoding.
  * ------------------------------------------------------------------------- */
 const PRESETS = {
-  // Steam-inspired baseline: the cited 2021 reverse engineering observed
-  // 24 kHz / 32 kbps. Capture EQ/gain are adjustable modeling choices;
-  // the mixed 2024 reference does not establish them or an exact Valve build.
-  modern:  { codec: 'steam',           position: 'open',    hp: 40,  lp: 11000, voice_scale: 1.0, gain: 1.0, loss: 0  },
-  // Classic CELT-era TF2: 22 kHz codec, smaller spaces by default.
-  legacy:  { codec: 'celt_22',         position: 'hallway', hp: 200, lp: 8000,  voice_scale: 1.0, gain: 1.6, loss: 0  },
-  // Loud mic-spam: pushed gain, in a tunnel for extra reverb drama.
-  spam:    { codec: 'celt_22',         position: 'tunnel',  hp: 120, lp: 10500, voice_scale: 1.0, gain: 3.0, loss: 0  },
+  // Measured baseline: Steam voice as recorded with voice_loopback in 2026.
+  modern:  { codec: 'steam',   position: 'open',   hp: 0, lp: 20000, voice_scale: 1.0, gain: 1.0, loss: 0  },
+  // CELT-era codec stand-in with the same receiver path.
+  legacy:  { codec: 'celt_22', position: 'open',   hp: 0, lp: 20000, voice_scale: 1.0, gain: 1.0, loss: 0  },
+  // Loud mic spam: overdriven capture, in a tunnel for extra reverb drama.
+  spam:    { codec: 'steam',   position: 'tunnel', hp: 0, lp: 20000, voice_scale: 1.0, gain: 3.0, loss: 0  },
   // 2fort sewers micspam classic
-  sewers:  { codec: 'celt_22',         position: 'water',   hp: 80,  lp: 9000,  voice_scale: 1.0, gain: 2.0, loss: 0  },
+  sewers:  { codec: 'steam',   position: 'water',  hp: 0, lp: 20000, voice_scale: 1.0, gain: 2.0, loss: 0  },
   // Terrible connection
-  laggy:   { codec: 'steam',           position: 'open',    hp: 40,  lp: 11000, voice_scale: 1.0, gain: 1.0, loss: 18 }
+  laggy:   { codec: 'steam',   position: 'open',   hp: 0, lp: 20000, voice_scale: 1.0, gain: 1.0, loss: 18 }
 };
 
-// Legacy alias so older console output still matches
-const presets = PRESETS;
-
 /* -------------------------------------------------------------------------
- * Codec profiles — historical rate references plus modeling choices:
+ * Codec profiles. Every profile runs the bundled libopus; only `steam` is
+ * calibrated against a real TF2 recording.
  *
- *   vaudio_celt      : CELT @ 22050 Hz, 512-sample frames (23.2 ms),
- *                      64 bytes/frame = exactly 22.05 kbps
- *   vaudio_celt_high : CELT @ 44100 Hz, 512-sample frames (11.6 ms),
- *                      64 bytes/frame = 44.1 kbps
- *   steam            : Steam voice API (Opus), 24 kHz mono, ~32 kbps,
- *                      with sender-side AGC/preprocessing
- *   vaudio_speex     : legacy Speex narrowband, 8 kHz, ~8 kbps
- *
- *   sampleRate    : codec's internal rate
- *   frameSamples  : hop for the approximate transform only; real Opus is 20 ms
- *   bytesPerFrame : estimated transform budget, not an encoded packet size
- *   bandLimit     : decoder low-pass edge (Hz)
- *   preEmphasis   : codec pre-emphasis coefficient (CELT/Opus use 0.85),
- *                   matched by de-emphasis at decode
- *   noiseFloor    : tiny additive decoder noise (0..1)
- *   agc           : optional modeled receive-side voice leveling
+ *   codecRate   : Opus sample rate (8/12/16/24/48 kHz)
+ *   bitrate     : bits per second at snd_bits 16 (CBR, 20 ms frames)
+ *   application : 'voip' (SILK/hybrid capable) or 'lowdelay' (CELT only)
+ *   signal      : Opus signal hint; 'voice' keeps music in hybrid mode,
+ *                 matching the SILK/CELT crossover seen in the recording
+ *   decoderEq   : optional FIR (linear gains interpolated between points)
+ *                 applied to decoded audio at codecRate
+ *   voiceRate   : rate at which the engine receives decoded voice and runs
+ *                 its auto-gain (128-sample blocks)
+ *   mixer       : how voiceRate is converted to the 44.1 kHz mixer:
+ *                 'sinc' (band-limited) or 'linear' (Source-style interp)
+ *   status      : 'measured' | 'experimental' | 'modeled'
  * ------------------------------------------------------------------------- */
 const CODEC_PROFILES = {
-  celt_22: {
-    displayName: 'CELT-style approximation (22 kHz)',
-    sampleRate: 22050, frameSamples: 512, bytesPerFrame: 64,
-    bandLimit: 10800, preEmphasis: 0.85, noiseFloor: 0.0009, agc: false
-  },
-  celt_44: {
-    displayName: 'CELT-style approximation (44.1 kHz)',
-    sampleRate: 44100, frameSamples: 512, bytesPerFrame: 64,
-    bandLimit: 20000, preEmphasis: 0.85, noiseFloor: 0.0003, agc: false
-  },
   steam: {
-    displayName: 'Steam-inspired Opus (24 kHz / 32 kbps)',
-    sampleRate: 24000, frameSamples: 512, bytesPerFrame: 84,
-    bandLimit: 11800, preEmphasis: 0.85, noiseFloor: 0.0005, agc: true,
-    webcodecs: 'opus', opusBitrate: 32000 // historical key; now uses bundled libopus
+    displayName: 'Steam voice (Opus 24 kHz / 32 kbps)',
+    codecRate: 24000, bitrate: 32000, application: 'voip', signal: 'voice',
+    // The recorded hybrid high band sits ~2.5 dB below libopus 1.6.1's,
+    // with a band edge just under 12 kHz (see tests/REFERENCE_2026.md).
+    decoderEq: {
+      taps: 95,
+      freqs:   [0, 7300, 7800, 10500, 11000, 11500, 11800, 12000],
+      gainsDb: [0, 0,   -2.5, -2.5,  -2.5,  -2.5,  -2.5,  -60]
+    },
+    voiceRate: 44100, mixer: 'sinc', status: 'measured'
   },
   // Optional fullband profile, NOT a verified TF2-era or native-rate preset.
   steam_48: {
     displayName: 'Fullband Opus (48 kHz / 64 kbps, experimental)',
-    sampleRate: 48000, frameSamples: 1024, bytesPerFrame: 170,
-    bandLimit: 20000, preEmphasis: 0.85, noiseFloor: 0.0004, agc: true,
-    webcodecs: 'opus', opusBitrate: 64000
+    codecRate: 48000, bitrate: 64000, application: 'voip', signal: 'voice',
+    voiceRate: 44100, mixer: 'sinc', status: 'experimental'
   },
+  // vaudio_celt ran CELT at 22.05 kHz / ~22 kbps. Opus's CELT layer is its
+  // descendant; this is a stand-in, not the original 0.x bitstream.
+  celt_22: {
+    displayName: 'CELT era (Opus CELT layer, 22 kbps)',
+    codecRate: 24000, bitrate: 22000, application: 'lowdelay', signal: 'auto',
+    voiceRate: 22050, mixer: 'linear', status: 'modeled'
+  },
+  celt_44: {
+    displayName: 'CELT high (Opus CELT layer, 44 kbps)',
+    codecRate: 48000, bitrate: 44000, application: 'lowdelay', signal: 'auto',
+    voiceRate: 44100, mixer: 'sinc', status: 'modeled'
+  },
+  // vaudio_speex was 8 kHz narrowband CELP. SILK is a different LPC codec
+  // with a similar narrowband character; this is a stand-in.
   speex: {
-    displayName: 'Narrowband effect (8 kHz, not real Speex)',
-    sampleRate: 8000, frameSamples: 256, bytesPerFrame: 32,
-    bandLimit: 3600, preEmphasis: 0.45, noiseFloor: 0.0020, agc: false
+    displayName: 'Narrowband (Opus SILK, 8 kHz / 8 kbps)',
+    codecRate: 8000, bitrate: 8000, application: 'voip', signal: 'voice',
+    voiceRate: 11025, mixer: 'linear', status: 'modeled'
   }
+};
+
+/* -------------------------------------------------------------------------
+ * Receiver voice path, fitted to the 2026 voice_loopback recording:
+ *
+ *   autoGain  : per 128-sample block, the next gain brings the block's mean
+ *               |x| to avgGain of full scale (voice_avggain), capped at
+ *               maxGain (effective voice_maxgain), ramped linearly across the
+ *               following block and clamped to int16. The recording shows
+ *               this signature: mean |y| = 0.49-0.52 of a hard clip ceiling
+ *               that ~13% of samples reach, gain updates at 44100/128 Hz.
+ *   outputFir : gentle post-mixer rolloff measured above 12 kHz
+ *   volume    : output level. The recording's ceiling sat at -16.4 dBFS, but
+ *               that includes the owner's game/OS volume, so it is a setting.
+ * ------------------------------------------------------------------------- */
+const VOICE_ENGINE = {
+  mixRate: 44100,
+  autoGain: { blockSize: 128, avgGain: 0.5, maxGain: 16 },
+  outputFir: [0.1, 0.8, 0.1],
+  volume: 0.5
 };
 
 /* -------------------------------------------------------------------------
@@ -390,11 +415,10 @@ const ENV_ALIAS = {
 };
 
 /* -------------------------------------------------------------------------
- * Listener position presets
- * In TF2, the listener's location applies `dsp_room` to teammate voice.
- * Each key maps a human-readable position to the dsp_room id plus any
- * additional receiver-side filtering (the underwater low-pass is a real
- * engine effect — dsp_water muffles everything for a submerged listener).
+ * Listener position presets — an optional effect layer. Each key maps a
+ * location to a dsp_room preset plus any extra low-pass (underwater). The
+ * reference loopback recording was dry, so whether and how TF2 routes voice
+ * through room DSP is not established by it; "open" (0) is the measured path.
  * ------------------------------------------------------------------------- */
 const LISTENER_POSITIONS = {
   open:       { label: 'Open / Outdoor',        dsp: 0,  extraLpf: null, notes: 'Hightower mid, 2fort battlements' },
@@ -410,12 +434,3 @@ const LISTENER_POSITIONS = {
 };
 
 const FCVAR = { NONE: 0, CHEAT: 1 << 0, READONLY: 1 << 1, SERVER: 1 << 2 };
-
-// Backwards-compatible alias: old script.js referenced `envConfigs[env]`.
-// Kept so older entry points don't break; new code uses DSP_PRESETS + ENV_ALIAS.
-const envConfigs = {
-  none:   null,
-  room:   [0.5, 3.0, 0.15],
-  locker: [0.3, 8.0, 0.25],
-  hall:   [1.5, 4.0, 0.35]
-};

@@ -5,8 +5,8 @@
  * All heavy audio lives in audio.js; this file is "the chrome around it".
  *
  * Depends on globals defined by constants.js + audio.js:
- *   TF2_DATA, PRESETS, CODEC_PROFILES, DSP_PRESETS, LISTENER_POSITIONS,
- *   ENV_ALIAS, FCVAR, TF2Audio
+ *   TF2_DATA, PRESETS, CODEC_PROFILES, VOICE_ENGINE, DSP_PRESETS,
+ *   LISTENER_POSITIONS, ENV_ALIAS, FCVAR, TF2Audio
  * =========================================================================
  */
 
@@ -26,6 +26,7 @@ const els = {
   consoleDetails: document.getElementById('console-details'),
   audio:     document.getElementById('preview'),
   audioDry:  document.getElementById('preview-dry'),
+  vizWave:   document.getElementById('viz-wave'),
   vizBars:   document.getElementById('viz-bars'),
   vizSpec:   document.getElementById('viz-spec'),
   canvas:    document.getElementById('visualizer'),
@@ -40,17 +41,23 @@ const els = {
   conIn:     document.getElementById('console-input'),
   conHint:   document.getElementById('console-hint'),
   conComplete: document.getElementById('console-complete'),
+  chain:     document.getElementById('signal-chain'),
   ng:        document.getElementById('net-graph'),
   ngFps:     document.getElementById('ng-fps'),
   ngPing:    document.getElementById('ng-ping'),
   ngLerp:    document.getElementById('ng-lerp'),
   ngFill:    document.getElementById('ng-fill'),
   ngLoss:    document.getElementById('ng-loss-val'),
+  ngIn:      document.getElementById('ng-in'),
+  ngOut:     document.getElementById('ng-out'),
   abToggle:  document.getElementById('ab-toggle'),
   hp:        document.getElementById('hp'),
   lp:        document.getElementById('lp'),
   bits:      document.getElementById('bits'),
   agc:       document.getElementById('agc'),
+  maxGain:   document.getElementById('maxgain'),
+  avgGain:   document.getElementById('avggain'),
+  volume:    document.getElementById('volume'),
   loss:      document.getElementById('loss'),
   frameMs:   document.getElementById('frameMs'),
   warble:    document.getElementById('warble_on'),
@@ -80,10 +87,11 @@ const state = {
   isConnected: true,
   simEnabled: true,
   abMode: 'wet',         // 'wet' or 'dry'
-  vizMode: 'bars',       // 'bars' or 'spec' (spectrogram)
+  vizMode: 'wave',       // 'wave', 'bars' or 'spec' (spectrogram)
+  renderId: 0,           // invalidates cached visualizer images per render
+  lastCodecInfo: null,   // codec statistics of the last render (net_graph)
   sourceName: null,      // name of the loaded clip (file or mic)
   netJitter: 0,          // net_jitter cvar (console-only)
-  realOpus: 1,           // snd_real_opus: bundled libopus; 0 explicitly selects approximation
   recorder: null,        // active PCM capture session
   recTick: null,         // recording timer interval
   processing: false,
@@ -105,65 +113,81 @@ class SourceSimulator {
   constructor(logCallback) {
     this.log = logCallback;
     this.isActive = false;
-    this.activePlayers = [];
+    this.timer = 0;
+    this.players = [];
     this.maxPlayers = 24;
-    this.initialPopulation();
+    for (let i = 0; i < 16; i++) this.addPlayer(true);
   }
-  initialPopulation() { for (let i = 0; i < 12; i++) this.addPlayer(true); }
-  start() { if (this.isActive) return; this.isActive = true; this.loop(); }
-  stop()  { this.isActive = false; }
-  addPlayer(silent = false) {
-    if (this.activePlayers.length >= this.maxPlayers) return;
-    const pool = TF2_DATA.playerNames.filter(n => !this.activePlayers.includes(n));
-    if (!pool.length) return;
-    const name = pool[Math.floor(Math.random() * pool.length)];
-    this.activePlayers.push(name);
-    if (!silent) this.log(`Player ${name} connected`, 'text');
+  start() { if (this.isActive) return; this.isActive = true; this.schedule(); }
+  stop()  { this.isActive = false; clearTimeout(this.timer); }
+  schedule() {
+    if (!this.isActive) return;
+    this.timer = setTimeout(() => { this.processTick(); this.schedule(); }, 600 + Math.random() * 3200);
   }
   pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
-  getRandomPlayer() { return this.pick(this.activePlayers); }
+  count(team) { return this.players.filter(p => p.team === team).length; }
+  addPlayer(silent = false) {
+    if (this.players.length >= this.maxPlayers) return;
+    const taken = new Set(this.players.map(p => p.name));
+    const pool = TF2_DATA.playerNames.filter(n => !taken.has(n));
+    if (!pool.length) return;
+    // Autobalance-ish: new players join the smaller team.
+    const team = this.count('RED') <= this.count('BLU') ? 'RED' : 'BLU';
+    const player = { name: this.pick(pool), team };
+    this.players.push(player);
+    if (!silent) {
+      this.log(`${player.name} connected`, 'text');
+      setTimeout(() => { if (this.players.includes(player)) this.log(`Player ${player.name} joined team ${team}`, team === 'RED' ? 'red' : 'blu'); }, 900);
+    }
+  }
+  removePlayer() {
+    if (this.players.length <= 8) return;
+    const i = Math.floor(Math.random() * this.players.length);
+    const [player] = this.players.splice(i, 1);
+    const reason = this.pick(['Disconnect by user.', 'Disconnect by user.', 'timed out', 'Kicked by Console : You have been voted off',
+      'Client left game (Steam auth ticket has been canceled)']);
+    this.log(`Dropped ${player.name} from server (${reason})`, 'text');
+  }
   triggerKill() {
-    if (this.activePlayers.length < 2) return;
-    const killer = this.getRandomPlayer();
-    let victim = this.getRandomPlayer();
-    while (victim === killer) victim = this.getRandomPlayer();
-    const weapon = this.pick(TF2_DATA.weapons);
+    const red = this.players.filter(p => p.team === 'RED'), blu = this.players.filter(p => p.team === 'BLU');
+    if (!red.length || !blu.length) return;
+    const [killer, victim] = Math.random() < 0.5 ? [this.pick(red), this.pick(blu)] : [this.pick(blu), this.pick(red)];
     const isCrit = Math.random() > 0.85;
-    this.log(`${killer} killed ${victim} with ${weapon}.${isCrit ? ' (crit)' : ''}`, 'text');
+    this.log(`${killer.name} killed ${victim.name} with ${this.pick(TF2_DATA.weapons)}.${isCrit ? ' (crit)' : ''}`, 'text');
+  }
+  triggerSuicide() {
+    if (!this.players.length) return;
+    const who = this.pick(this.players).name;
+    this.log(Math.random() < 0.5 ? `${who} suicided.` : `${who} bid farewell, cruel world!`, 'text');
   }
   triggerChat() {
-    if (!this.activePlayers.length) return;
-    const player = this.getRandomPlayer();
-    const msg = this.pick(TF2_DATA.chat);
-    const isDead = Math.random() > 0.7;
-    const team = Math.random() > 0.8 ? "(TEAM) " : "";
-    const prefix = isDead ? "*DEAD* " : "";
-    this.log(`${prefix}${team}${player} :  ${msg}`, 'text');
+    if (!this.players.length) return;
+    const player = this.pick(this.players);
+    // TF2 order: *DEAD*(TEAM) Name :  message
+    const prefix = `${Math.random() > 0.7 ? '*DEAD*' : ''}${Math.random() > 0.8 ? '(TEAM)' : ''}`;
+    this.log(`${prefix}${prefix ? ' ' : ''}${player.name} :  ${this.pick(TF2_DATA.chat)}`, 'text');
   }
-  triggerError()     { this.log(this.pick(TF2_DATA.errors), 'err'); }
-  triggerSystem()    { this.log(this.pick(TF2_DATA.system), 'text'); }
+  triggerError()  { this.log(this.pick(TF2_DATA.errors), 'err'); }
+  triggerSystem() { this.log(this.pick(TF2_DATA.system), 'text'); }
   triggerAchievement() {
-    if (!this.activePlayers.length) return;
-    this.log(`${this.getRandomPlayer()} has earned the achievement ${this.pick(TF2_DATA.achievements)}`, 'ach');
+    if (!this.players.length) return;
+    this.log(`${this.pick(this.players).name} has earned the achievement ${this.pick(TF2_DATA.achievements)}`, 'ach');
   }
   triggerItem() {
-    if (!this.activePlayers.length) return;
-    this.log(`${this.getRandomPlayer()} has found: ${this.pick(TF2_DATA.items)}`, 'item');
-  }
-  loop() {
-    if (!this.isActive) return;
-    const nextTick = Math.random() * 3500 + 500;
-    setTimeout(() => { this.processTick(); this.loop(); }, nextTick);
+    if (!this.players.length) return;
+    this.log(`${this.pick(this.players).name} has found: ${this.pick(TF2_DATA.items)}`, 'item');
   }
   processTick() {
     const r = Math.random();
-    if      (r < 0.02) this.addPlayer();
-    else if (r < 0.30) this.triggerKill();
-    else if (r < 0.55) this.triggerChat();
-    else if (r < 0.60) this.triggerError();
-    else if (r < 0.65) this.triggerAchievement();
-    else if (r < 0.70) this.triggerItem();
-    else if (r < 0.75) this.triggerSystem();
+    if      (r < 0.04) this.addPlayer();
+    else if (r < 0.07) this.removePlayer();
+    else if (r < 0.37) this.triggerKill();
+    else if (r < 0.41) this.triggerSuicide();
+    else if (r < 0.64) this.triggerChat();
+    else if (r < 0.68) this.triggerError();
+    else if (r < 0.72) this.triggerAchievement();
+    else if (r < 0.76) this.triggerItem();
+    else if (r < 0.80) this.triggerSystem();
   }
 }
 
@@ -303,13 +327,6 @@ const cvars = {
       if (!isNaN(n)) state.netJitter = Math.min(50, Math.max(0, n));
     }
   },
-  'snd_real_opus': {
-    val: 1, help: 'Use bundled real Opus; 0 explicitly selects an approximate effect',
-    action: (v) => {
-      const n = parseInt(v);
-      if (!isNaN(n)) state.realOpus = n ? 1 : 0;
-    }
-  },
   '+voicerecord': { help: 'Start microphone capture', action: () => startRecord() },
   '-voicerecord': { help: 'Stop microphone capture and mount the clip', action: () => stopRecord() },
   'writeconfig':  { help: 'Copy a shareable settings URL to the clipboard', action: () => writeConfig() },
@@ -388,6 +405,7 @@ const cvars = {
         els.gain.removeAttribute('max');
         els.loss.removeAttribute('max');
         els.voiceScale.removeAttribute('max');
+        els.voiceScale.setAttribute('max', '4');
         logLine('Dev limits removed. God speed.');
       } else {
         els.gain.setAttribute('max', '5.0');
@@ -462,31 +480,23 @@ const cvars = {
   },
 
   /* === Audio playback === */
-  'volume': {
-    val: 1.0, help: 'Audio playback volume (0.0 - 1.0)',
-    action: (v) => {
-      const val = parseFloat(v);
-      if (!isNaN(val)) {
-        els.audio.volume = Math.min(1, Math.max(0, val));
-        if (els.audioDry) els.audioDry.volume = els.audio.volume;
-      }
-      else logLine(`Current volume: ${els.audio.volume.toFixed(2)}`, 'text');
-    }
-  },
   'play':    { help: 'Start playback',   action: () => { if (els.audio.src) els.audio.play().catch(e => logLine(e.message, 'err')); else logLine('No audio loaded.', 'err'); } },
   'stop':    { help: 'Stop playback',    action: () => { els.audio.pause(); els.audio.currentTime = 0; } },
   'restart': { help: 'Restart playback', action: () => { els.audio.currentTime = 0; els.audio.play().catch(() => {}); } },
 
   /* === Linked cvars (mirror a DOM input) === */
-  'voice_overdrive': { help: 'Microphone gain boost (sender)', link: 'gain', flags: FCVAR.CHEAT },
-  'voice_scale':     { help: 'Receiver playback gain (0..2)', link: 'voice_scale' },
-  'dsp_hpf':         { help: 'Sender high-pass filter cutoff', link: 'hp' },
-  'dsp_lpf':         { help: 'Sender low-pass filter cutoff',  link: 'lp' },
-  'snd_bits':        { help: 'Codec bitrate scale (16 = stock)', link: 'bits' },
-  'snd_agc':         { help: 'Reference-tuned RMS voice leveling for Steam profiles (0 = off)', link: 'agc' },
+  'voice_micgain':   { help: 'Sender capture gain; above 1 clips the int16 capture', link: 'gain' },
+  'voice_scale':     { help: 'Receiver voice scale, applied inside the auto-gain (more = more clipping)', link: 'voice_scale' },
+  'voice_agc':       { help: 'Receiver auto-gain with int16 clamp (0 = unity gain)', link: 'agc' },
+  'voice_maxgain':   { help: 'Auto-gain cap (fitted effective value: 16)', link: 'maxgain' },
+  'voice_avggain':   { help: 'Auto-gain target mean level, fraction of full scale', link: 'avggain' },
+  'volume':          { help: 'Output volume of the rendered file (0.0 - 1.0)', link: 'volume' },
+  'dsp_hpf':         { help: 'Optional sender high-pass cutoff (0 = off)', link: 'hp' },
+  'dsp_lpf':         { help: 'Optional sender low-pass cutoff (20000 = off)', link: 'lp' },
+  'snd_bits':        { help: 'Codec bitrate scale (16 = profile bitrate)', link: 'bits' },
   'net_fakeloss':    { help: 'Simulated packet loss %',        link: 'loss' },
-  'net_split':       { help: 'Packet frame size in ms',        link: 'frameMs' },
-  'snd_warble':      { help: 'Enable codec quantization (0 = clean)', link: 'warble_on' },
+  'net_split':       { help: 'Packet grouping in ms (whole 20 ms frames)', link: 'frameMs' },
+  'snd_codec':       { help: 'Run the codec (0 = bypass; filters and receiver remain)', link: 'warble_on' },
   'sv_voicecodec':   {
     help: 'Voice codec (celt_22 / celt_44 / steam / steam_48 / speex)',
     link: 'codec',
@@ -620,7 +630,49 @@ els.controls.addEventListener('change', (e) => {
     const cmd = idToCvarMap[target.id];
     execCommand(`${cmd} ${target.value}`, true);
   }
+  // A hand-edited control no longer matches any quick preset.
+  setActivePreset(null);
+  updateSignalChain();
 });
+
+function setActivePreset(name) {
+  document.querySelectorAll('.preset-row .preset-btn').forEach((button) => {
+    button.setAttribute('aria-pressed', String(button.dataset.preset === name));
+  });
+}
+
+// Live, human-readable summary of the voice path the next render will use.
+function updateSignalChain() {
+  if (!els.chain) return;
+  const codec = CODEC_PROFILES[els.codec.value] || CODEC_PROFILES.steam;
+  const num = (el, fallback) => { const v = Number(el.value); return Number.isFinite(v) ? v : fallback; };
+  const gain = num(els.gain, 1), bits = num(els.bits, 16), loss = num(els.loss, 0);
+  const maxGain = num(els.maxGain, VOICE_ENGINE.autoGain.maxGain), volume = num(els.volume, VOICE_ENGINE.volume);
+  const codecOn = els.warble.value === '1', agcOn = els.agc.value === '1';
+  const kbps = Math.round(Math.max(6000, codec.bitrate * bits / 16) / 1000);
+  const mode = codec.application === 'lowdelay' ? 'CELT' : codec.codecRate <= 8000 ? 'SILK' : 'SILK/CELT hybrid';
+  const packetMs = Math.max(20, Math.round(num(els.frameMs, 20) / 20) * 20);
+  const room = els.position.value === 'manual'
+    ? `dsp_room ${els.env.value}`
+    : (LISTENER_POSITIONS[els.position.value] || LISTENER_POSITIONS.open).label;
+  const filters = [num(els.hp, 0) > 10 ? `HP ${num(els.hp, 0)} Hz` : '', num(els.lp, 20000) < 20000 ? `LP ${num(els.lp, 20000)} Hz` : ''].filter(Boolean);
+  const steps = [
+    ['Capture', `mic ×${gain.toFixed(1)}${filters.length ? ' · ' + filters.join(' · ') : ''}`, gain > 1 ? 'hot' : ''],
+    ['Codec', codecOn ? `Opus ${codec.codecRate / 1000} kHz · ${kbps} kbps · ${mode}` : 'bypassed', codecOn ? '' : 'off'],
+    ['Network', `${packetMs} ms packets · ${loss}% loss`, loss > 0 ? 'hot' : ''],
+    ['Receiver', agcOn ? `auto-gain ≤${maxGain}× · int16 clip` : 'unity gain · int16 clip', ''],
+    ['Mixer', `44.1 kHz · ${room}`, ''],
+    ['Output', `volume ${Math.round(volume * 100)}%`, '']
+  ];
+  els.chain.replaceChildren(...steps.map(([title, detail, cls]) => {
+    const li = document.createElement('li');
+    if (cls) li.className = cls;
+    const b = document.createElement('b'); b.textContent = title;
+    const span = document.createElement('span'); span.textContent = detail;
+    li.append(b, span);
+    return li;
+  }));
+}
 
 function runPreset(name) {
   if (!name) return;
@@ -629,7 +681,10 @@ function runPreset(name) {
   if (!p) {
     // Fall back to user presets saved via preset_save
     const user = LS.get('tf2ve_presets', {});
-    if (user[cleanName]) { applyConfig(user[cleanName]); logLine(`exec user_${cleanName}.cfg`, 'cmd'); return; }
+    if (user[cleanName]) {
+      applyConfig(user[cleanName]); logLine(`exec user_${cleanName}.cfg`, 'cmd');
+      setActivePreset(null); updateSignalChain(); return;
+    }
     logLine(`Error: preset "${name}" not found.`, 'err');
     return;
   }
@@ -641,15 +696,19 @@ function runPreset(name) {
   execCommand(`dsp_hpf ${p.hp}`);
   execCommand(`dsp_lpf ${p.lp}`);
   execCommand(`voice_scale ${p.voice_scale}`);
-  execCommand(`voice_overdrive ${p.gain}`);
+  execCommand(`voice_micgain ${p.gain}`);
   execCommand(`net_fakeloss ${p.loss}`);
   execCommand('snd_bits 16');
-  execCommand('snd_warble 1');
-  execCommand('snd_agc 1');
-  execCommand('snd_real_opus 1');
+  execCommand('snd_codec 1');
+  execCommand('voice_agc 1');
+  execCommand(`voice_maxgain ${VOICE_ENGINE.autoGain.maxGain}`);
+  execCommand(`voice_avggain ${VOICE_ENGINE.autoGain.avgGain}`);
+  execCommand(`volume ${VOICE_ENGINE.volume}`);
   execCommand('net_split 20');
   execCommand('net_jitter 0');
   state.sv_cheats = tempCheats;
+  setActivePreset(cleanName);
+  updateSignalChain();
 }
 
 function printCvarList() {
@@ -667,7 +726,7 @@ function printCvarList() {
 function printStatus() {
   if (!state.isConnected) { logLine("Not connected to server.", "text"); return; }
   logLine(`hostname: Local Browser Environment`);
-  logLine(`version : 2.0.0.1  / 24 ${CODEC_PROFILES[els.codec.value].sampleRate} secure`);
+  logLine(`version : 2.0.0.1  / 24 ${CODEC_PROFILES[els.codec.value].codecRate} secure`);
   logLine(`codec   : ${CODEC_PROFILES[els.codec.value].displayName}`);
   logLine(`listener: ${els.position.value} (dsp_room ${els.env.value})`);
   logLine(`map     : ${state.mapName} at: 0 x, 0 y, 0 z`);
@@ -716,15 +775,15 @@ const CONFIG_FIELDS = [
   configControl('lp', els.lp),
   configControl('bits', els.bits),
   configControl('agc', els.agc),
+  configControl('maxgain', els.maxGain),
+  configControl('avggain', els.avgGain),
+  configControl('vol', els.volume),
   configControl('frame', els.frameMs),
   configControl('loss', els.loss),
   configControl('warble', els.warble),
   configControl('cdur', els.cDur),
   configControl('cdec', els.cDec),
   configControl('cmix', els.cMix),
-  ['real', () => String(state.realOpus),
-    v => { state.realOpus = Number(v); cvars.snd_real_opus.val = Number(v); },
-    v => ['0', '1'].includes(String(v)) ? String(v) : null],
   ['jit', () => String(state.netJitter),
     (v) => { state.netJitter = Number(v); },
     (v) => { const n = Number(v); return Number.isFinite(n) ? String(Math.min(50, Math.max(0, n))) : null; }]
@@ -832,6 +891,8 @@ function mountSource(mono, sampleRate, name) {
   els.abToggle.disabled = true;
   els.abToggle.textContent = 'A/B: Wet';
   state.abMode = 'wet';
+  state.lastCodecInfo = null;
+  refreshVisualizer();
   setStatus(`${name} · ${duration.toFixed(1)}s · ${sampleRate.toLocaleString()} Hz`, 'success');
   logLine(`FS_MountFile: "${name}" (${duration.toFixed(1)}s) mounted.`, 'sys');
 }
@@ -879,7 +940,7 @@ async function startRecord() {
     if (context && context.state !== 'closed') await context.close();
     if (state.recorder === session) state.recorder = null;
     clearInterval(state.recTick); state.recTick = null;
-    els.mic.textContent = '🎤 Mic';
+    els.mic.textContent = '🎤 Record';
     els.mic.classList.remove('recording');
     els.file.disabled = false;
     els.process.disabled = !state.decodedSource;
@@ -945,39 +1006,74 @@ if (els.mic) els.mic.addEventListener('click', () => {
 /* Input handling                                                     */
 /* ------------------------------------------------------------------ */
 
-els.conIn.addEventListener('input', () => {
+function cvarValue(name) {
+  const c = cvars[name];
+  if (!c) return null;
+  if (c.link) { const el = document.getElementById(c.link); return el ? String(el.value) : null; }
+  return c.val !== undefined ? String(c.val) : null;
+}
+
+function consoleMatches(prefix) {
+  const p = prefix.toLowerCase();
+  return [...new Set([...Object.keys(cvars), ...Object.keys(aliases)])].filter(k => k.startsWith(p)).sort();
+}
+
+function showHint(typed, rest) {
+  const spacer = document.createElement('span');
+  spacer.style.color = 'transparent';
+  spacer.textContent = typed;
+  els.conHint.append(spacer, document.createTextNode(rest));
+}
+
+// Grey inline hint: the first completion while typing a name, then the
+// current value (or usage) once a known command is followed by a space.
+function updateConsoleHint() {
   const val = els.conIn.value;
   els.conHint.replaceChildren();
-  if (!val) { updateCompleteBtn(); return; }
-  const lowerVal = val.toLowerCase();
-  const matches = Object.keys(cvars).filter(k => k.startsWith(lowerVal));
-  if (matches.length) {
-    const match = matches[0];
-    const typedLen = val.length;
-    if (typedLen < match.length) {
-      const spacer = document.createElement('span');
-      spacer.style.color = 'transparent';
-      spacer.textContent = match.substring(0, typedLen);
-      els.conHint.append(spacer, document.createTextNode(match.substring(typedLen)));
-    }
+  const argStart = /^(\S+) $/.exec(val);
+  if (argStart && cvars[argStart[1].toLowerCase()]) {
+    const name = argStart[1].toLowerCase(), c = cvars[name], current = cvarValue(name);
+    const usage = c.usage ? c.usage.replace(/^\S+\s*/, '') : '';
+    if (current !== null) showHint(val, `${current}   (current)`);
+    else if (usage) showHint(val, usage);
+  } else if (val && !/\s/.test(val)) {
+    const match = consoleMatches(val)[0];
+    if (match && match.length > val.length) showHint(val, match.substring(val.length));
   }
   updateCompleteBtn();
-});
+}
+els.conIn.addEventListener('input', updateConsoleHint);
 
-// Show the ⇥ tap-complete button whenever a hint is visible (touch
+// Show the ⇥ tap-complete button whenever a completion is possible (touch
 // keyboards have no Tab key).
 function updateCompleteBtn() {
   if (!els.conComplete) return;
-  els.conComplete.style.display = els.conHint.textContent.trim() ? 'block' : 'none';
+  const val = els.conIn.value;
+  els.conComplete.style.display = val && !/\s/.test(val) && consoleMatches(val).length ? 'block' : 'none';
 }
 
+// Source-style Tab: complete a unique name, otherwise extend to the longest
+// common prefix, otherwise list the candidates with their current values.
 function completeConsole() {
   const val = els.conIn.value;
-  if (!val) return;
-  const matches = Object.keys(cvars).filter(k => k.startsWith(val.toLowerCase()));
-  if (matches.length === 1) { els.conIn.value = matches[0] + " "; els.conHint.textContent = ""; }
-  else if (matches.length > 1) logLine(`> ${matches.join(', ')}`, 'help');
-  updateCompleteBtn();
+  if (!val || /\s/.test(val)) return;
+  const matches = consoleMatches(val);
+  if (matches.length === 1) {
+    els.conIn.value = matches[0] + ' ';
+  } else if (matches.length > 1) {
+    let prefix = matches[0];
+    for (const m of matches) while (!m.startsWith(prefix)) prefix = prefix.slice(0, -1);
+    if (prefix.length > val.length) els.conIn.value = prefix;
+    else {
+      logLine(`] ${val}`, 'text');
+      for (const m of matches.slice(0, 24)) {
+        const value = cvarValue(m);
+        logLine(`  ${m}${value !== null ? ` = "${value}"` : aliases[m] ? ' (alias)' : ''}`, 'help');
+      }
+      if (matches.length > 24) logLine(`  ... ${matches.length - 24} more`, 'help');
+    }
+  }
+  updateConsoleHint();
   els.conIn.focus();
 }
 
@@ -992,8 +1088,8 @@ els.conIn.addEventListener('keydown', (e) => {
       state.cmdIndex = state.cmdHistory.length;
       LS.set('tf2ve_history', state.cmdHistory);
       execCommand(val);
-      els.conIn.value = ''; els.conHint.textContent = '';
-      updateCompleteBtn();
+      els.conIn.value = '';
+      updateConsoleHint();
     }
   } else if (e.key === 'ArrowUp') {
     e.preventDefault();
@@ -1007,7 +1103,7 @@ els.conIn.addEventListener('keydown', (e) => {
       state.cmdIndex++; els.conIn.value = state.cmdHistory[state.cmdIndex];
       els.conIn.dispatchEvent(new Event('input'));
     } else {
-      state.cmdIndex = state.cmdHistory.length; els.conIn.value = ''; els.conHint.textContent = '';
+      state.cmdIndex = state.cmdHistory.length; els.conIn.value = ''; updateConsoleHint();
     }
   } else if (e.key === 'Tab') {
     e.preventDefault();
@@ -1104,6 +1200,14 @@ function processInWorker(source, opts) {
   });
 }
 
+function describeModes(modes) {
+  if (!modes) return 'modes unknown';
+  const total = modes.silk + modes.hybrid + modes.celt;
+  const parts = Object.entries(modes).filter(([, n]) => n > 0)
+    .map(([mode, n]) => `${mode.toUpperCase()} ${Math.round(100 * n / Math.max(1, total))}%`);
+  return parts.length ? parts.join(', ') : 'no packets';
+}
+
 async function runAudioProcess(source, opts) {
   if (typeof Worker !== 'undefined' && location.protocol !== 'file:') {
     try {
@@ -1165,11 +1269,13 @@ els.process.addEventListener('click', async () => {
       lp:          Number(els.lp.value),
       bits:        Number(els.bits.value),
       agc:         els.agc.value === '1',
+      maxGain:     Number(els.maxGain.value),
+      avgGain:     Number(els.avgGain.value),
+      volume:      Number(els.volume.value),
       lossPct:     Number(els.loss.value),
       frameMs:     Number(els.frameMs.value),  // net_split — previously never passed
       enableWarble: els.warble.value === '1',
       jitterPct:   state.netJitter,
-      realCodec:   state.realOpus === 1,
       onProgress:  (p) => {
         const percent = Math.min(100, Math.max(0, Math.round(p * 100)));
         els.process.textContent = `Processing… ${percent}%`;
@@ -1183,12 +1289,12 @@ els.process.addEventListener('click', async () => {
     const { samples, sampleRate, blob, realOpus, codecInfo } = await runAudioProcess(state.decodedSource, opts);
     const took = Math.round(performance.now() - t0);
 
-    // Report the actual processing path, including explicit approximations.
-    if (codecKey === 'steam' || codecKey === 'steam_48') {
-      logLine(realOpus
-        ? `S_Voice: ${codecInfo.version}, ${codecInfo.bitrate / 1000} kbps, 20 ms frames, native PLC`
-        : 'S_Voice: approximate effect or codec bypass selected', 'sys');
-    }
+    // Report the actual processing path: codec version, bitrate and the
+    // Opus modes the encoder really chose.
+    logLine(realOpus
+      ? `S_Voice: ${codecInfo.version}, ${codecInfo.bitrate / 1000} kbps, 20 ms frames, native PLC (${describeModes(codecInfo.modes)})`
+      : 'S_Voice: codec bypassed', 'sys');
+    logLine(`S_Voice: receiver auto-gain ${codecInfo.autoGain ? 'on' : 'off'} at ${codecInfo.voiceRate} Hz`, 'sys');
 
     state.processedBuffer = samples;
     state.processedRate   = sampleRate;
@@ -1212,9 +1318,10 @@ els.process.addEventListener('click', async () => {
     state.downloadName = `${base}_tf2_${codecKey}.wav`;
     els.dl.disabled = false;
 
-    drawStaticWaveform();
-    const method = realOpus ? `Real Opus · ${codecInfo.bitrate / 1000} kbps`
-      : (opts.enableWarble ? 'Approximate codec effect' : 'Codec bypassed');
+    state.renderId++;
+    state.lastCodecInfo = codecInfo;
+    refreshVisualizer();
+    const method = realOpus ? `Real Opus · ${codecInfo.bitrate / 1000} kbps` : 'Codec bypassed';
     setStatus(`Ready · ${method} · ${(took / 1000).toFixed(1)}s render · ${sampleRate.toLocaleString()} Hz`, 'success');
     logLine(`ChangeLevel: rendered ${samples.length} samples @ ${sampleRate}Hz in ${took}ms`, 'sys');
     logLine(`Net_SendPacket: reliable stream ready.`);
@@ -1253,6 +1360,7 @@ els.abToggle.addEventListener('click', () => {
   els.audioDry.muted = wetAudible;
   syncDry(true);
   els.abToggle.textContent = wetAudible ? 'A/B: Wet' : 'A/B: Dry';
+  refreshVisualizer();
 });
 
 // Keep the hidden dry twin locked to the main (wet) transport.
@@ -1271,183 +1379,348 @@ els.audio.addEventListener('ratechange', () => { if (els.audioDry) els.audioDry.
 
 /* ------------------------------------------------------------------ */
 /* Visualizer                                                         */
+/*                                                                    */
+/* WAVE: peak + RMS envelope of the audible version with a playhead.  */
+/* BARS: log-frequency spectrum in dBFS. Live from the AnalyserNode   */
+/*       while playing; computed from the rendered buffer at the      */
+/*       playhead when paused, with the analyser's own window/scale.  */
+/* SPEC: whole-file log-frequency spectrogram with a playhead.        */
 /* ------------------------------------------------------------------ */
 
 const ctx = els.canvas.getContext('2d', { alpha: false });
+const VIZ = {
+  minHz: 40, maxHz: 20000,   // log-frequency axis
+  minDb: -100, maxDb: -10,   // AnalyserNode dB scale (full-scale sine ~ -13.6)
+  fftSize: 4096,
+  bandEdgeHz: 12000          // Opus super-wideband edge used by the Steam profile
+};
+const vizCache = { key: null, image: null };
+let vizPeaks = null, vizPeakTime = 0;
 
 function resizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
   const rect = els.canvas.getBoundingClientRect();
   const W = Math.max(1, Math.round(rect.width * dpr));
   const H = Math.max(1, Math.round(rect.height * dpr));
-  // Only touch the backing store when the size REALLY changed — assigning
-  // canvas.width clears the canvas, and comparing against fractional dpr
-  // sizes failed every frame, wiping the spectrogram history each redraw.
+  // Only touch the backing store when the size really changed: assigning
+  // canvas.width clears it.
   if (els.canvas.width !== W || els.canvas.height !== H) {
     els.canvas.width = W;
     els.canvas.height = H;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
-  return { w: rect.width, h: rect.height };
+  return { w: rect.width, h: rect.height, dpr };
 }
 
-function drawGrid(w, h) {
+// Inferno-like palette for the spectrogram, 256 entries.
+const PALETTE = (() => {
+  const stops = [[0, 0, 4], [40, 11, 84], [101, 21, 110], [159, 42, 99], [212, 72, 66], [245, 125, 21], [250, 193, 39], [252, 255, 164]];
+  const lut = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255 * (stops.length - 1), k = Math.min(stops.length - 2, Math.floor(t)), f = t - k;
+    for (let c = 0; c < 3; c++) lut[i * 3 + c] = stops[k][c] + (stops[k + 1][c] - stops[k][c]) * f;
+  }
+  return lut;
+})();
+
+const dbToUnit = (value) => Math.min(1, Math.max(0, (value - VIZ.minDb) / (VIZ.maxDb - VIZ.minDb)));
+const hzToX = (hz, w, top) => w * Math.log(hz / VIZ.minHz) / Math.log(top / VIZ.minHz);
+
+// Log-spaced [fromBin, toBin] ranges for `count` bars/rows.
+function logBands(count, sampleRate, fftSize) {
+  const top = Math.min(VIZ.maxHz, sampleRate / 2), binHz = sampleRate / fftSize, bands = [];
+  for (let i = 0; i < count; i++) {
+    const lo = VIZ.minHz * Math.pow(top / VIZ.minHz, i / count);
+    const hi = VIZ.minHz * Math.pow(top / VIZ.minHz, (i + 1) / count);
+    bands.push([lo / binHz, hi / binHz]);
+  }
+  return bands;
+}
+
+// Linear-frequency rows for the spectrogram: codec band edges read as
+// horizontal lines instead of being squeezed into the top of a log axis.
+function linearBands(count, sampleRate, fftSize) {
+  const top = Math.min(VIZ.maxHz, sampleRate / 2), binHz = sampleRate / fftSize, bands = [];
+  for (let i = 0; i < count; i++) bands.push([top * i / count / binHz, top * (i + 1) / count / binHz]);
+  return bands;
+}
+
+// Max over each band; narrow low bands interpolate between bins.
+function bandLevels(spectrumDb, bands, out) {
+  const last = spectrumDb.length - 1;
+  for (let i = 0; i < bands.length; i++) {
+    const [lo, hi] = bands[i];
+    let value = -Infinity;
+    if (hi - lo < 1) {
+      const pos = Math.min(last, (lo + hi) / 2), k = Math.floor(pos), f = pos - k;
+      value = spectrumDb[k] * (1 - f) + spectrumDb[Math.min(last, k + 1)] * f;
+    } else {
+      for (let k = Math.ceil(lo); k <= Math.min(last, Math.floor(hi)); k++) value = Math.max(value, spectrumDb[k]);
+    }
+    out[i] = Number.isFinite(value) ? value : VIZ.minDb;
+  }
+  return out;
+}
+
+// In-place radix-2 FFT for the paused/static views.
+function fftReal(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang), half = len >> 1;
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < half; k++) {
+        const a = i + k, b = a + half;
+        const vr = re[b] * cr - im[b] * ci, vi = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - vr; im[b] = im[a] - vi; re[a] += vr; im[a] += vi;
+        const nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr;
+      }
+    }
+  }
+}
+
+const blackman = (() => {
+  const cache = new Map();
+  return (n) => {
+    if (!cache.has(n)) cache.set(n, Float32Array.from({ length: n },
+      (_, i) => 0.42 - 0.5 * Math.cos(2 * Math.PI * i / n) + 0.08 * Math.cos(4 * Math.PI * i / n)));
+    return cache.get(n);
+  };
+})();
+
+// Same windowing and scaling as AnalyserNode.getFloatFrequencyData.
+function spectrumAt(samples, center, fftSize, out) {
+  const re = new Float64Array(fftSize), im = new Float64Array(fftSize), win = blackman(fftSize);
+  const start = Math.round(center - fftSize / 2);
+  for (let i = 0; i < fftSize; i++) {
+    const j = start + i;
+    re[i] = (j >= 0 && j < samples.length ? samples[j] : 0) * win[i];
+  }
+  fftReal(re, im);
+  for (let k = 0; k < fftSize / 2; k++) out[k] = 20 * Math.log10(Math.hypot(re[k], im[k]) / fftSize + 1e-12);
+  return out;
+}
+
+// The version the listener hears: processed (wet) or original (dry).
+function audibleBuffer() {
+  if (state.abMode === 'dry' && state.decodedSource) {
+    return { samples: state.decodedSource.getChannelData(0), rate: state.decodedSource.sampleRate, label: 'DRY' };
+  }
+  if (state.processedBuffer) return { samples: state.processedBuffer, rate: state.processedRate, label: 'WET' };
+  if (state.decodedSource) return { samples: state.decodedSource.getChannelData(0), rate: state.decodedSource.sampleRate, label: 'SOURCE' };
+  return null;
+}
+
+function playheadFraction() {
+  const d = els.audio.duration;
+  return Number.isFinite(d) && d > 0 ? Math.min(1, Math.max(0, els.audio.currentTime / d)) : 0;
+}
+
+function drawBackdrop(w, h) {
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, w, h);
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(0, h/2); ctx.lineTo(w, h/2); ctx.stroke();
 }
 
-function animateSpectrum() {
-  if (!state.isPlaying) return;
-  const { w, h } = resizeCanvas();
-  if (!state.analyser) { drawGrid(w, h); return; }
-  const bufferLength = state.analyser.frequencyBinCount;
-  const dataArray = state.freqData || (state.freqData = new Uint8Array(bufferLength));
-  state.analyser.getByteFrequencyData(dataArray);
-  if (state.vizMode === 'spec') {
-    drawSpectrogramColumn(dataArray, w, h);
-    state.animationId = requestAnimationFrame(animateSpectrum);
+function drawLabel(text, x, y, color = 'rgba(200, 210, 220, 0.75)', align = 'left') {
+  ctx.font = '9px Verdana, sans-serif'; ctx.textAlign = align; ctx.textBaseline = 'top';
+  ctx.fillStyle = color; ctx.fillText(text, x, y);
+}
+
+function drawFrequencyGrid(w, h, top, labels) {
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)'; ctx.lineWidth = 1;
+  for (const hz of [100, 1000, 10000]) {
+    if (hz >= top) continue;
+    const x = Math.round(hzToX(hz, w, top)) + 0.5;
+    if (labels) {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.6)'; ctx.fillRect(x + 1, h - 12, 22, 11);
+      drawLabel(hz >= 1000 ? `${hz / 1000}k` : String(hz), x + 3, h - 11);
+    } else { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke(); }
+  }
+  if (VIZ.bandEdgeHz < top) {
+    const x = Math.round(hzToX(VIZ.bandEdgeHz, w, top)) + 0.5;
+    if (labels) drawLabel('12k', x + 3, 16, 'rgba(255, 184, 34, 0.85)');
+    else {
+      ctx.save(); ctx.setLineDash([3, 3]); ctx.strokeStyle = 'rgba(255, 184, 34, 0.35)';
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke(); ctx.restore();
+    }
+  }
+}
+
+function drawBars(levels, w, h, top, now) {
+  drawBackdrop(w, h);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+  for (const dbLine of [-20, -40, -60, -80]) {
+    const y = Math.round(h * (1 - dbToUnit(dbLine))) + 0.5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  drawFrequencyGrid(w, h, top, false);
+  const count = levels.length, slot = w / count, barW = Math.max(1, slot - 1);
+  if (!vizPeaks || vizPeaks.length !== count) vizPeaks = new Float32Array(count);
+  const dt = vizPeakTime ? Math.min(0.1, (now - vizPeakTime) / 1000) : 0;
+  vizPeakTime = now;
+  for (let i = 0; i < count; i++) {
+    const u = dbToUnit(levels[i]);
+    vizPeaks[i] = Math.max(u, vizPeaks[i] - dt * 0.5);       // caps fall 50%/s
+    const barH = u * h;
+    ctx.fillStyle = `hsl(${Math.round(205 - 205 * Math.min(1, u * 1.15))}, 85%, ${40 + 20 * u}%)`;
+    ctx.fillRect(i * slot, h - barH, barW, barH);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
+    ctx.fillRect(i * slot, Math.round(h - vizPeaks[i] * h) - 1, barW, 1.5);
+  }
+  drawFrequencyGrid(w, h, top, true);
+}
+
+function drawPlayhead(w, h) {
+  if (!state.processedBuffer && !state.decodedSource) return;
+  const x = Math.round(playheadFraction() * w) + 0.5;
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+}
+
+function renderWaveImage(buffer, W, H) {
+  const image = document.createElement('canvas');
+  image.width = W; image.height = H;
+  const g = image.getContext('2d', { alpha: false });
+  g.fillStyle = '#000'; g.fillRect(0, 0, W, H);
+  g.strokeStyle = 'rgba(255, 255, 255, 0.06)';
+  g.beginPath(); g.moveTo(0, H / 2); g.lineTo(W, H / 2); g.stroke();
+  const data = buffer.samples, step = data.length / W, mid = H / 2;
+  for (let x = 0; x < W; x++) {
+    const from = Math.floor(x * step), to = Math.max(from + 1, Math.floor((x + 1) * step));
+    let min = 0, max = 0, sq = 0;
+    for (let i = from; i < to && i < data.length; i++) {
+      const v = data[i];
+      if (v < min) min = v; if (v > max) max = v;
+      sq += v * v;
+    }
+    const rmsValue = Math.sqrt(sq / Math.max(1, to - from));
+    g.fillStyle = '#2a5f86';
+    g.fillRect(x, mid - max * mid, 1, Math.max(1, (max - min) * mid));
+    g.fillStyle = '#66c0f4';
+    g.fillRect(x, mid - rmsValue * mid, 1, Math.max(1, 2 * rmsValue * mid));
+  }
+  return image;
+}
+
+function renderSpectrogramImage(buffer, W, H) {
+  const image = document.createElement('canvas');
+  image.width = W; image.height = H;
+  const g = image.getContext('2d');
+  const pixels = g.createImageData(W, H);
+  const fftSize = 2048, spectrum = new Float32Array(fftSize / 2), level = new Float32Array(H);
+  const rows = linearBands(H, buffer.rate, fftSize), grid = new Float32Array(W * H);
+  const data = buffer.samples, step = data.length / W;
+  for (let x = 0; x < W; x++) {
+    const column = grid.subarray(x * H, (x + 1) * H);
+    column.fill(-200);
+    // Up to three FFTs per column: max-hold keeps short events visible.
+    const hops = Math.max(1, Math.min(3, Math.floor(step / fftSize)));
+    for (let hop = 0; hop < hops; hop++) {
+      spectrumAt(data, x * step + (hop + 0.5) * step / hops, fftSize, spectrum);
+      bandLevels(spectrum, rows, level);
+      for (let r = 0; r < H; r++) if (level[r] > column[r]) column[r] = level[r];
+    }
+  }
+  // Scale each image to its own loud end so band edges stay visible on
+  // loud, clipped renders: 72 dB below the 99th-percentile level.
+  const sorted = grid.filter((_, i) => i % 7 === 0).sort();
+  const topDb = sorted[Math.floor(sorted.length * 0.99)] || VIZ.maxDb, range = 72;
+  for (let x = 0; x < W; x++) {
+    for (let r = 0; r < H; r++) {
+      const u = Math.min(1, Math.max(0, (grid[x * H + r] - topDb + range) / range));
+      const c = Math.round(u * 255) * 3, p = ((H - 1 - r) * W + x) * 4;
+      pixels.data[p] = PALETTE[c]; pixels.data[p + 1] = PALETTE[c + 1]; pixels.data[p + 2] = PALETTE[c + 2]; pixels.data[p + 3] = 255;
+    }
+  }
+  g.putImageData(pixels, 0, 0);
+  return image;
+}
+
+// Whole-file images are cached per buffer, mode and canvas size.
+function staticImage(mode, buffer, W, H) {
+  const key = `${mode}:${buffer.label}:${buffer.samples.length}:${buffer.rate}:${W}x${H}:${state.renderId}`;
+  if (vizCache.key !== key) {
+    vizCache.image = mode === 'spec' ? renderSpectrogramImage(buffer, W, H) : renderWaveImage(buffer, W, H);
+    vizCache.key = key;
+  }
+  return vizCache.image;
+}
+
+function drawVisualizer(now = performance.now()) {
+  const { w, h, dpr } = resizeCanvas();
+  const buffer = audibleBuffer();
+  if (!buffer) { drawBackdrop(w, h); drawLabel('Load audio to visualize', 8, 8); return; }
+  if (state.vizMode === 'bars') {
+    const live = state.isPlaying && state.analyser;
+    const rate = live ? state.audioCtx.sampleRate : buffer.rate;
+    const top = Math.min(VIZ.maxHz, rate / 2);
+    const count = Math.max(16, Math.min(160, Math.floor(w / 5)));
+    if (!state.vizBands || state.vizBands.count !== count || state.vizBands.rate !== rate) {
+      state.vizBands = { count, rate, bands: logBands(count, rate, VIZ.fftSize), levels: new Float32Array(count) };
+    }
+    const spectrum = state.vizSpectrum || (state.vizSpectrum = new Float32Array(VIZ.fftSize / 2));
+    if (live) state.analyser.getFloatFrequencyData(spectrum);
+    else spectrumAt(buffer.samples, playheadFraction() * buffer.samples.length, VIZ.fftSize, spectrum);
+    drawBars(bandLevels(spectrum, state.vizBands.bands, state.vizBands.levels), w, h, top, now);
+    if (live) {
+      const wave = state.vizWave || (state.vizWave = new Float32Array(state.analyser.fftSize));
+      state.analyser.getFloatTimeDomainData(wave);
+      let peak = 0, sq = 0;
+      for (const v of wave) { peak = Math.max(peak, Math.abs(v)); sq += v * v; }
+      const toDb = (v) => (v > 0 ? (20 * Math.log10(v)).toFixed(1) : '-inf');
+      drawLabel(`${buffer.label}  peak ${toDb(peak)}  rms ${toDb(Math.sqrt(sq / wave.length))} dBFS`, 8, 4);
+    } else {
+      drawLabel(`${buffer.label}  spectrum at ${els.audio.currentTime.toFixed(2)} s`, 8, 4);
+    }
     return;
   }
-  drawGrid(w, h);
-  const barWidth = (w / bufferLength) * 2.5;
-  let x = 0, sum = 0;
-  for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
-  const isLoud = (sum / bufferLength) > 60;
-  for (let i = 0; i < bufferLength; i++) {
-    const barHeight = (dataArray[i] / 255) * h;
-    ctx.fillStyle = (isLoud && barHeight > h * 0.6)
-      ? `rgb(${barHeight + 100}, 50, 50)`
-      : `rgb(50, ${barHeight + 100}, 240)`;
-    ctx.fillRect(x, h - barHeight, barWidth, barHeight);
-    x += barWidth + 1;
-  }
-  state.animationId = requestAnimationFrame(animateSpectrum);
+  const image = staticImage(state.vizMode, buffer, Math.round(w * dpr), Math.round(h * dpr));
+  ctx.drawImage(image, 0, 0, w, h);
+  if (state.vizMode === 'spec') drawFrequencyAxisLabels(w, h, buffer.rate);
+  drawLabel(buffer.label, state.vizMode === 'spec' ? 30 : 8, 4);
+  drawPlayhead(w, h);
 }
 
-function drawStaticWaveform() {
-  if (!state.processedBuffer) return;
-  const { w, h } = resizeCanvas();
-  drawGrid(w, h);
-  ctx.fillStyle = '#66c0f4';
-  const data = state.processedBuffer;
-  const step = Math.max(1, Math.ceil(data.length / w));
-  const amp = h / 2;
-  for (let i = 0; i < w; i++) {
-    let min = 1.0, max = -1.0;
-    const startIdx = i * step;
-    const endIdx = Math.min(startIdx + step, data.length);
-    for (let j = startIdx; j < endIdx; j++) {
-      const val = data[j];
-      if (val < min) min = val;
-      if (val > max) max = val;
-    }
-    if (max < min) { min = 0; max = 0; }
-    const yTop = (1 - max) * amp;
-    const yBot = (1 - min) * amp;
-    ctx.fillRect(i, yTop, 1, Math.max(1, yBot - yTop));
+function drawFrequencyAxisLabels(w, h, rate) {
+  const top = Math.min(VIZ.maxHz, rate / 2);
+  for (const hz of [4000, 8000, VIZ.bandEdgeHz, 16000]) {
+    if (hz >= top) continue;
+    const y = h - h * hz / top;
+    const edge = hz === VIZ.bandEdgeHz;
+    const text = `${hz / 1000}k`;
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)'; ctx.fillRect(2, Math.max(0, y - 10), 22, 10);
+    drawLabel(text, 4, Math.max(0, y - 10), edge ? 'rgba(255, 184, 34, 0.9)' : 'rgba(220, 230, 240, 0.85)');
   }
 }
 
-function drawScrubFrame() {
-  if (state.isPlaying || !state.processedBuffer) return;
-  const { w, h } = resizeCanvas();
-  drawGrid(w, h);
-  const pct = els.audio.currentTime / els.audio.duration;
-  if (!isFinite(pct) || pct < 0 || pct > 1) return;
-  const bufferIdx = Math.floor(pct * state.processedBuffer.length);
-  const fftSize = 256, binCount = 128;
-  const out = new Float32Array(binCount);
-  const twoPi = 2 * Math.PI;
-  for (let k = 0; k < binCount; k++) {
-    let r = 0, im = 0;
-    for (let n = 0; n < fftSize; n++) {
-      if (bufferIdx + n >= state.processedBuffer.length) break;
-      const x = state.processedBuffer[bufferIdx + n];
-      const wn = 0.5 * (1 - Math.cos((twoPi * n) / (fftSize - 1)));
-      const theta = (twoPi * k * n) / fftSize;
-      r += (x * wn) * Math.cos(theta);
-      im += (x * wn) * Math.sin(theta);
-    }
-    out[k] = Math.sqrt(r * r + im * im);
-  }
-  const barWidth = (w / binCount) * 2.5;
-  let x = 0;
-  for (let i = 0; i < binCount; i++) {
-    const val = Math.min(1.0, out[i] * 3.5);
-    const barHeight = val * h;
-    ctx.fillStyle = (barHeight > h * 0.6)
-      ? `rgb(${barHeight + 100}, 50, 50)`
-      : `rgb(50, ${barHeight + 100}, 240)`;
-    ctx.fillRect(x, h - barHeight, barWidth, barHeight);
-    x += barWidth + 1;
-  }
+function animateVisualizer(now) {
+  drawVisualizer(now);
+  if (state.isPlaying) state.animationId = requestAnimationFrame(animateVisualizer);
 }
 
-// Scrolling spectrogram: shift left by an exact integer number of device
-// pixels, then paint the newest column on the right.
-//
-// Blur fix: the old version scrolled by drawing the canvas onto itself with a
-// dpr-scaled transform and default (bilinear) smoothing, so source and dest
-// widths never matched exactly. Every pixel got re-resampled ~60x/second and
-// the tiny errors accumulated into horizontal motion blur. Here we drop to raw
-// device-pixel space, turn smoothing OFF, and copy a block whose source and
-// destination dimensions are identical — a 1:1 integer translation with zero
-// resampling, so columns stay razor-crisp no matter how long it scrolls.
-function drawSpectrogramColumn(dataArray, w, h) {
-  const cw = els.canvas.width;                    // backing store, device px
-  const ch = els.canvas.height;
-  const dpr = window.devicePixelRatio || 1;
-  const shift = Math.max(1, Math.round(dpr));     // integer px/frame == 1 CSS px
-
-  ctx.save();
-  ctx.setTransform(1, 0, 0, 1, 0, 0);             // work in raw device pixels
-  ctx.imageSmoothingEnabled = false;              // no bilinear filtering
-
-  // Exact 1:1 copy (src size === dest size) shifted left by `shift` px.
-  ctx.drawImage(els.canvas, shift, 0, cw - shift, ch, 0, 0, cw - shift, ch);
-
-  // Blank the freed strip on the right before painting the new column.
-  ctx.fillStyle = '#000';
-  ctx.fillRect(cw - shift, 0, shift, ch);
-
-  const bins = dataArray.length;
-  const rowH = ch / bins;
-  for (let i = 0; i < bins; i++) {
-    const v = dataArray[i];
-    if (v < 6) continue;
-    ctx.fillStyle = `hsl(${Math.max(0, 240 - v * 1.1)}, 90%, ${8 + (v / 255) * 45}%)`;
-    ctx.fillRect(cw - shift, ch - (i + 1) * rowH, shift, rowH + 0.5);
-  }
-  ctx.restore();                                  // back to the dpr transform
+function refreshVisualizer() {
+  if (!state.isPlaying) drawVisualizer();
 }
 
-// Segmented BARS | SPEC control: light the active side, expose it to
-// assistive tech, and reset the canvas for the chosen mode.
+// Segmented WAVE | BARS | SPEC control.
 function setVizMode(mode) {
   if (state.vizMode === mode) return;
   state.vizMode = mode;
-  const isSpec = mode === 'spec';
-  if (els.vizBars) {
-    els.vizBars.classList.toggle('active', !isSpec);
-    els.vizBars.setAttribute('aria-pressed', String(!isSpec));
+  for (const [button, value] of [[els.vizWave, 'wave'], [els.vizBars, 'bars'], [els.vizSpec, 'spec']]) {
+    if (!button) continue;
+    button.classList.toggle('active', mode === value);
+    button.setAttribute('aria-pressed', String(mode === value));
   }
-  if (els.vizSpec) {
-    els.vizSpec.classList.toggle('active', isSpec);
-    els.vizSpec.setAttribute('aria-pressed', String(isSpec));
-  }
-  const { w, h } = resizeCanvas();
-  if (isSpec) {
-    // Start the spectrogram from a clean black field so the bar grid's
-    // centre line doesn't scroll across it as a stray streak.
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, w, h);
-  } else {
-    drawGrid(w, h);
-    if (!state.isPlaying) drawStaticWaveform();
-  }
+  vizPeaks = null;
+  refreshVisualizer();
 }
 
+if (els.vizWave) els.vizWave.addEventListener('click', () => setVizMode('wave'));
 if (els.vizBars) els.vizBars.addEventListener('click', () => setVizMode('bars'));
 if (els.vizSpec) els.vizSpec.addEventListener('click', () => setVizMode('spec'));
 
@@ -1456,7 +1729,10 @@ els.audio.addEventListener('play', () => {
     try {
       state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       state.analyser = state.audioCtx.createAnalyser();
-      state.analyser.fftSize = 256;
+      state.analyser.fftSize = VIZ.fftSize;
+      state.analyser.smoothingTimeConstant = 0.6;
+      state.analyser.minDecibels = VIZ.minDb;
+      state.analyser.maxDecibels = VIZ.maxDb;
       state.sourceNode = state.audioCtx.createMediaElementSource(els.audio);
       state.sourceNode.connect(state.analyser);
       state.analyser.connect(state.audioCtx.destination);
@@ -1467,45 +1743,67 @@ els.audio.addEventListener('play', () => {
         state.sourceNodeDry.connect(state.analyser);
       }
     } catch (e) {
-      state.analyser = null;   // visualizer off; playback itself unaffected
+      state.analyser = null;   // visualizer falls back to buffer analysis
     }
   }
   if (state.audioCtx && state.audioCtx.state === 'suspended') state.audioCtx.resume();
   if (els.audioDry && els.audioDry.src) { syncDry(); els.audioDry.play().catch(() => {}); }
   state.isPlaying = true;
   cancelAnimationFrame(state.animationId);
-  animateSpectrum();
+  state.animationId = requestAnimationFrame(animateVisualizer);
 });
-els.audio.addEventListener('pause',  () => { if (els.audioDry) els.audioDry.pause(); state.isPlaying = false; cancelAnimationFrame(state.animationId); drawScrubFrame(); });
-els.audio.addEventListener('ended',  () => { if (els.audioDry) els.audioDry.pause(); state.isPlaying = false; cancelAnimationFrame(state.animationId); drawStaticWaveform(); });
-els.audio.addEventListener('seeking', drawScrubFrame);
-els.audio.addEventListener('seeked',  () => { syncDry(); drawScrubFrame(); });
-window.addEventListener('resize', () => { if (!state.isPlaying) drawStaticWaveform(); });
+function stopVisualizer() {
+  if (els.audioDry) els.audioDry.pause();
+  state.isPlaying = false;
+  cancelAnimationFrame(state.animationId);
+  refreshVisualizer();
+}
+els.audio.addEventListener('pause', stopVisualizer);
+els.audio.addEventListener('ended', stopVisualizer);
+els.audio.addEventListener('seeked', () => { syncDry(); refreshVisualizer(); });
+els.audio.addEventListener('timeupdate', refreshVisualizer);
+let resizeTimer = 0;
+window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(refreshVisualizer, 150); });
 
 /* ------------------------------------------------------------------ */
 /* Net graph (only spins when visible)                                */
+/*                                                                    */
+/* Voice-channel numbers come from the last render: packets per       */
+/* second from net_split, payload rate from the real encoded bytes,   */
+/* and the loss the burst model actually produced.                    */
 /* ------------------------------------------------------------------ */
 
-let lastTime = performance.now(), frameCount = 0, netGraphId = 0;
+let lastTime = performance.now(), frameCount = 0;
 function updateNetGraph() {
-  netGraphId = requestAnimationFrame(updateNetGraph);
+  requestAnimationFrame(updateNetGraph);
   const now = performance.now();
   frameCount++;
   if (now - lastTime < 500) return;
-  if (els.ng.style.display !== 'none') {
-    const fps = Math.round(frameCount * 2);
+  if (els.ng.style.display === 'block') {
+    const fps = Math.round(frameCount * 1000 / (now - lastTime));
     els.ngFps.textContent = fps;
-    const lerpBase = parseFloat(els.frameMs.value) * 2;
-    els.ngLerp.textContent = (lerpBase + (Math.random() * 2)).toFixed(1);
-    els.ngPing.textContent = Math.floor(Math.random() * 15) + 5;
-    els.ngLoss.textContent = els.loss.value;
+    els.ngPing.textContent = 5 + Math.floor(Math.random() * 4 + state.netJitter / 5 * Math.random());
+    els.ngLerp.textContent = '100.0';
+    const info = state.lastCodecInfo;
+    if (info && info.frames) {
+      const seconds = info.frames * info.frameMs / 1000;
+      const pps = (50 / (info.framesPerPacket || 1)).toFixed(0);
+      const kps = (info.encodedBytes / seconds / 1024).toFixed(2);
+      els.ngIn.textContent = `${pps} ${kps}`;
+      els.ngOut.textContent = `${pps} ${kps}`;
+      els.ngLoss.textContent = Math.round(100 * info.lostFrames / info.frames);
+    } else {
+      els.ngIn.textContent = '0 0.00';
+      els.ngOut.textContent = '0 0.00';
+      els.ngLoss.textContent = els.loss.value;
+    }
     els.ngFill.style.width = Math.min(100, (fps / 60) * 100) + '%';
     els.ngFill.style.background = (fps < 30) ? '#ff4040' : '#a4d007';
   }
   frameCount = 0;
   lastTime = now;
 }
-updateNetGraph();
+requestAnimationFrame(updateNetGraph);
 
 // Pause the background event simulator while the tab is hidden (saves
 // battery on mobile; resumes where it left off).
@@ -1526,6 +1824,9 @@ document.addEventListener('visibilitychange', () => {
     : [];
   state.cmdIndex = state.cmdHistory.length;
   applyHashConfig();
+  updateSignalChain();
+  refreshVisualizer();
+  if (!location.hash || location.hash.length < 2) setActivePreset('modern');
 
   const bootLogs = [
     { t: "Valve Software - Source Engine [ Build 22050 ]", c: 'text' },
@@ -1534,9 +1835,9 @@ document.addEventListener('visibilitychange', () => {
     { t: "execing autoexec.cfg", c: 'text' },
     { t: "cc_lang_listener: loading linguistics_en.txt", c: 'text' },
     { t: "Sound System: Init (2 channels, 16bit)", c: 'sys' },
-    { t: `sv_voicecodec: ${(CODEC_PROFILES[els.codec.value] || CODEC_PROFILES.celt_22).displayName}`, c: 'cmd' },
+    { t: `sv_voicecodec: ${(CODEC_PROFILES[els.codec.value] || CODEC_PROFILES.steam).displayName}`, c: 'cmd' },
     { t: "Parallel processing initialized", c: 'text' },
-    { t: "Type 'help' for commands. Try 'exec preset_spam' for the classic TF2 sound.", c: 'sys' },
+    { t: "Type 'help' for commands. Try 'exec preset_spam' for overdriven mic spam.", c: 'sys' },
     { t: "System Ready.", c: 'sys' }
   ];
   let delay = 0;

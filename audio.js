@@ -1,12 +1,15 @@
 /* TF2 Voice Emulator — local DSP and codec orchestration.
  *
- * Capture gain/saturation -> resampling -> capture EQ
- * -> real libopus OR explicitly approximate legacy transform -> packet loss
- * and concealment -> optional voice leveling -> playback resampling
- * -> listener gain / modeled room DSP.
+ * Sender:   downmix -> capture gain / int16 clip -> resample to the codec
+ *           rate -> optional capture filters -> real libopus encode
+ * Network:  20 ms packets grouped by net_split, seeded burst loss
+ * Receiver: libopus decode + native concealment -> profile EQ -> engine
+ *           voice rate -> Source-style auto-gain with int16 clamp -> 44.1 kHz
+ *           mixer (room DSP) -> output stage -> output rate
  *
- * Real Opus lives in opus-codec.mjs. The legacy transform and room processors
- * are effects inspired by Source; they are not Valve's implementations.
+ * The Steam profile and receiver path are fitted to a paired 2026
+ * voice_loopback recording (tests/REFERENCE_2026.md). Room processors are
+ * effects built from Valve's preset data, not Valve's implementations.
  * Same decoded PCM + settings + pinned runtime gives repeatable output.
  *
  * TF2Audio.process(buffer, opts) -> { samples, sampleRate, blob, codecInfo }
@@ -21,12 +24,13 @@
   /* ------------------------------------------------------------------ */
 
   const TAU = Math.PI * 2;
+  const INT16_FULL_SCALE = 32767 / 32768;
   const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
   const finiteOr = (value, fallback) => {
     const number = Number(value);
     return Number.isFinite(number) ? number : fallback;
   };
-  const nextPow2 = (n) => { let p = 1; while (p < n) p <<= 1; return p; };
+  const gcd = (a, b) => { while (b) { const t = a % b; a = b; b = t; } return a; };
 
   function mulberry32(seed) {
     let a = seed >>> 0;
@@ -38,7 +42,7 @@
     };
   }
 
-  // Deterministic hash -> [0,1). Used for folding signs, comb detuning, etc.
+  // Deterministic hash -> [0,1). Used for comb detuning in the room DSP.
   function hash01(a, b, c) {
     const s = Math.sin(a * 12.9898 + b * 78.233 + (c || 0) * 37.719) * 43758.5453;
     return s - Math.floor(s);
@@ -111,68 +115,136 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Resampling — polyphase windowed-sinc (anti-alias / anti-image)      */
+  /* Resampling — exact rational polyphase, Kaiser-windowed sinc         */
+  /*                                                                    */
+  /* Equivalent to upsampling by `up`, filtering at the lower Nyquist and */
+  /* decimating by `down`, but only the needed taps are evaluated. The    */
+  /* filter is -6 dB at the lower Nyquist, flat to ~0.9 of it and at      */
+  /* least 75 dB down 1.17x beyond it. Output is time-aligned to input.   */
   /* ------------------------------------------------------------------ */
 
-  function resampleSinc(input, inRate, outRate) {
-    if (!input.length || inRate === outRate) return input.slice(0);
-    const ratio = inRate / outRate;
-    const outLen = Math.max(1, Math.round(input.length / ratio));
-    const out = new Float32Array(outLen);
-
-    const fc = 0.5 * Math.min(1, outRate / inRate) * 0.92;
-    const zeros = 12;
-    const halfW = Math.min(192, Math.max(4, Math.ceil(zeros / (2 * fc))));
-    const taps = 2 * halfW;
-    const PHASES = 128;
-
-    const table = new Float32Array((PHASES + 1) * taps);
-    for (let p = 0; p <= PHASES; p++) {
-      const frac = p / PHASES;
-      const row = p * taps;
-      let sum = 0;
-      for (let k = 0; k < taps; k++) {
-        const t = (k - halfW + 1) - frac;
-        const x = 2 * fc * t;
-        const sinc = x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x);
-        const u = Math.PI * clamp(t / halfW, -1, 1);
-        const w = 0.42 + 0.5 * Math.cos(u) + 0.08 * Math.cos(2 * u);
-        const v = sinc * w;
-        table[row + k] = v;
-        sum += v;
-      }
-      const norm = sum !== 0 ? 1 / sum : 1;
-      for (let k = 0; k < taps; k++) table[row + k] *= norm;
+  function besselI0(x) {
+    let sum = 1, term = 1;
+    const q = x * x / 4;
+    for (let k = 1; k < 64; k++) {
+      term *= q / (k * k);
+      sum += term;
+      if (term < sum * 1e-16) break;
     }
+    return sum;
+  }
 
-    const lastIn = input.length - 1;
+  const KAISER_BETA = 8.6;
+  const ZEROS_PER_SIDE = 16;
+  const kernelCache = new Map();
+  function resampleKernel(up, down) {
+    const key = `${up}/${down}`;
+    if (kernelCache.has(key)) return kernelCache.get(key);
+    const m = Math.max(up, down);
+    const half = ZEROS_PER_SIDE * m;
+    const h = new Float64Array(2 * half + 1);
+    const i0Beta = besselI0(KAISER_BETA);
+    let sum = 0;
+    for (let k = 0; k <= 2 * half; k++) {
+      const t = (k - half) / m;
+      const sinc = t === 0 ? 1 : Math.sin(Math.PI * t) / (Math.PI * t);
+      const r = (k - half) / half;
+      const w = besselI0(KAISER_BETA * Math.sqrt(Math.max(0, 1 - r * r))) / i0Beta;
+      h[k] = sinc * w;
+      sum += h[k];
+    }
+    const scale = up / sum;
+    for (let k = 0; k < h.length; k++) h[k] *= scale;
+    const kernel = { h, half };
+    if (kernelCache.size > 16) kernelCache.clear();
+    kernelCache.set(key, kernel);
+    return kernel;
+  }
+
+  function resampleSinc(input, inRate, outRate) {
+    inRate = Math.round(inRate); outRate = Math.round(outRate);
+    if (!input.length || inRate === outRate) return Float32Array.from(input);
+    const g = gcd(inRate, outRate);
+    const up = outRate / g, down = inRate / g;
+    const { h, half } = resampleKernel(up, down);
+    const n = input.length;
+    const outLen = Math.max(1, Math.round(n * up / down));
+    const out = new Float32Array(outLen);
     for (let i = 0; i < outLen; i++) {
-      const c = i * ratio;
-      const base = Math.floor(c);
-      const row = Math.round((c - base) * PHASES) * taps;
-      const j0 = base - halfW + 1;
+      const t = i * down;                          // position at the up-rate
+      let j = Math.ceil((t - half) / up);
+      if (j < 0) j = 0;
+      let jEnd = Math.floor((t + half) / up);
+      if (jEnd > n - 1) jEnd = n - 1;
+      let k = half + t - j * up;
       let acc = 0;
-      for (let k = 0; k < taps; k++) {
-        let j = j0 + k;
-        if (j < 0) j = 0; else if (j > lastIn) j = lastIn;
-        acc += input[j] * table[row + k];
-      }
+      for (; j <= jEnd; j++, k -= up) acc += input[j] * h[k];
       out[i] = acc;
     }
     return out;
   }
 
-  function resampleLinear(input, inRate, outRate) {  // legacy export
-    if (inRate === outRate) return input.slice(0);
+  // Source's software mixer converts voice to the mix rate by linear
+  // interpolation; used for the low-rate legacy profiles.
+  function resampleLinear(input, inRate, outRate) {
+    if (inRate === outRate) return Float32Array.from(input);
     const ratio = inRate / outRate;
-    const outLen = Math.floor(input.length / ratio);
+    const outLen = Math.max(1, Math.round(input.length / ratio));
     const out = new Float32Array(outLen);
+    const last = input.length - 1;
     for (let i = 0; i < outLen; i++) {
-      const srcPos = i * ratio;
-      const i0 = srcPos | 0;
-      const i1 = Math.min(i0 + 1, input.length - 1);
-      const frac = srcPos - i0;
+      const pos = i * ratio;
+      const i0 = Math.min(last, pos | 0);
+      const i1 = Math.min(last, i0 + 1);
+      const frac = pos - (pos | 0);
       out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+    }
+    return out;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* FIR design / filtering                                             */
+  /* ------------------------------------------------------------------ */
+
+  // Frequency-sampling design with a Hamming window, matching
+  // scipy.signal.firwin2 (linear gains interpolated between points).
+  function firwin2(numtaps, freqs, gainsDb, rate) {
+    const nyq = rate / 2;
+    const nfreqs = 1 + (1 << Math.ceil(Math.log2(numtaps)));
+    const size = 2 * (nfreqs - 1);
+    const re = new Float64Array(size), im = new Float64Array(size);
+    const gains = gainsDb.map(db => Math.pow(10, db / 20));
+    for (let k = 0; k < nfreqs; k++) {
+      const f = nyq * k / (nfreqs - 1);
+      let seg = 0;
+      while (seg < freqs.length - 2 && f > freqs[seg + 1]) seg++;
+      const span = freqs[seg + 1] - freqs[seg];
+      const mix = span > 0 ? clamp((f - freqs[seg]) / span, 0, 1) : 0;
+      const gain = gains[seg] + (gains[seg + 1] - gains[seg]) * mix;
+      const phase = -(numtaps - 1) / 2 * Math.PI * k / (nfreqs - 1);
+      re[k] = gain * Math.cos(phase);
+      im[k] = gain * Math.sin(phase);
+      if (k > 0 && k < nfreqs - 1) { re[size - k] = re[k]; im[size - k] = -im[k]; }
+    }
+    im[nfreqs - 1] = 0;
+    fftInPlace(re, im, true);
+    const taps = new Float64Array(numtaps);
+    for (let n = 0; n < numtaps; n++) {
+      taps[n] = re[n] * (0.54 - 0.46 * Math.cos(TAU * n / (numtaps - 1)));
+    }
+    return taps;
+  }
+
+  // Linear-phase FIR with its group delay removed: output aligns to input.
+  function applyFirZeroPhase(x, taps) {
+    const n = x.length, m = taps.length, center = (m - 1) >> 1;
+    const out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      let acc = 0;
+      const k0 = Math.max(0, i + center - (n - 1));
+      const k1 = Math.min(m - 1, i + center);
+      for (let k = k0; k <= k1; k++) acc += taps[k] * x[i + center - k];
+      out[i] = acc;
     }
     return out;
   }
@@ -208,36 +280,10 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Pre/de-emphasis (matched pair, applied at codec rate)               */
+  /* Nonlinearities                                                      */
   /* ------------------------------------------------------------------ */
 
-  function preEmphasis(samples, a) {
-    if (!a) return samples;
-    const out = new Float32Array(samples.length);
-    let prev = 0;
-    for (let i = 0; i < samples.length; i++) {
-      out[i] = samples[i] - a * prev;
-      prev = samples[i];
-    }
-    return out;
-  }
-
-  function deEmphasis(samples, a) {
-    if (!a) return samples;
-    const out = new Float32Array(samples.length);
-    let prev = 0;
-    for (let i = 0; i < samples.length; i++) {
-      prev = samples[i] + a * prev;
-      out[i] = prev;
-    }
-    return out;
-  }
-
-  /* ------------------------------------------------------------------ */
-  /* Capture nonlinearities                                              */
-  /* ------------------------------------------------------------------ */
-
-  // Hard clip — the sound of Windows "+20 dB mic boost" hitting the ADC.
+  // int16 conversion: anything past full scale is flattened.
   function hardClip(samples, t) {
     const out = new Float32Array(samples.length);
     for (let i = 0; i < samples.length; i++) out[i] = clamp(samples[i], -t, t);
@@ -258,273 +304,43 @@
     return out;
   }
 
-  // Modeled receive-side leveling, informed by paired 2026 loopback/music
-  // recordings, NOT Valve's recovered implementation. RMS detection after
-  // decoding avoids making bass filtering increase output volume swings.
-  // Ignore the codec's tiny silence residual instead of amplifying it.
-  function applyVoiceLevel(samples, rate) {
-    const target = 0.10;
-    const envA = Math.exp(-1 / (0.030 * rate));
-    const upA  = Math.exp(-1 / (0.050 * rate));
-    const dnA  = Math.exp(-1 / (0.010 * rate));
+  /* ------------------------------------------------------------------ */
+  /* Receiver auto-gain (Source voice channel)                          */
+  /*                                                                    */
+  /* Each finished block's mean |x| sets the NEXT gain: avgGain / mean,  */
+  /* capped at maxGain and multiplied by voice_scale. The gain ramps     */
+  /* linearly from the previous target across the following block and    */
+  /* every sample is clamped to int16. With music this keeps the mean at */
+  /* ~half scale and flattens ~13% of samples: the hard-clipped, level-  */
+  /* locked sound measured in the 2026 recording. Digitally silent       */
+  /* blocks hold the previous target instead of jumping to maxGain.      */
+  /* ------------------------------------------------------------------ */
+
+  function receiverAutoGain(samples, options = {}) {
+    const block = Math.max(1, Math.round(finiteOr(options.blockSize, 128)));
+    const avgGain = Math.max(0, finiteOr(options.avgGain, 0.5));
+    const maxGain = Math.max(0, finiteOr(options.maxGain, 16));
+    const scale = Math.max(0, finiteOr(options.scale, 1));
+    const silence = 1 / 32768;
     const out = new Float32Array(samples.length);
-    let energy = 0, gain = 1;
-    for (let i = 0; i < samples.length; i++) {
-      energy = energy * envA + samples[i] * samples[i] * (1 - envA);
-      const want = energy < 1e-8 ? 1 : clamp(target / Math.sqrt(energy), 0.05, 10);
-      const alpha = want < gain ? dnA : upA;
-      gain = gain * alpha + want * (1 - alpha);
-      out[i] = samples[i] * gain;
+    let current = scale, next = scale;
+    for (let start = 0; start < samples.length; start += block) {
+      const end = Math.min(samples.length, start + block);
+      const step = (next - current) / block;
+      let gain = current, total = 0;
+      for (let i = start; i < end; i++) {
+        const x = samples[i];
+        total += Math.abs(x);
+        gain += step;
+        const y = x * gain;
+        out[i] = y > INT16_FULL_SCALE ? INT16_FULL_SCALE : (y < -INT16_FULL_SCALE ? -INT16_FULL_SCALE : y);
+      }
+      if (end - start < block) break;
+      current = next;
+      const mean = total / block;
+      if (mean > silence) next = Math.min(maxGain, avgGain / mean) * scale;
     }
     return out;
-  }
-
-  /* ==================================================================== */
-  /* TRANSFORM CODEC EMULATION                                            */
-  /*                                                                      */
-  /* CELT-inspired effect: per frame we quantize each critical           */
-  /* band's energy (coarse 6 dB steps + fine bits) and the band's shape   */
-  /* as a PVQ pulse vector, under a fixed bit budget. Bands that get no   */
-  /* shape bits are reconstructed by FOLDING spectrum up from lower       */
-  /* bands — that folding is the signature low-bitrate warble/birdies.    */
-  /*                                                                      */
-  /* This approximation uses an STFT (sqrt-Hann, 50% overlap, hop =      */
-  /* 512 samples for the CELT-style presets). This is neither bit-exact  */
-  /* CELT nor a verified perceptual match; no real bitstream is emitted. */
-  /* ==================================================================== */
-
-  // Bark-style band edges (Hz), same layout family CELT uses.
-  const BARK_EDGES = [0, 200, 400, 600, 800, 1000, 1200, 1400, 1600, 2000,
-    2400, 2800, 3200, 4000, 4800, 5600, 6800, 8000, 9600, 12000, 15600, 20000, 26000];
-
-  function makeBandEdges(rate, fftSize) {
-    const nyqBin = fftSize >> 1;
-    const binHz = rate / fftSize;
-    const edges = [0];
-    for (let i = 1; i < BARK_EDGES.length; i++) {
-      const bin = Math.min(nyqBin, Math.round(BARK_EDGES[i] / binHz));
-      if (bin > edges[edges.length - 1] + 1) edges.push(bin);
-      if (bin >= nyqBin) break;
-    }
-    if (edges[edges.length - 1] < nyqBin) edges.push(nyqBin);
-    return edges;
-  }
-
-  // Rough per-pulse bit cost — enough to reproduce CELT's allocation
-  // behaviour (low bands get resolved, high bands starve and fold).
-  function pulsesForBits(dims, bits) {
-    if (bits <= 0.5 || dims <= 0) return 0;
-    let K = 0, used = 0;
-    while (K < 96) {
-      const cost = Math.log2(1 + (2 * dims) / (K + 1)) + 1;
-      if (used + cost > bits) break;
-      used += cost;
-      K++;
-    }
-    return K;
-  }
-
-  // PVQ: quantize vec to K signed integer pulses (L1 = K), return the
-  // L2-normalised reconstruction.
-  function pvqQuantize(vec, K) {
-    const n = vec.length;
-    const y = new Float32Array(n);
-    let l1 = 0;
-    for (let i = 0; i < n; i++) l1 += Math.abs(vec[i]);
-    if (l1 < 1e-12) { y[0] = K; }
-    else {
-      let used = 0;
-      for (let i = 0; i < n; i++) {
-        const t = K * Math.abs(vec[i]) / l1;
-        const q = Math.floor(t + 0.5);
-        y[i] = vec[i] < 0 ? -q : q;
-        used += q;
-      }
-      // Adjust pulse count to exactly K (guarded; each step moves one pulse)
-      let guard = 2 * n + K + 8;
-      while (used > K && guard-- > 0) {
-        let best = -1, bestErr = -Infinity;
-        for (let i = 0; i < n; i++) {
-          const a = Math.abs(y[i]);
-          if (a <= 0) continue;
-          const err = a - K * Math.abs(vec[i]) / l1;   // most over-allocated
-          if (err > bestErr) { bestErr = err; best = i; }
-        }
-        if (best < 0) break;
-        y[best] -= Math.sign(y[best]);
-        used--;
-      }
-      while (used < K && guard-- > 0) {
-        let best = 0, bestErr = -Infinity;
-        for (let i = 0; i < n; i++) {
-          const err = K * Math.abs(vec[i]) / l1 - Math.abs(y[i]); // most under-allocated
-          if (err > bestErr) { bestErr = err; best = i; }
-        }
-        y[best] += (vec[best] < 0 ? -1 : 1);
-        used++;
-      }
-    }
-    let e = 0;
-    for (let i = 0; i < n; i++) e += y[i] * y[i];
-    const s = e > 0 ? 1 / Math.sqrt(e) : 0;
-    for (let i = 0; i < n; i++) y[i] *= s;
-    return y;
-  }
-
-  // Spectral folding: build a unit shape for a bit-starved band by tiling
-  // the lower band's quantized shape with pseudo-random signs.
-  function foldShape(source, dims, frameIdx, bandIdx) {
-    const y = new Float32Array(dims);
-    if (source && source.length) {
-      for (let i = 0; i < dims; i++) {
-        const v = source[i % source.length];
-        const flip = hash01(frameIdx, bandIdx, i) < 0.5 ? -1 : 1;
-        y[i] = v * flip;
-      }
-    } else {
-      for (let i = 0; i < dims; i++) y[i] = hash01(frameIdx, bandIdx, i) - 0.5;
-    }
-    let e = 0;
-    for (let i = 0; i < dims; i++) e += y[i] * y[i];
-    const s = e > 0 ? 1 / Math.sqrt(e) : 0;
-    for (let i = 0; i < dims; i++) y[i] *= s;
-    return y;
-  }
-
-  /**
-   * Run the transform codec over `samples`.
-   *   codecCfg: { frameSamples, sampleRate }
-   *   quantize: false = transparent transform (band-limit only)
-   *   bytesPerFrame: bit budget when quantizing
-   *   lossMask: Uint8Array per frame (1 = lost) or null
-   */
-  async function transformCodec(samples, rate, frameSamples, quantize, bytesPerFrame, lossMask, onProgress) {
-    if (!samples.length) return samples;
-    const hop = nextPow2(Math.max(64, frameSamples | 0));  // STFT hop must be pow-2
-    const fftSize = hop * 2;
-    const nyqBin = hop;
-
-    const win = new Float32Array(fftSize);
-    for (let n = 0; n < fftSize; n++) win[n] = Math.sin(Math.PI * (n + 0.5) / fftSize);
-
-    const edges = makeBandEdges(rate, fftSize);
-    const nb = edges.length - 1;
-
-    // --- bit allocation (fixed per render) ---
-    const totalBits = Math.max(48, Math.round(bytesPerFrame * 8));
-    const fine = new Uint8Array(nb);
-    const K = new Uint16Array(nb);
-    {
-      let energyBits = 0;
-      for (let b = 0; b < nb; b++) {
-        fine[b] = b < nb / 2 ? 2 : 1;
-        energyBits += 2 + fine[b];
-      }
-      const shapeTotal = Math.max(0, totalBits - energyBits);
-      const w = new Float32Array(nb);
-      let wsum = 0;
-      for (let b = 0; b < nb; b++) {
-        const width = edges[b + 1] - edges[b];
-        w[b] = Math.pow(width, 0.85) * (1.25 - 0.5 * b / Math.max(1, nb - 1));
-        wsum += w[b];
-      }
-      for (let b = 0; b < nb; b++) {
-        const dims = 2 * (edges[b + 1] - edges[b]);
-        K[b] = pulsesForBits(dims, shapeTotal * w[b] / wsum);
-      }
-    }
-
-    // --- codec state ---
-    const prevLogE = new Float32Array(nb).fill(-14);
-    let havePrev = false;
-    const prevRe = new Float32Array(fftSize);
-    const prevIm = new Float32Array(fftSize);
-    let consecLost = 0;
-
-    const pad = hop;
-    const paddedLen = samples.length + 2 * pad + fftSize;
-    const acc = new Float32Array(paddedLen);
-    const re = new Float32Array(fftSize);
-    const im = new Float32Array(fftSize);
-
-    const shapes = new Array(nb).fill(null);   // per-band quantized shapes (this frame)
-
-    const totalHops = Math.max(1, Math.ceil((paddedLen - fftSize) / hop) + 1);
-    for (let start = 0, hopIdx = 0; start + fftSize <= paddedLen; start += hop, hopIdx++) {
-      if ((hopIdx & 63) === 63) {
-        if (onProgress) onProgress(hopIdx / totalHops);
-        await microYield();
-      }
-      for (let n = 0; n < fftSize; n++) {
-        const j = start + n - pad;
-        re[n] = (j >= 0 && j < samples.length ? samples[j] : 0) * win[n];
-        im[n] = 0;
-      }
-      fftInPlace(re, im, false);
-
-      const frameIdx = Math.max(0, hopIdx - 1);  // frame index in input time
-      const lost = lossMask ? (frameIdx < lossMask.length && lossMask[frameIdx] === 1) : false;
-
-      if (lost) {
-        // --- decoder PLC: repeat last good spectrum with decay ---
-        consecLost++;
-        const g = consecLost > 6 ? 0 : Math.pow(0.72, consecLost);
-        if (havePrev && g > 0) {
-          for (let k = 0; k < fftSize; k++) { re[k] = prevRe[k] * g; im[k] = prevIm[k] * g; }
-        } else {
-          re.fill(0); im.fill(0);
-        }
-      } else {
-        consecLost = 0;
-        if (quantize) {
-          // --- encode/decode this frame under the bit budget ---
-          for (let b = 0; b < nb; b++) {
-            const s = edges[b], e = edges[b + 1], m = e - s, dims = 2 * m;
-
-            // 1) band energy -> coarse (6 dB) + fine quantization w/ prediction
-            let en = 1e-20;
-            for (let k = s; k < e; k++) en += re[k] * re[k] + im[k] * im[k];
-            const logE = clamp(0.5 * Math.log2(en), -30, 20);   // log2 amplitude
-            const pred = havePrev ? prevLogE[b] : logE;
-            const step = 1 / (1 << fine[b]);                    // in 6 dB units
-            const qLogE = pred + Math.round((logE - pred) / step) * step;
-            prevLogE[b] = qLogE;
-            const E = Math.pow(2, qLogE);
-
-            // 2) band shape -> PVQ pulses, or folding when starved
-            let shape;
-            if (K[b] > 0) {
-              const vec = new Float32Array(dims);
-              for (let i = 0; i < m; i++) { vec[2 * i] = re[s + i]; vec[2 * i + 1] = im[s + i]; }
-              shape = pvqQuantize(vec, K[b]);
-            } else {
-              shape = foldShape(shapes[b > 0 ? b - 1 : 0], dims, frameIdx, b);
-            }
-            shapes[b] = shape;
-
-            // 3) reconstruct: unit shape × quantized energy
-            for (let i = 0; i < m; i++) {
-              re[s + i] = shape[2 * i] * E;
-              im[s + i] = shape[2 * i + 1] * E;
-            }
-          }
-          // zero anything above the top band, keep spectrum conjugate-symmetric
-          for (let k = edges[nb]; k <= nyqBin; k++) { re[k] = 0; im[k] = 0; }
-          for (let k = 1; k < nyqBin; k++) {
-            re[fftSize - k] = re[k];
-            im[fftSize - k] = -im[k];
-          }
-          im[0] = 0; im[nyqBin] = 0;
-        }
-        prevRe.set(re); prevIm.set(im);
-        havePrev = true;
-      }
-
-      fftInPlace(re, im, true);
-      for (let n = 0; n < fftSize; n++) acc[start + n] += re[n] * win[n];
-    }
-
-    return acc.slice(pad, pad + samples.length);
   }
 
   /* ------------------------------------------------------------------ */
@@ -557,8 +373,8 @@
   }
 
   /* Late-packet "crackle": when the jitter buffer starves, playback emits
-   * short hard gaps (1-3 ms) at packet boundaries — the classic TF2 voice
-   * pop/crunch on a bad connection. Deterministic via the seeded PRNG.   */
+   * short hard gaps (1-3 ms) at packet boundaries. An artistic effect, not
+   * a jitter-buffer simulation. Deterministic via the seeded PRNG.        */
   function applyJitterCrackle(samples, rate, packetSamples, pct, rand) {
     if (!(pct > 0) || !samples.length) return samples;
     const rnd = rand || Math.random;
@@ -582,8 +398,8 @@
     if (!opusModulePromise) {
       opusModulePromise = import('./opus-codec.mjs').catch(error => {
         opusModulePromise = null;
-        throw new Error('Real Opus could not load. Serve the complete folder over HTTP(S). ' +
-          'No approximate conversion was substituted. ' + error.message);
+        throw new Error('The bundled Opus codec could not load. Serve the complete folder over HTTP(S). ' +
+          error.message);
       });
     }
     return opusModulePromise;
@@ -593,16 +409,6 @@
   async function realOpusRoundTrip(samples, rate, bitrate, options = {}) {
     const opus = await loadOpusModule();
     return (await opus.roundTrip(samples, rate, bitrate, options)).samples;
-  }
-
-  function addNoiseFloor(samples, level, rand) {
-    if (!level) return samples;
-    const rnd = rand || Math.random;
-    const out = new Float32Array(samples.length);
-    for (let i = 0; i < samples.length; i++) {
-      out[i] = samples[i] + (rnd() * 2 - 1) * level;
-    }
-    return out;
   }
 
   /* ==================================================================== */
@@ -827,28 +633,59 @@
   /* Main processing function                                            */
   /* ------------------------------------------------------------------ */
 
+  const firCache = new Map();
+  function profileEq(codec) {
+    const eq = codec.decoderEq;
+    if (!eq) return null;
+    const key = `${codec.codecRate}:${eq.taps}:${eq.freqs}:${eq.gainsDb}`;
+    if (!firCache.has(key)) firCache.set(key, firwin2(eq.taps, eq.freqs, eq.gainsDb, codec.codecRate));
+    return firCache.get(key);
+  }
+
+  function resolveRoom(opts) {
+    let dspId = 0;
+    if (opts.listenerPos && LISTENER_POSITIONS[opts.listenerPos]) {
+      dspId = LISTENER_POSITIONS[opts.listenerPos].dsp;
+    } else if (opts.dspRoom != null && DSP_PRESETS[opts.dspRoom]) {
+      dspId = opts.dspRoom;
+    }
+    const preset = DSP_PRESETS[dspId] || DSP_PRESETS[0];
+    if (!preset.custom) return { chain: preset.chain || [], mix: preset.mix || 0 };
+    const supplied = opts.customEnv || {};
+    const env = {
+      duration: clamp(finiteOr(supplied.duration, finiteOr(preset.duration, 1.5)), 0.05, 6),
+      decay: clamp(finiteOr(supplied.decay, finiteOr(preset.decay, 3)), 0.5, 8),
+      mix: clamp(finiteOr(supplied.mix, finiteOr(preset.mix, 0.25)), 0, 1)
+    };
+    return { chain: customChain(env), mix: env.mix };
+  }
+
   /**
    * Render a source AudioBuffer (or any { sampleRate, length,
-   * numberOfChannels, getChannelData }) through the TF2 VOIP pipeline.
+   * numberOfChannels, getChannelData }) through the TF2 voice pipeline.
    *
    * opts = {
-   *   codec:        key of CODEC_PROFILES   ('celt_22' default)
+   *   codec:        key of CODEC_PROFILES                               ['steam']
    *   listenerPos:  key of LISTENER_POSITIONS. Overrides dspRoom.
    *   dspRoom:      numeric id into DSP_PRESETS (when listenerPos absent)
    *   customEnv:    { duration, decay, mix } override for DSP_PRESETS[99]
-   *   micGain:      pre-codec gain (mic boost; >1 can saturate input)   [1.0]
-   *   voiceScale:   post-codec receiver gain (voice_scale)              [1.0]
-   *   hp / lp:      sender-side HP/LP in Hz                             [40 / 11000]
-   *   agc:          modeled receive-side RMS leveling for Steam        [true]
-   *   bits:         bitrate scale — 16 = stock rate (64 B/frame for     [16]
-   *                 vaudio_celt), lower = starved and warbly
+   *   micGain:      sender capture gain; > 1 clips the int16 capture   [1]
+   *   hp / lp:      optional sender filters in Hz (off: hp <= 10,
+   *                 lp >= 0.45 x codec rate)                           [off]
+   *   bits:         bitrate scale; 16 = profile bitrate                 [16]
    *   lossPct:      simulated packet loss %                             [0]
-   *   frameMs:      net_split packet duration in ms (frames per packet) [20]
-   *   enableWarble: false bypasses codec quantization (clean transform) [true]
-   *   seed:         PRNG seed for the loss pattern / noise              [0xC0FFEE]
+   *   frameMs:      net_split packet duration (whole 20 ms frames)      [20]
+   *   jitterPct:    net_jitter crackle % (artistic)                     [0]
+   *   enableWarble: false bypasses the codec (filters/engine remain)    [true]
+   *   agc:          receiver auto-gain (false = unity gain)             [true]
+   *   avgGain:      voice_avggain target mean |x| / full scale          [0.5]
+   *   maxGain:      voice_maxgain gain cap                              [16]
+   *   voiceScale:   voice_scale, applied inside the auto-gain           [1]
+   *   volume:       output level after the mixer                        [0.5]
+   *   seed:         PRNG seed for the loss pattern / crackle        [0xC0FFEE]
    * }
    *
-   * Resolves to { samples: Float32Array, sampleRate, blob }
+   * Resolves to { samples: Float32Array, sampleRate, blob, codecInfo }
    */
   async function process(audioBuffer, opts = {}) {
     if (!audioBuffer || typeof audioBuffer.getChannelData !== 'function' ||
@@ -857,143 +694,114 @@
         !Number.isInteger(audioBuffer.numberOfChannels) || audioBuffer.numberOfChannels < 1) {
       throw new TypeError('TF2Audio.process requires a valid AudioBuffer-like source.');
     }
-    const codecKey = opts.codec || 'celt_22';
-    const codec = Object.hasOwn(CODEC_PROFILES, codecKey) ? CODEC_PROFILES[codecKey] : CODEC_PROFILES.celt_22;
-
-    // Resolve listener position / dsp_room -> preset id (copy + merge 99)
-    let dspId = 0;
-    if (opts.listenerPos && LISTENER_POSITIONS[opts.listenerPos]) {
-      dspId = LISTENER_POSITIONS[opts.listenerPos].dsp;
-    } else if (opts.dspRoom != null && DSP_PRESETS[opts.dspRoom]) {
-      dspId = opts.dspRoom;
-    }
-    const dspPreset = DSP_PRESETS[dspId] || DSP_PRESETS[0];
-    let dspChainDef = dspPreset.chain || [];
-    let dspMix = dspPreset.mix || 0;
-    if (dspPreset.custom) {
-      const supplied = opts.customEnv || {};
-      const env = {
-        duration: clamp(finiteOr(supplied.duration, finiteOr(dspPreset.duration, 1.5)), 0.05, 6),
-        decay: clamp(finiteOr(supplied.decay, finiteOr(dspPreset.decay, 3)), 0.5, 8),
-        mix: clamp(finiteOr(supplied.mix, finiteOr(dspPreset.mix, 0.25)), 0, 1)
-      };
-      dspChainDef = customChain(env);
-      dspMix = env.mix;
-    }
+    const codecKey = Object.hasOwn(CODEC_PROFILES, opts.codec) ? opts.codec : 'steam';
+    const codec = CODEC_PROFILES[codecKey];
+    const engine = VOICE_ENGINE;
+    const room = resolveRoom(opts);
     const listenerCfg = opts.listenerPos ? LISTENER_POSITIONS[opts.listenerPos] : null;
 
-    const micGain      = clamp(finiteOr(opts.micGain, 1.0), 0, 20);
-    const voiceScale   = clamp(finiteOr(opts.voiceScale, 1.0), 0, 4);
-    const hp           = clamp(finiteOr(opts.hp, 40), 0, codec.sampleRate * 0.45);
-    const lp           = clamp(finiteOr(opts.lp, Math.min(codec.bandLimit, 11000)), 100, codec.sampleRate * 0.49);
+    const codecRate    = codec.codecRate;
+    const micGain      = clamp(finiteOr(opts.micGain, 1), 0, 20);
+    const hp           = clamp(finiteOr(opts.hp, 0), 0, codecRate * 0.45);
+    const lp           = clamp(finiteOr(opts.lp, codecRate / 2), 100, codecRate / 2);
     const bits         = clamp(finiteOr(opts.bits, 16), 2, 32);
     const lossPct      = clamp(finiteOr(opts.lossPct, 0), 0, 100);
     const jitterPct    = clamp(finiteOr(opts.jitterPct, 0), 0, 100);
-    const enableWarble = opts.enableWarble !== false;
+    const enableCodec  = opts.enableWarble !== false;
+    const autoGain     = opts.agc !== false;
+    const avgGain      = clamp(finiteOr(opts.avgGain, engine.autoGain.avgGain), 0.01, 2);
+    const maxGain      = clamp(finiteOr(opts.maxGain, engine.autoGain.maxGain), 1, 100);
+    const voiceScale   = clamp(finiteOr(opts.voiceScale, 1), 0, 4);
+    const volume       = clamp(finiteOr(opts.volume, engine.volume), 0, 1);
     const rand         = mulberry32(finiteOr(opts.seed, 0xC0FFEE) >>> 0);
 
     const srcRate = audioBuffer.sampleRate;
-    const codecRate = codec.sampleRate;
-    const playbackRate = Math.max(22050, srcRate);
-    const useRealOpus = enableWarble && codec.webcodecs === 'opus' && opts.realCodec !== false;
-    const frameSamples = useRealOpus ? codecRate / 50 : codec.frameSamples;
-    const frameDurMs = 1000 * frameSamples / codecRate;
-    const netFrameMs = clamp(finiteOr(opts.frameMs, frameDurMs), 5, 200);
-    const framesPerPacket = clamp(Math.round(netFrameMs / frameDurMs), 1, 8);
-    const bytesPerFrame = Math.max(12, Math.round(codec.bytesPerFrame * bits / 16));
-
-    const yieldUI = microYield;
+    const mixRate = engine.mixRate;
+    const playbackRate = Math.max(mixRate, Math.round(srcRate));
+    const frameMs = 20;
+    const framesPerPacket = clamp(Math.round(finiteOr(opts.frameMs, frameMs) / frameMs), 1, 10);
     const report = (f) => { if (typeof opts.onProgress === 'function') opts.onProgress(f); };
 
-    /* ---- 1) Capture: downmix + mic gain + ADC hard clip ---- */
+    /* ---- 1) Sender capture: downmix, capture gain, int16 clip ---- */
     let samples = bufferToMono(audioBuffer);
-    const playbackLength = Math.round(samples.length * playbackRate / srcRate);
     if (!samples.every(Number.isFinite)) throw new TypeError('Source PCM contains a non-finite sample.');
+    const playbackLength = Math.round(samples.length * playbackRate / srcRate);
     if (micGain !== 1) {
       for (let i = 0; i < samples.length; i++) samples[i] *= micGain;
     }
-    // Soft knee first (console-level saturation), hard edge only for real
-    // overdrive — moderate gains stay musical, mic-spam gains stay crunchy.
-    samples = softLimit(samples, 0.92);
-    samples = hardClip(samples, 0.99);
+    samples = hardClip(samples, INT16_FULL_SCALE);
     report(0.05);
-    await yieldUI();
+    await microYield();
 
-    /* ---- 2) Resample to codec rate ---- */
+    /* ---- 2) Resample to the codec rate; optional capture filters ---- */
     samples = resampleSinc(samples, srcRate, codecRate);
-
-    /* ---- 3) Capture filters BEFORE either encoder ---- */
-    if (hp > 10) {
-      samples = applyBiquad(samples, biquadCoefs('highpass', codecRate, hp, 0.707));
+    if (hp > 10) samples = applyBiquad(samples, biquadCoefs('highpass', codecRate, hp, 0.707));
+    if (lp < codecRate * 0.45) {
+      samples = applyBiquad(samples, biquadCoefs('lowpass', codecRate, lp, 0.707));
+      samples = applyBiquad(samples, biquadCoefs('lowpass', codecRate, lp, 0.707));
     }
-    const lpEdge = Math.min(lp, codec.bandLimit);
-    samples = applyBiquad(samples, biquadCoefs('lowpass', codecRate, lpEdge, 0.707));
-    samples = applyBiquad(samples, biquadCoefs('lowpass', codecRate, lpEdge, 0.85));
-    report(0.30);
-    await yieldUI();
+    report(0.2);
+    await microYield();
 
-    /* ---- 4) Encode -> lose packets -> decode / conceal loss ---- */
-    let codecInfo = { backend: enableWarble ? 'approximation' : 'bypass',
-      frameSamples, frameMs: frameDurMs, plc: 'spectral-approximation' };
-    if (useRealOpus) {
+    /* ---- 3) Encode -> lose packets -> decode / conceal ---- */
+    let codecInfo = { backend: 'bypass', sampleRate: codecRate, frameMs };
+    if (enableCodec) {
       const opus = await loadOpusModule();
-      const bitrate = Math.round((codec.opusBitrate || 32000) * bits / 16);
+      const bitrate = Math.max(6000, Math.round(codec.bitrate * bits / 16));
       const result = await opus.roundTrip(samples, codecRate, bitrate, {
+        application: codec.application, signal: codec.signal,
         makeLossMask: count => buildLossMask(count, framesPerPacket, lossPct, rand),
         yieldControl: microYield,
-        onProgress: f => report(0.30 + 0.45 * f)
+        onProgress: f => report(0.2 + 0.5 * f)
       });
       samples = result.samples;
-      codecInfo = result.info;
-    } else {
-      const nFrames = Math.ceil(samples.length / frameSamples) + 2;
-      const lossMask = buildLossMask(nFrames, framesPerPacket, lossPct, rand);
-      samples = preEmphasis(samples, codec.preEmphasis);
-      samples = await transformCodec(samples, codecRate, frameSamples,
-        enableWarble, bytesPerFrame, lossMask,
-        f => report(0.30 + 0.45 * Math.min(1, f)));
-      // This noise is an optional artistic part of the legacy approximation.
-      // Do not add synthetic hiss to real Opus or the clean bypass.
-      if (enableWarble && micGain > 0) samples = addNoiseFloor(samples, codec.noiseFloor, rand);
-      samples = deEmphasis(samples, codec.preEmphasis);
+      codecInfo = { ...result.info, framesPerPacket };
+      const eq = profileEq(codec);
+      if (eq) samples = applyFirZeroPhase(samples, eq);
     }
-    report(0.75);
-    await yieldUI();
-
-    /* ---- 4b) Jitter-buffer starvation crackle (net_jitter) ---- */
     if (jitterPct > 0) {
-      samples = applyJitterCrackle(samples, codecRate,
-                                   frameSamples * framesPerPacket, jitterPct, rand);
+      samples = applyJitterCrackle(samples, codecRate, codecRate / 50 * framesPerPacket, jitterPct, rand);
+    }
+    report(0.72);
+    await microYield();
+
+    /* ---- 4) Receiver voice channel: auto-gain + int16 clamp ---- */
+    samples = resampleSinc(samples, codecRate, codec.voiceRate);
+    if (autoGain) {
+      samples = receiverAutoGain(samples, { blockSize: engine.autoGain.blockSize,
+        avgGain, maxGain, scale: voiceScale });
+    } else {
+      for (let i = 0; i < samples.length; i++) samples[i] *= voiceScale;
+      samples = hardClip(samples, INT16_FULL_SCALE);
     }
 
-    /* ---- 5) Modeled voice leveling, before user playback volume ---- */
-    if (codec.agc && opts.agc !== false) samples = applyVoiceLevel(samples, codecRate);
+    /* ---- 5) Mixer at 44.1 kHz: rate conversion, room DSP, output ---- */
+    samples = codec.mixer === 'linear'
+      ? resampleLinear(samples, codec.voiceRate, mixRate)
+      : resampleSinc(samples, codec.voiceRate, mixRate);
+    const dryMixLength = samples.length;
+    report(0.8);
+    await microYield();
+    if (listenerCfg && listenerCfg.extraLpf) {
+      samples = applyBiquad(samples, biquadCoefs('lowpass', mixRate, listenerCfg.extraLpf, 0.8));
+    }
+    samples = await runDspChain(samples, mixRate, room.chain, room.mix);
+    if (engine.outputFir) samples = applyFirZeroPhase(samples, engine.outputFir);
+    if (volume !== 1) {
+      for (let i = 0; i < samples.length; i++) samples[i] *= volume;
+    }
+    report(0.9);
+    await microYield();
 
-    /* ---- 6) Upsample to playback rate ---- */
-    samples = resampleSinc(samples, codecRate, playbackRate);
-    // Two rounded resampling lengths can otherwise drop/add a source sample.
-    if (samples.length !== playbackLength) {
-      const aligned = new Float32Array(playbackLength);
-      aligned.set(samples.subarray(0, playbackLength));
+    /* ---- 6) Output rate; keep every source frame plus any room tail ---- */
+    const tail = Math.max(0, Math.round((samples.length - dryMixLength) * playbackRate / mixRate));
+    samples = resampleSinc(samples, mixRate, playbackRate);
+    const outLength = playbackLength + tail;
+    if (samples.length !== outLength) {
+      const aligned = new Float32Array(outLength);
+      aligned.set(samples.subarray(0, outLength));
       samples = aligned;
     }
-    report(0.85);
-    await yieldUI();
-
-    /* ---- 7) Listener: voice_scale + underwater LP + dsp_room chain ---- */
-    if (voiceScale !== 1) {
-      const s = new Float32Array(samples.length);
-      for (let i = 0; i < samples.length; i++) s[i] = samples[i] * voiceScale;
-      samples = s;
-    }
-    if (listenerCfg && listenerCfg.extraLpf) {
-      samples = applyBiquad(samples, biquadCoefs('lowpass', playbackRate, listenerCfg.extraLpf, 0.8));
-    }
-    samples = await runDspChain(samples, playbackRate, dspChainDef, dspMix);
-    report(0.98);
-    await yieldUI();
-
-    /* ---- 8) Final safety soft-clip ---- */
     samples = softLimit(samples, 0.98);
     for (let i = 0; i < samples.length; i++) {
       if (!Number.isFinite(samples[i])) throw new Error(`DSP produced a non-finite sample at index ${i}.`);
@@ -1001,7 +809,8 @@
 
     const blob = encodeWav(samples, playbackRate);
     report(1);
-    return { samples, sampleRate: playbackRate, blob, realOpus: useRealOpus, codecInfo };
+    return { samples, sampleRate: playbackRate, blob, realOpus: enableCodec,
+      codecInfo: { ...codecInfo, codec: codecKey, autoGain, voiceRate: codec.voiceRate } };
   }
 
   /* ------------------------------------------------------------------ */
@@ -1042,18 +851,18 @@
     encodeWav,
     bufferToMono,
     // exposed for tests / tools
-    resampleLinear,
     resampleSinc,
+    resampleLinear,
+    firwin2,
+    applyFirZeroPhase,
     softLimit,
-    applyVoiceLevel,
     hardClip,
+    receiverAutoGain,
     biquadCoefs,
     applyBiquad,
     mulberry32,
-    transformCodec,
     buildLossMask,
     runDspChain,
-    makeBandEdges,
     applyJitterCrackle,
     realOpusRoundTrip
   };
