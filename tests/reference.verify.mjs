@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { fft, findMatch, consistentTimeline, sampleTimeline, describePair, rmsDb } from './reference.compare.mjs';
+import { fft, findMatch, consistentTimeline, sampleTimeline, describePair, rmsDb, clipSignature, levelTracking } from './reference.compare.mjs';
 
 let passed = 0;
 const check = (label, condition) => { assert.ok(condition, label); passed++; console.log(`  ok    ${label}`); };
@@ -41,4 +41,21 @@ assert.throws(() => describePair(new Float32Array(rate), new Float32Array(rate),
 check('Silence cannot be scored as a perfect tonal match', true);
 assert.throws(() => sampleTimeline(source, rate, -1, 1, 100));
 check('Out-of-range timeline rejects instead of silently padding', true);
+const square = Float32Array.from({ length: 48000 }, (_, i) => (Math.floor(i / 50) % 2 ? .5 : -.5));
+const squareSig = clipSignature(square, 48000);
+check('Clip signature: a square wave is all ceiling', near(squareSig.meanOverCeiling, 1, 1e-9) && near(squareSig.crestDb, 0, 1e-6)
+  && near(squareSig.ceilingDbfs, 20 * Math.log10(.5), 1e-6) && squareSig.blockPeakSpreadDb === 0);
+const sine = Float32Array.from({ length: 48000 }, (_, i) => .5 * Math.sin(2 * Math.PI * 440 * i / 48000));
+const clipped = Float32Array.from(sine, v => Math.max(-.25, Math.min(.25, 2 * v)));
+const sineSig = clipSignature(sine, 48000), clippedSig = clipSignature(clipped, 48000);
+check('Clip signature: clipping raises mean/ceiling and lowers crest', clippedSig.meanOverCeiling > sineSig.meanOverCeiling + .1
+  && clippedSig.crestDb < sineSig.crestDb - 1 && clippedSig.clippedPercent > sineSig.clippedPercent);
+assert.throws(() => clipSignature(new Float32Array(100), 48000));
+check('Clip signature rejects silence', true);
+const wobble = Float32Array.from({ length: 48000 * 4 }, (_, i) => (.2 + .15 * Math.sin(i / 20000)) * Math.sin(i * .05));
+const tracked = levelTracking(wobble, Float32Array.from(wobble, v => v * .5), 48000);
+check('Level tracking removes a constant gain and finds perfect agreement',
+  near(tracked.offsetDb, 20 * Math.log10(2), 1e-6) && tracked.rmsDeviationDb < 1e-6 && near(tracked.correlation, 1, 1e-9));
+assert.throws(() => levelTracking(wobble, wobble.subarray(1), 48000));
+check('Level tracking rejects unequal lengths', true);
 console.log(`\n${passed} paired-reference checks passed.`);

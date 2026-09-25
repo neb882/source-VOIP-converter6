@@ -42,7 +42,7 @@ const rate = 24000;
 // Voiced harmonics plus changing high-frequency content, unlike a single tone.
 const x = Float32Array.from({ length: rate }, (_, i) => .10 * Math.sin(2 * Math.PI * 233 * i / rate)
   + .06 * Math.sin(2 * Math.PI * 3123 * i / rate) + .04 * Math.sin(2 * Math.PI * (5100 * i / rate + 600 * (i / rate) ** 2)));
-const base = { codec: 'steam', micGain: 1, voiceScale: 1, hp: 120, lp: 11000, listenerPos: 'open', bits: 16 };
+const base = { codec: 'steam', micGain: 1, voiceScale: 1, listenerPos: 'open', bits: 16 };
 const high = await A.process(buffer(x, rate), base);
 const low = await A.process(buffer(x, rate), { ...base, bits: 6 });
 check('Both quality settings use real Opus', high.realOpus && low.realOpus);
@@ -51,34 +51,34 @@ check('Lower bitrate produces fewer encoded bytes', low.codecInfo.encodedBytes <
 check('Quality changes the decoded audio', difference(high.samples, low.samples) > .01);
 const repeat = await A.process(buffer(x, rate), base);
 check('Pinned real codec is repeatable', difference(high.samples, repeat.samples) === 0);
+check('Steam profile encodes as VOIP with the voice signal hint', high.codecInfo.application === 'voip' && high.codecInfo.signal === 'voice');
+check('Encoder mode per packet is reported from the TOC byte',
+  Object.values(high.codecInfo.modes).reduce((a, b) => a + b, 0) === high.codecInfo.frames);
 const lost = await A.process(buffer(x, rate), { ...base, lossPct: 100 });
 check('100% loss reaches native decoder PLC', lost.codecInfo.plc === 'opus' && lost.codecInfo.lostFrames === lost.codecInfo.frames);
 check('No voice leaks through 100% loss from stream start', energy(lost.samples) < 1e-12);
 const lossy = await A.process(buffer(x, rate), { ...base, lossPct: 25 });
-check('Partial loss conceals packets without changing duration', lossy.samples.length === x.length && lossy.codecInfo.lostFrames > 0 && energy(lossy.samples) > 0);
+check('Partial loss conceals packets without changing duration',
+  lossy.samples.length === Math.round(x.length * lossy.sampleRate / rate) && lossy.codecInfo.lostFrames > 0 && energy(lossy.samples) > 0);
 const silent = await A.process(buffer(new Float32Array(rate), rate), base);
 // Opus's own quantization may return very small nonzero PCM for silence.
-check('Silence stays below -100 dBFS RMS without added hiss', energy(silent.samples) / rate < 1e-10);
+check('Silence stays below -100 dBFS RMS without added hiss', energy(silent.samples) / silent.samples.length < 1e-10);
 const muted = await A.process(buffer(x, rate), { ...base, voiceScale: 0 });
 check('Receiver mute is exact silence', energy(muted.samples) === 0);
 const quiet = Float32Array.from(x, v => v * .1);
 const leveled = await A.process(buffer(quiet, rate), base);
 const unleveled = await A.process(buffer(quiet, rate), { ...base, agc: false });
-check('Disabling modeled AGC preserves quiet input dynamics', energy(leveled.samples) > energy(unleveled.samples) * 2);
-const levelTone = amplitude => Float32Array.from({ length: rate * 2 }, (_, i) => amplitude * Math.sin(2 * Math.PI * 440 * i / rate));
-const quietLevel = A.applyVoiceLevel(levelTone(.02), rate).subarray(rate);
-const loudLevel = A.applyVoiceLevel(levelTone(.5), rate).subarray(rate);
-check('RMS voice leveling controls a 28 dB input level difference',
-  Math.abs(10 * Math.log10(energy(loudLevel) / energy(quietLevel))) < .2);
-check('Voice leveling has a predictable steady RMS target', Math.abs(energy(loudLevel) / rate - .01) < .0005);
-check('Voice leveling never invents signal during digital silence', energy(A.applyVoiceLevel(new Float32Array(rate), rate)) === 0);
-const tiny = levelTone(.000003);
-check('Voice leveling does not boost tiny codec silence residue', energy(A.applyVoiceLevel(tiny, rate)) <= energy(tiny) * 1.01);
-const bounded = A.applyVoiceLevel(levelTone(.0002), rate);
-check('Voice leveling respects its maximum boost', energy(bounded) <= energy(levelTone(.0002)) * 100.01);
-const halfVolume = await A.process(buffer(x, rate), { ...base, voiceScale: .5 });
-check('Receiver gain remains effective after automatic leveling',
-  difference(halfVolume.samples, Float32Array.from(high.samples, v => v * .5)) < 1e-12);
+check('Disabling receiver auto-gain preserves quiet input levels', energy(leveled.samples) > energy(unleveled.samples) * 20);
+const levelDb = (samples) => 10 * Math.log10(energy(samples) / energy(high.samples));
+const halfIn = await A.process(buffer(Float32Array.from(x, v => v * .5), rate), base);
+check('Receiver auto-gain levels a 6 dB input difference to within 0.5 dB', Math.abs(levelDb(halfIn.samples)) < .5);
+const faint = await A.process(buffer(Float32Array.from(x, v => v * .05), rate), base);
+// x needs ~7x gain; 26 dB quieter needs ~140x, so voice_maxgain (16) binds.
+check('voice_maxgain caps the boost for very quiet input', levelDb(faint.samples) < -15 && levelDb(faint.samples) > -22);
+const quarter = await A.process(buffer(x, rate), { ...base, volume: .25 });
+const halfVol = await A.process(buffer(x, rate), { ...base, volume: .5 });
+check('Output volume is linear and applied after the voice clamp',
+  difference(Float32Array.from(quarter.samples, v => v * 2), halfVol.samples) < 1e-9);
 for (const sourceRate of [8000, 44100, 96000]) {
   const data = Float32Array.from({ length: 1001 }, (_, i) => .1 * Math.sin(2 * Math.PI * 440 * i / sourceRate));
   const result = await A.process(buffer(data, sourceRate), base);
@@ -100,11 +100,11 @@ const highTone = Float32Array.from({ length: rate }, (_, i) => .15 * Math.sin(2 
 await A.process(buffer(highTone, rate), { ...base, lp: 1500 });
 check('Sender low-pass removes out-of-band energy before encoding', energy(captured) < energy(highTone) * .001);
 sandbox.TF2Opus = opus;
-const approximated = await A.process(buffer(x, rate), { ...base, realCodec: false });
-check('Approximation is only selected explicitly and reported honestly', !approximated.realOpus && approximated.codecInfo.backend === 'approximation');
+const bypassed = await A.process(buffer(x, rate), { ...base, enableWarble: false });
+check('Codec bypass is only selected explicitly and reported honestly', !bypassed.realOpus && bypassed.codecInfo.backend === 'bypass');
 sandbox.TF2Opus = { roundTrip: async () => { throw new Error('Codec unavailable'); } };
 await assert.rejects(() => A.process(buffer(x, rate), base), /Codec unavailable/);
-check('Codec failure is not silently replaced by an approximation', true);
+check('Codec failure is reported, never silently bypassed', true);
 sandbox.TF2Opus = opus;
 
 // Independent packet parser confirms actual codec framing, not a metadata label.

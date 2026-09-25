@@ -1,6 +1,11 @@
 /* Local-only paired reference comparison. Never redistribute the input audio.
  * This measures a whole playback/capture chain, not isolated codec parameters.
  * Usage: node tests/reference.compare.mjs <recorded.mp3> <source.mp3> [...]
+ *
+ * Each source is located in the recording, warped onto the recording's clock,
+ * rendered through the app at 48 kHz and compared on the properties that
+ * identified the real chain (tests/REFERENCE_2026.md): level-matched spectra
+ * up to 19 kHz, the receiver clipping signature and short-term level tracking.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -126,7 +131,7 @@ export function consistentTimeline(matches) {
     medianAbsoluteCorrelation: percentile(selected.map(x => Math.abs(x.correlation)), .5) };
 }
 
-export const BAND_EDGES = [40, 80, 120, 200, 300, 500, 1000, 2000, 3000, 5000, 8000, 10000, 11000, 12000];
+export const BAND_EDGES = [40, 80, 120, 200, 300, 500, 1000, 2000, 3000, 5000, 8000, 10000, 11000, 12000, 16000, 19000];
 export function spectrum(samples, rate, size = 2048) {
   const bands = new Float64Array(BAND_EDGES.length - 1);
   let frames = 0;
@@ -158,12 +163,14 @@ export function describePair(input, output, rate) {
   if (anchorA < 1e-15 || anchorB < 1e-15) throw new Error('Not enough active signal for a level-matched comparison.');
   const anchorGain = db(anchorB / Math.max(1e-15, anchorA));
   const totalA = a.reduce((x, y) => x + y, 0);
-  const bands = Array.from(a, (value, i) => ({
-    hz: `${BAND_EDGES[i]}-${BAND_EDGES[i + 1]}`,
-    inputRelativeDb: db(value / Math.max(1e-15, totalA)),
-    gainDb: db(b[i] / Math.max(1e-15, value)),
-    normalizedGainDb: db(b[i] / Math.max(1e-15, value)) - anchorGain
-  }));
+  // Bands above the analysis Nyquist (or with no input energy) have no gain.
+  const bands = Array.from(a, (value, i) => {
+    const measurable = BAND_EDGES[i] < rate / 2 && value > 1e-20;
+    return { hz: `${BAND_EDGES[i]}-${BAND_EDGES[i + 1]}`,
+      inputRelativeDb: measurable ? db(value / Math.max(1e-15, totalA)) : null,
+      gainDb: measurable ? db(b[i] / value) : null,
+      normalizedGainDb: measurable ? db(b[i] / value) - anchorGain : null };
+  });
   const inputLevels = [], outputLevels = [], changes = [];
   const block = Math.round(rate * .25);
   for (let i = 0; i + block <= input.length; i += block) {
@@ -177,33 +184,54 @@ export function describePair(input, output, rate) {
     gainChangeP10Db: percentile(changes, .1), gainChangeMedianDb: percentile(changes, .5), gainChangeP90Db: percentile(changes, .9), bands };
 }
 
-// Retained only as a reproducible BEFORE baseline for the calibration report.
-// This is the previous app's peak detector, not a second production mode.
-export function previousCaptureLevel(samples, rate) {
-  const out = new Float32Array(samples.length);
-  const envelopeA = Math.exp(-1 / (.050 * rate));
-  const attackA = Math.exp(-1 / (.015 * rate)), releaseA = Math.exp(-1 / (.400 * rate));
-  let envelope = .12, gain = 1;
-  for (let i = 0; i < samples.length; i++) {
-    const value = Math.abs(samples[i]);
-    envelope = Math.max(value, envelope * envelopeA + value * (1 - envelopeA));
-    const want = Math.max(.25, Math.min(6, .12 / Math.max(envelope, 1e-4)));
-    const a = want < gain ? attackA : releaseA;
-    gain = gain * a + want * (1 - a);
-    out[i] = samples[i] * gain;
+// The receiver's int16 clamp leaves a flat ceiling that most short blocks
+// reach, with mean |x| near half of it (tests/REFERENCE_2026.md). The ceiling
+// is estimated as the 99.5th percentile so MP3 overshoot does not define it.
+export function clipSignature(samples, rate) {
+  if (!samples.length) throw new Error('Clip signature needs audio.');
+  const magnitudes = Float32Array.from(samples, Math.abs).sort();
+  const ceiling = magnitudes[Math.min(magnitudes.length - 1, Math.floor(magnitudes.length * .995))];
+  if (!(ceiling > 0)) throw new Error('Clip signature needs non-silent audio.');
+  let near = 0, sumAbs = 0, sumSq = 0;
+  for (const v of samples) { const m = Math.abs(v); if (m > .95 * ceiling) near++; sumAbs += m; sumSq += v * v; }
+  const block = Math.max(1, Math.round(rate * 256 / 48000)), peaks = [];
+  for (let i = 0; i + block <= samples.length; i += block) {
+    let peak = 0;
+    for (let j = i; j < i + block; j++) peak = Math.max(peak, Math.abs(samples[j]));
+    if (peak > .1 * ceiling) peaks.push(20 * Math.log10(peak));
   }
-  return out;
+  return { ceilingDbfs: 20 * Math.log10(ceiling), clippedPercent: 100 * near / samples.length,
+    meanOverCeiling: sumAbs / samples.length / ceiling, crestDb: 20 * Math.log10(ceiling / Math.sqrt(sumSq / samples.length)),
+    blockPeakSpreadDb: percentile(peaks, .9) - percentile(peaks, .1) };
+}
+
+// Short-term level agreement after removing the overall volume difference.
+export function levelTracking(recorded, rendered, rate, seconds = .5) {
+  if (recorded.length !== rendered.length) throw new Error('Level tracking needs equal-length audio.');
+  const block = Math.round(rate * seconds), a = [], b = [];
+  for (let i = 0; i + block <= recorded.length; i += block) {
+    const x = rmsDb(recorded.subarray(i, i + block)), y = rmsDb(rendered.subarray(i, i + block));
+    if (x > -70 && y > -70) { a.push(x); b.push(y); }
+  }
+  if (a.length < 3) throw new Error('Level tracking needs at least three active blocks.');
+  const offset = percentile(a.map((x, i) => x - b[i]), .5);
+  const deviations = a.map((x, i) => x - b[i] - offset);
+  const mean = v => v.reduce((s, x) => s + x, 0) / v.length;
+  const ma = mean(a), mb = mean(b);
+  let cov = 0, va = 0, vb = 0;
+  for (let i = 0; i < a.length; i++) { cov += (a[i] - ma) * (b[i] - mb); va += (a[i] - ma) ** 2; vb += (b[i] - mb) ** 2; }
+  return { blocks: a.length, offsetDb: offset, rmsDeviationDb: Math.sqrt(mean(deviations.map(d => d * d))),
+    worstDeviationDb: Math.max(...deviations.map(Math.abs)), correlation: va > 0 && vb > 0 ? cov / Math.sqrt(va * vb) : null };
 }
 
 function compactReport(report) {
-  const rounded = x => x === null ? null : Math.round(x * 100) / 100;
-  const summary = pair => ({ inputRmsDbfs: rounded(pair.inputRmsDbfs), outputRmsDbfs: rounded(pair.outputRmsDbfs),
-    inputRangeDb: rounded(pair.inputLevelRangeP90P10Db), outputRangeDb: rounded(pair.outputLevelRangeP90P10Db),
-    normalizedBandGainDb: pair.bands.map(x => [x.hz, rounded(x.normalizedGainDb)]) });
+  const r = x => x === null || x === undefined ? null : Math.round(x * 100) / 100;
+  const sig = s => Object.fromEntries(Object.entries(s).map(([k, v]) => [k, r(v)]));
   return { ...report, sourceMatches: report.sourceMatches.map(s => ({ ...s, comparisons: s.comparisons?.map(c => ({
-    channel: c.channel, sourceToRecorded: summary(c.sourceToRecorded), variants: c.variants.map(v => ({ name: v.name,
-      comparisonToRecorded: summary(v.comparisonToRecorded), changeFromSource: summary(v.changeFromSource),
-      secondHalfCheck: summary(v.secondHalfCheck) }))
+    channel: c.channel, recordedClipSignature: sig(c.recordedClipSignature), variants: c.variants.map(v => ({ name: v.name,
+      clipSignature: sig(v.clipSignature), levelTracking: sig(v.levelTracking),
+      renderedMinusRecordedDb: v.comparisonToRecorded.bands.map(x => [x.hz, x.normalizedGainDb === null ? null : r(-x.normalizedGainDb)]),
+      secondHalfLevelTracking: sig(v.secondHalfLevelTracking) }))
   })) })) };
 }
 
@@ -246,12 +274,12 @@ async function main() {
   sandbox.TF2Opus = await import('../opus-codec.mjs');
   const preset = vm.runInContext('PRESETS.modern', sandbox);
   const reference = await decodeFile(referencePath);
-  const searchRate = 2000;
-  const narrow = (samples, rate) => audio.applyBiquad(audio.resampleSinc(samples, rate, searchRate),
+  const searchRate = 2000, rate = 48000;
+  const narrow = (samples, sr) => audio.applyBiquad(audio.resampleSinc(samples, sr, searchRate),
     audio.biquadCoefs('highpass', searchRate, 100, .707));
   const ref = narrow(mono(reference), reference.rate);
+  const ref48 = audio.resampleSinc(mono(reference), reference.rate, rate);
   const sourceMatches = [];
-  const ref24 = audio.resampleSinc(mono(reference), reference.rate, 24000);
   for (const sourcePath of sourcePaths) {
     const source = await decodeFile(sourcePath);
     console.error(`Locating ${path.basename(sourcePath)} in the recording...`);
@@ -269,59 +297,40 @@ async function main() {
     const timelines = channels.map(x => ({ channel: x.channel, timeline: consistentTimeline(x.matches) })).filter(x => x.timeline);
     timelines.sort((a, b) => b.timeline.matches - a.timeline.matches || b.timeline.medianAbsoluteCorrelation - a.timeline.medianAbsoluteCorrelation);
     const selected = timelines[0];
-    let comparisons = null;
-    if (selected) {
-      const timeline = selected.timeline;
-      // Stay inside the confirmed passage, away from push-to-talk edges.
-      const start = timeline.firstReferenceSeconds + 2;
-      const seconds = timeline.lastReferenceSeconds - timeline.firstReferenceSeconds;
-      const length = Math.round(seconds * 24000);
-      const recorded = ref24.subarray(Math.round(start * 24000), Math.round(start * 24000) + length);
-      comparisons = [];
-      const verification = [];
-      for (const channel of ['mix', 'left']) {
-        const source24 = audio.resampleSinc(mono(source, channel), source.rate, 24000);
-        const input = sampleTimeline(source24, 24000, timeline.offsetSeconds + start * timeline.scale, timeline.scale, length);
-        if (channel === selected.channel) {
-          // Verify the clock fit in three separate full-rate windows. These
-          // correlations identify a passage, not perceptual codec fidelity.
-          const filteredInput = audio.applyBiquad(input, audio.biquadCoefs('highpass', 24000, 300, .707));
-          const filteredRef = audio.applyBiquad(recorded, audio.biquadCoefs('highpass', 24000, 300, .707));
-          for (const fraction of [.15, .5, .85]) {
-            const center = Math.round(length * fraction), radius = 1200, half = 24000;
-            const match = findMatch(filteredInput.subarray(center - half - radius, center + half + radius),
-              filteredRef.subarray(center - half, center + half));
-            verification.push({ referenceCenterSeconds: start + center / 24000, correlation: match.correlation,
-              residualOffsetMs: match.sample === null ? null : (match.sample - radius) / 24 });
-          }
-        }
-        const variants = [];
-        const settings = [
-          ['previous-modern', { hp: 120, lp: 11000, agc: false, micGain: 1 }],
-          ['modern', { hp: preset.hp, lp: preset.lp, agc: true, micGain: preset.gain }],
-          ['modern-leveling-off', { hp: preset.hp, lp: preset.lp, agc: false, micGain: preset.gain }]
-        ];
-        for (const [name, opts] of settings) {
-          console.error(`Comparing ${path.basename(sourcePath)} / ${channel} / ${name}...`);
-          const sourceInput = name === 'previous-modern'
-            ? previousCaptureLevel(audio.hardClip(audio.softLimit(Float32Array.from(input, x => x * 1.3), .92), .99), 24000)
-            : input;
-          const rendered = await audio.process({ sampleRate: 24000, length: input.length, numberOfChannels: 1, getChannelData: () => sourceInput },
-            { codec: 'steam', listenerPos: 'open', voiceScale: 1, bits: 16, ...opts });
-          const split = Math.floor(length / 2);
-          variants.push({ name, comparisonToRecorded: describePair(rendered.samples, recorded, 24000),
-            changeFromSource: describePair(input, rendered.samples, 24000),
-            secondHalfCheck: describePair(rendered.samples.subarray(split), recorded.subarray(split), 24000) });
-        }
-        comparisons.push({ channel, sourceToRecorded: describePair(input, recorded, 24000), variants });
+    if (!selected) { sourceMatches.push({ file: path.basename(sourcePath), timelines, channels, comparisons: null }); continue; }
+    const timeline = selected.timeline;
+    // Stay inside the confirmed passage, away from push-to-talk edges.
+    const start = timeline.firstReferenceSeconds + 2;
+    const seconds = timeline.lastReferenceSeconds - timeline.firstReferenceSeconds;
+    const length = Math.round(seconds * rate);
+    const recorded = ref48.subarray(Math.round(start * rate), Math.round(start * rate) + length);
+    const comparisons = [];
+    for (const channel of ['mix', 'left']) {
+      const source48 = audio.resampleSinc(mono(source, channel), source.rate, rate);
+      const input = sampleTimeline(source48, rate, timeline.offsetSeconds + start * timeline.scale, timeline.scale, length);
+      const settings = [
+        ['modern', { codec: preset.codec, listenerPos: preset.position, micGain: preset.gain, voiceScale: preset.voice_scale, hp: preset.hp, lp: preset.lp }],
+        ['receiver-auto-gain-off', { codec: preset.codec, listenerPos: preset.position, agc: false, volume: 1 }]
+      ];
+      const variants = [];
+      for (const [name, opts] of settings) {
+        console.error(`Comparing ${path.basename(sourcePath)} / ${channel} / ${name}...`);
+        const rendered = (await audio.process({ sampleRate: rate, length, numberOfChannels: 1, getChannelData: () => input }, opts)).samples;
+        const split = Math.floor(length / 2);
+        variants.push({ name, clipSignature: clipSignature(rendered, rate),
+          levelTracking: levelTracking(recorded, rendered, rate),
+          secondHalfLevelTracking: levelTracking(recorded.subarray(split), rendered.subarray(split), rate),
+          comparisonToRecorded: describePair(rendered, recorded, rate) });
       }
-      sourceMatches.push({ file: path.basename(sourcePath), sampleRate: source.rate, durationSeconds: source.length / source.rate,
-        timelines, localAlignmentVerification: verification,
-        alignedReferenceStartSeconds: start, alignedDurationSeconds: seconds, comparisons });
-    } else sourceMatches.push({ file: path.basename(sourcePath), timelines, channels, comparisons });
+      comparisons.push({ channel, recordedClipSignature: clipSignature(recorded, rate), variants });
+    }
+    sourceMatches.push({ file: path.basename(sourcePath), sampleRate: source.rate, durationSeconds: source.length / source.rate,
+      timelines, alignedReferenceStartSeconds: start, alignedDurationSeconds: seconds, comparisons });
   }
   const report = { reference: path.basename(referencePath), referenceDurationSeconds: reference.length / reference.rate,
-    method: '4-second waveform cross-correlation at 2 kHz; robust offset/clock fit; band-limited fractional correction; 24 kHz paired spectra, normalized at 300–3000 Hz. Music and capture-chain benchmark, not a unique codec identification.', sourceMatches };
+    method: '4-second waveform cross-correlation at 2 kHz; robust offset/clock fit; band-limited fractional correction; ' +
+      '48 kHz render of the aligned source; spectra normalized at 300-3000 Hz; clip signature; 0.5 s level tracking. ' +
+      'Music and capture-chain benchmark, not a unique codec identification.', sourceMatches };
   console.log(JSON.stringify(compact ? compactReport(report) : report, null, 2));
 }
 

@@ -150,6 +150,8 @@ async function main() {
   let browser = null, context = null;
   try {
     const launchOptions = { headless: true, args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'] };
+    // Optional: a preinstalled Chromium whose build differs from Playwright's pin.
+    if (process.env.CHROMIUM_EXECUTABLE) launchOptions.executablePath = process.env.CHROMIUM_EXECUTABLE;
     try { browser = await chromium.launch(launchOptions); }
     catch (error) {
       if (!String(error.message).includes('Executable doesn\'t exist')) throw error;
@@ -177,7 +179,7 @@ async function main() {
 
     console.log('\n[Browser 2] Accessibility, disclosure, and safe console');
     const controlIds = ['codec', 'listener_position', 'gain', 'voice_scale', 'hp', 'lp', 'env',
-      'c_dur', 'c_dec', 'c_mix', 'agc', 'bits', 'frameMs', 'loss', 'warble_on'];
+      'c_dur', 'c_dec', 'c_mix', 'agc', 'maxgain', 'avggain', 'volume', 'bits', 'frameMs', 'loss', 'warble_on'];
     const unlabeled = await page.evaluate((ids) => ids.filter((id) => {
       const element = document.getElementById(id);
       return !element || !element.labels || element.labels.length === 0;
@@ -188,12 +190,16 @@ async function main() {
     check(await page.locator('#gain').isVisible(), 'advanced controls expand');
     await page.locator('#bits').fill('6');
     await page.locator('#agc').selectOption('0');
+    await page.locator('#maxgain').fill('3');
+    await page.locator('#volume').fill('0.1');
     await page.getByRole('button', { name: 'Modern (Steam Voice)', exact: true }).click();
-    check(await page.locator('#codec').inputValue() === 'steam', 'Modern preset selects documented 24 kHz baseline');
-    check(await page.locator('#lp').inputValue() === '11000', 'Modern preset uses provisional capture filtering');
-    check(await page.locator('#hp').inputValue() === '40' && Number(await page.locator('#gain').inputValue()) === 1,
-      'Modern preset restores reference-tuned bass and unity input gain');
-    check(await page.locator('#bits').inputValue() === '16' && await page.locator('#agc').inputValue() === '1', 'preset resets previous quality and gain-model overrides');
+    check(await page.locator('#codec').inputValue() === 'steam', 'Modern preset selects the measured 24 kHz Steam profile');
+    check(await page.locator('#lp').inputValue() === '20000' && await page.locator('#hp').inputValue() === '0',
+      'Modern preset leaves the optional sender filters off');
+    check(Number(await page.locator('#gain').inputValue()) === 1, 'Modern preset restores unity capture gain');
+    check(await page.locator('#bits').inputValue() === '16' && await page.locator('#agc').inputValue() === '1'
+      && await page.locator('#maxgain').inputValue() === '16' && await page.locator('#volume').inputValue() === '0.5',
+      'preset resets quality, receiver auto-gain and output overrides');
     await page.locator('#console-details summary').click();
     await page.locator('#console-input').fill('echo <img src=x onerror="window.__consoleXss=1">');
     await page.locator('#console-input').press('Enter');
@@ -218,6 +224,42 @@ async function main() {
       return dry.volume === .25 && dry.playbackRate === 1.25;
     });
     check(true, 'A/B comparison preserves playback volume and speed');
+
+    console.log('\n[Browser 3b] Visualizer, signal chain, presets, console, net_graph');
+    const painted = () => page.evaluate(() => {
+      const canvas = document.getElementById('visualizer');
+      const data = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+      let lit = 0;
+      for (let i = 0; i < data.length; i += 16) if (data[i] + data[i + 1] + data[i + 2] > 60) lit++;
+      return lit / (data.length / 16);
+    });
+    for (const mode of ['wave', 'bars', 'spec']) {
+      await page.locator(`#viz-${mode}`).click();
+      check(await page.locator(`#viz-${mode}`).getAttribute('aria-pressed') === 'true', `${mode.toUpperCase()} view is selected`);
+      check(await painted() > 0.02, `${mode.toUpperCase()} view paints the rendered audio`);
+    }
+    await page.locator('#viz-wave').click();
+    await page.locator('#loss').fill('12');
+    await page.locator('#loss').dispatchEvent('change');
+    check((await page.locator('#signal-chain').textContent()).includes('12% loss'), 'signal chain follows control edits');
+    check(await page.locator('.preset-row .preset-btn[aria-pressed="true"]').count() === 0, 'a hand-edited control clears the active preset');
+    await page.getByRole('button', { name: 'Laggy 18% Loss', exact: true }).click();
+    check(await page.locator('.preset-btn[data-preset="laggy"]').getAttribute('aria-pressed') === 'true'
+      && (await page.locator('#signal-chain').textContent()).includes('18% loss'), 'preset highlights itself and updates the chain');
+    await page.getByRole('button', { name: 'Modern (Steam Voice)', exact: true }).click();
+    await page.locator('#console-input').fill('net_g');
+    await page.locator('#console-input').press('Tab');
+    check(await page.locator('#console-input').inputValue() === 'net_graph ', 'Tab completes a unique command');
+    await page.locator('#console-input').fill('voice_m');
+    await page.locator('#console-input').press('Tab');
+    const listing = await page.locator('#console-out').textContent();
+    check(listing.includes('voice_maxgain = "16"') && listing.includes('voice_micgain = "1'), 'ambiguous Tab lists candidates with values');
+    await page.locator('#console-input').fill('net_graph 2');
+    await page.locator('#console-input').press('Enter');
+    await page.waitForFunction(() => document.getElementById('ng-in').textContent !== '0 0.00');
+    check((await page.locator('#ng-in').textContent()).startsWith('50 '), 'net_graph reports the rendered packet rate', await page.locator('#ng-in').textContent());
+    await page.locator('#console-input').fill('net_graph 0');
+    await page.locator('#console-input').press('Enter');
 
     const parity = await page.evaluate(async () => {
       const data = Float32Array.from({ length: 24000 }, (_, i) => .2 * Math.sin(2 * Math.PI * 431 * i / 24000));
@@ -297,7 +339,7 @@ async function main() {
       'worker replacement preserves the loaded audio without reloading');
     check(afterUpdate.processEnabled, 'worker replacement leaves Process Audio enabled');
     check(afterUpdate.keys.includes('unrelated-test-cache'), 'activation preserves unrelated origin caches');
-    check(afterUpdate.keys.includes('tf2ve-v6'), 'current app shell cache is populated');
+    check(afterUpdate.keys.includes('tf2ve-v7'), 'current app shell cache is populated');
     // Restore the normal registration while still online. Otherwise reloading
     // registers sw.js again and races another replacement against file loading.
     await activateServiceWorker(page, 'sw.js');

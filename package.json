@@ -1,8 +1,8 @@
 {
   "name": "tf2-voice-emulator",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "private": true,
-  "description": "Browser-based Source Engine and TF2 voice-chat pipeline emulator.",
+  "description": "Browser-based TF2 voice-chat emulator: real Opus plus the measured Source receiver auto-gain and clipping.",
   "scripts": {
     "dev": "node tests/static-server.js",
     "test": "node tests/verify.js && node tests/opus.verify.mjs && node tests/reference.verify.mjs",
