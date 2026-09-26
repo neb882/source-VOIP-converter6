@@ -224,16 +224,19 @@ const PRESETS = {
  * calibrated against a real TF2 recording.
  *
  *   codecRate   : Opus sample rate (8/12/16/24/48 kHz)
- *   bitrate     : bits per second at snd_bits 16 (CBR, 20 ms frames)
+ *   bitrate     : bits per second at snd_bits 16 (20 ms frames)
  *   application : 'voip' (SILK/hybrid capable) or 'lowdelay' (CELT only)
  *   signal      : Opus signal hint; 'voice' keeps music in hybrid mode,
  *                 matching the SILK/CELT crossover seen in the recording
+ *   encoder     : libopus complexity / vbr / dtx. Without it: complexity 10,
+ *                 CBR, no DTX
  *   decoderEq   : optional FIR (linear gains interpolated between points)
  *                 applied to decoded audio at codecRate
- *   senderGate  : Steam's sender voice gate. 20 ms frames above thresholdDb
- *                 (RMS, dBFS) open it; it stays open holdMs after the last
- *                 one. Closed frames are not sent. Profiles without it
- *                 transmit continuously (push-to-talk engine codecs).
+ *   senderGate  : Steam's sender voice gate. A 20 ms frame above thresholdDb
+ *                 (RMS, dBFS) is sent with the prerollMs before it and the
+ *                 holdMs after it; other frames are not sent. Profiles
+ *                 without it transmit continuously (push-to-talk engine
+ *                 codecs).
  *   voiceRate   : rate at which the engine receives decoded voice and runs
  *                 its auto-gain (128-sample blocks)
  *   mixer       : how voiceRate is converted to the 44.1 kHz mixer:
@@ -242,24 +245,31 @@ const PRESETS = {
  * ------------------------------------------------------------------------- */
 const CODEC_PROFILES = {
   steam: {
-    displayName: 'Steam voice (Opus 24 kHz / 32 kbps)',
-    codecRate: 24000, bitrate: 32000, application: 'voip', signal: 'voice',
-    // Above the SILK/CELT crossover the recorded high band sits ~2.5 dB
-    // below libopus 1.6.1's, and the band edge falls from 11.5 kHz. Fitted
-    // to steady pink noise and music (see tests/REFERENCE_2026.md).
+    displayName: 'Steam voice (Opus 24 kHz VBR, ~32 kbps)',
+    // Steam's packets are VBR with DTX, about 32 kbps on noise and 26 kbps on
+    // voiced speech. libopus 1.6.1 spends the same bytes at a 34 kbps target.
+    // Complexity 6 is the highest at which it takes DTX decisions from the
+    // SILK voice detector, as Steam's encoder does (tests/REFERENCE_2026.md).
+    codecRate: 24000, bitrate: 34000, application: 'voip', signal: 'voice',
+    encoder: { complexity: 6, vbr: true, dtx: true },
+    // Steam's decoded packets against libopus 1.6.1 on the same input: about
+    // 1 dB more above 3 kHz in the SILK band, 1 dB less in the CELT band
+    // above 8 kHz, and Steam's capture resampler rolling off from 11.2 kHz.
+    // The receiver adds nothing (measured within 0.1 dB to 11.5 kHz).
     decoderEq: {
       taps: 95,
-      freqs:   [0, 7700, 8200, 10500, 11000, 11500, 11800, 12000],
-      gainsDb: [0, 0,   -2.5, -2.5,  -2.5,  -4,    -8,    -60]
+      freqs:   [0, 1000, 2000, 3000, 4000, 7800, 8100, 11000, 11200, 11400, 11500, 11650, 11750, 12000],
+      gainsDb: [0, 0,    0.4,  0.7,  1.0,  1.0,  -1.0, -1.0,  -1.3,  -2.5,  -4.0,  -4.8,  -6.5,  -6.5]
     },
-    senderGate: { thresholdDb: -39.5, holdMs: 300 },
+    senderGate: { thresholdDb: -39.5, prerollMs: 120, holdMs: 440 },
     voiceRate: 44100, mixer: 'sinc', status: 'measured'
   },
   // Optional fullband profile, NOT a verified TF2-era or native-rate preset.
   steam_48: {
     displayName: 'Fullband Opus (48 kHz / 64 kbps, experimental)',
     codecRate: 48000, bitrate: 64000, application: 'voip', signal: 'voice',
-    senderGate: { thresholdDb: -39.5, holdMs: 300 },
+    encoder: { complexity: 6, vbr: true, dtx: true },
+    senderGate: { thresholdDb: -39.5, prerollMs: 120, holdMs: 440 },
     voiceRate: 44100, mixer: 'sinc', status: 'experimental'
   },
   // vaudio_celt ran CELT at 22.05 kHz / ~22 kbps. Opus's CELT layer is its

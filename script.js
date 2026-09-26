@@ -492,7 +492,7 @@ const cvars = {
   'voice_avggain':   { help: 'Auto-gain normalizes each block between its mean (0) and peak (1) to full scale; 0.5 = TF2 default', link: 'avggain' },
   'voice_capture_channel': { help: 'Stereo input to the mono mic: left (measured through a virtual cable) / mix / right', link: 'capture_channel' },
   'voice_vad':       { help: 'Steam sender voice gate: auto (profile default) / 1 / 0', link: 'vad' },
-  'voice_vad_threshold': { help: 'Gate opening level: 20 ms frame RMS in dBFS (measured -39.5), 300 ms hold', link: 'vad_threshold' },
+  'voice_vad_threshold': { help: 'Gate opening level: 20 ms frame RMS in dBFS (measured -39.5); 120 ms pre-roll, 440 ms hold', link: 'vad_threshold' },
   'volume':          { help: 'Output volume of the rendered file (0.0 - 1.0)', link: 'volume' },
   'dsp_hpf':         { help: 'Optional sender high-pass cutoff (0 = off)', link: 'hp' },
   'dsp_lpf':         { help: 'Optional sender low-pass cutoff (20000 = off)', link: 'lp' },
@@ -666,7 +666,7 @@ function updateSignalChain() {
   const filters = [num(els.hp, 0) > 10 ? `HP ${num(els.hp, 0)} Hz` : '', num(els.lp, 20000) < 20000 ? `LP ${num(els.lp, 20000)} Hz` : ''].filter(Boolean);
   const steps = [
     ['Capture', `${channelLabel}mic ×${gain.toFixed(1)}${filters.length ? ' · ' + filters.join(' · ') : ''} · ${gateOn ? `gate > ${gateDb} dBFS` : 'no gate'}`, gain > 1 ? 'hot' : ''],
-    ['Codec', codecOn ? `Opus ${codec.codecRate / 1000} kHz · ${kbps} kbps · ${mode}` : 'bypassed', codecOn ? '' : 'off'],
+    ['Codec', codecOn ? `Opus ${codec.codecRate / 1000} kHz · ${codec.encoder?.vbr ? 'VBR ' : ''}${kbps} kbps${codec.encoder?.dtx ? ' · DTX' : ''} · ${mode}` : 'bypassed', codecOn ? '' : 'off'],
     ['Network', `${packetMs} ms packets · ${loss}% lost${jitter > 0 ? ` · ${jitter} ms jitter` : ''}`, loss > 0 || jitter > 0 ? 'hot' : ''],
     ['Receiver', agcOn ? `auto-gain ≤${maxGain}× · int16 clip` : 'unity gain · int16 clip', ''],
     ['Mixer', `44.1 kHz · ${room}`, ''],
@@ -1324,11 +1324,14 @@ els.process.addEventListener('click', async () => {
     // Report the actual processing path: codec version, bitrate and the
     // Opus modes the encoder really chose.
     logLine(realOpus
-      ? `S_Voice: ${codecInfo.version}, ${codecInfo.bitrate / 1000} kbps, 20 ms frames, native PLC (${describeModes(codecInfo.modes)})`
+      ? `S_Voice: ${codecInfo.version}, ${codecInfo.bitrate / 1000} kbps ${codecInfo.vbr ? 'VBR' : 'CBR'}${codecInfo.dtx ? ' + DTX' : ''}, 20 ms frames, native PLC (${describeModes(codecInfo.modes)})`
       : 'S_Voice: codec bypassed', 'sys');
     if (realOpus && codecInfo.gate != null) {
       const held = codecInfo.frames ? Math.round(100 * codecInfo.gatedFrames / codecInfo.frames) : 0;
-      logLine(`S_Voice: voice gate at ${codecInfo.gate} dBFS held back ${codecInfo.gatedFrames} of ${codecInfo.frames} frames (${held}%)`, 'sys');
+      logLine(`S_Voice: voice gate at ${codecInfo.gate} dBFS sent ${codecInfo.spurts} talk spurt${codecInfo.spurts === 1 ? '' : 's'} and held back ${codecInfo.gatedFrames} of ${codecInfo.frames} frames (${held}%)`, 'sys');
+    }
+    if (realOpus && codecInfo.dtxFrames) {
+      logLine(`S_Voice: ${codecInfo.dtxFrames} inactive frames sent as DTX comfort noise`, 'sys');
     }
     if (realOpus && (codecInfo.lostFrames || codecInfo.underrunFrames)) {
       logLine(`S_Voice: ${codecInfo.lostFrames} frames lost and concealed, ${codecInfo.underrunFrames || 0} late frames played as silence`, 'sys');

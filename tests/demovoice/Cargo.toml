@@ -1,0 +1,11 @@
+[package]
+name = "demovoice"
+version = "0.1.0"
+edition = "2021"
+description = "Dump the Steam voice packets stored in a TF2 SourceTV demo"
+license = "MIT"
+publish = false
+
+[dependencies]
+tf-demo-parser = "0.6.0"
+bitbuffer = "0.11"
