@@ -31,7 +31,15 @@ Sync beeps mark the start and end.
 
 The levels are chosen so that Steam's voice gate stays open, the receiver auto-gain sits at its fixed +20 dB cap and nothing clips. Every lost or concealed 20 ms frame then shows against the known waveform.
 
-Use your own server with `sv_cheats 1`; the `net_fake*` commands are cheat-protected. Record one take per line, naming each file after its settings:
+The `net_fake*` commands are cheat-protected, so use your own server with `sv_cheats 1`. On a server you host from the game (a listen server), your own traffic normally bypasses the network layer. `net_fakelag` is documented to include that loopback path, but `net_fakeloss` is not.
+
+**Setup on a listen server:**
+1. Run `find usesockets`. If `net_usesocketsforloopback` exists, set it to 1 before loading the map, then load the map (`map ctf_2fort`, or `retry` if one is already running).
+2. Set `sv_cheats 1` and `voice_loopback 1`, and turn on `net_graph 1`.
+3. Run a 30-second check: set `net_fakeloss 30` and talk. Your echo should turn choppy and `net_graph` should report loss. If it stays clean, the loss is not reaching the voice path; use a dedicated server instead (connect with `connect 127.0.0.1`).
+4. Set `net_fakeloss 0` again.
+
+Record one take per line, naming each file after its settings:
 
 | Take | Console |
 | --- | --- |
@@ -42,7 +50,7 @@ Use your own server with `sv_cheats 1`; the `net_fake*` commands are cheat-prote
 | combined | `net_fakeloss 10; net_fakelag 100; net_fakejitter 50` |
 
 Some notes on these commands:
-- `net_fakejitter` only acts together with `net_fakelag`.
-- The commands affect all incoming game traffic. On a server hosted from the same game they may apply in both directions, so the voice loss can exceed the setting. The analysis measures the actual loss, so the exact figure does not matter.
+- `net_fakejitter` varies the `net_fakelag` delay, so it only acts together with it.
+- The commands affect all incoming game traffic. On a listen server they may apply in both directions, so the voice loss can exceed the setting. The analysis measures the actual loss, so the exact figure does not matter.
 - Reset all three to 0 afterwards.
 - A `net_graph 1` screenshot during each take records the loss the game itself reports.
