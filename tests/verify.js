@@ -191,8 +191,10 @@ async function main() {
     const g1k = firGainDb(taps, 1000, 24000), g5k = firGainDb(taps, 5000, 24000), g9k = firGainDb(taps, 9000, 24000);
     check('steam EQ is transparent below the SILK/CELT crossover', Math.abs(g1k) < 0.1 && Math.abs(g5k) < 0.1, `${g1k.toFixed(2)} / ${g5k.toFixed(2)} dB`);
     check('steam EQ trims the hybrid high band by the measured 2.5 dB', Math.abs(g9k + 2.5) < 0.2, `${g9k.toFixed(2)} dB`);
-    check('steam EQ starts the band edge above 11.5 kHz', firGainDb(taps, 11500, 24000) > -3 && firGainDb(taps, 12000, 24000) < -5,
-      `${firGainDb(taps, 11500, 24000).toFixed(2)} / ${firGainDb(taps, 12000, 24000).toFixed(2)} dB`);
+    const g75 = firGainDb(taps, 7500, 24000), g11 = firGainDb(taps, 11000, 24000), g115 = firGainDb(taps, 11500, 24000), g12 = firGainDb(taps, 12000, 24000);
+    check('steam EQ leaves the SILK/CELT crossover near unity', g75 > -0.8, `${g75.toFixed(2)} dB at 7.5 kHz`);
+    check('steam EQ rolls the band edge off from 11.5 kHz', g11 > -3.2 && g115 < -3 && g115 > -6.5 && g12 < -8,
+      `${g11.toFixed(2)} / ${g115.toFixed(2)} / ${g12.toFixed(2)} dB`);
     const js = TF2Audio.firwin2(95, [0, 6000, 12000], [0, -6, -6], 24000);
     // Gains interpolate linearly: halfway from 1.0 to 0.501 is 0.75 (-2.5 dB).
     check('firwin2 design follows its gain points', Math.abs(firGainDb(js, 9000, 24000) + 6) < 0.1 && Math.abs(firGainDb(js, 3000, 24000) + 2.5) < 0.2);
@@ -205,18 +207,32 @@ async function main() {
   console.log('\n[3] Receiver auto-gain (Source voice channel model)');
   {
     const R = 44100;
-    const quiet = TF2Audio.receiverAutoGain(tone(440, 1, R, 0.05), {});
-    const loud = TF2Audio.receiverAutoGain(tone(440, 1, R, 0.3), {});
-    const mq = meanAbs(quiet, R / 2), ml = meanAbs(loud, R / 2);
-    check('mean |y| settles at voice_avggain (0.5) for quiet input', Math.abs(mq - 0.5) < 0.01, mq.toFixed(4));
-    check('mean |y| settles at voice_avggain (0.5) for loud input', Math.abs(ml - 0.5) < 0.01, ml.toFixed(4));
+    // Gain actually applied at sample i (only where the input is large and the output unclipped).
+    const gainAt = (y, x, i) => (Math.abs(x[i]) > 0.05 && Math.abs(y[i]) < 0.99 ? y[i] / x[i] : NaN);
+    const avgGainOver = (y, x, offsets, fromBlock, toBlock) => {
+      let s = 0, n = 0;
+      for (let b = fromBlock; b < toBlock; b++) for (const j of offsets) { const g = gainAt(y, x, b * 128 + j); if (Number.isFinite(g)) { s += g; n++; } }
+      return s / Math.max(1, n);
+    };
+    // Steady sine: the default mean/peak blend (voice_avggain 0.5) overdrives by 1 / (2/pi + 0.5 (1 - 2/pi)) = 1.22.
+    const sine = tone(440, 1, R, 0.2);
+    const def = TF2Audio.receiverAutoGain(sine, {});
+    const c1 = clipFraction(def.subarray(R / 2), 0.95 * 32767 / 32768), m1 = meanAbs(def, R / 2);
+    check('voice_avggain 0.5 overdrives a steady sine 1.22x into the clamp (takes: 42% clipped, mean 0.71)', c1 > 0.40 && c1 < 0.46 && Math.abs(m1 - 0.71) < 0.02,
+      `${(c1 * 100).toFixed(1)}% / ${m1.toFixed(3)}`);
+    const c25 = clipFraction(TF2Audio.receiverAutoGain(sine, { avgGain: 0.25 }).subarray(R / 2), 0.95 * 32767 / 32768);
+    check('voice_avggain 0.25 drives harder (take: 50% clipped)', c25 > 0.47 && c25 < 0.53, `${(c25 * 100).toFixed(1)}%`);
+    const pk = TF2Audio.receiverAutoGain(sine, { avgGain: 1 });
+    const p1 = peakAbs(pk.subarray(R / 2));
+    check('voice_avggain 1 normalizes the block peak to full scale', p1 > 0.985 && p1 <= 1, p1.toFixed(4));
     const tiny = tone(440, 1, R, 0.001);
-    const capped = TF2Audio.receiverAutoGain(tiny, { maxGain: 16 });
-    const gain = rms(capped, R / 2) / rms(tiny, R / 2);
-    check('gain never exceeds voice_maxgain', gain <= 16.0001 && gain > 15.9, gain.toFixed(3));
+    const gain10 = rms(TF2Audio.receiverAutoGain(tiny, {}), R / 2) / rms(tiny, R / 2);
+    const gain16 = rms(TF2Audio.receiverAutoGain(tiny, { maxGain: 16 }), R / 2) / rms(tiny, R / 2);
+    check('quiet input stops at voice_maxgain (default 10)', Math.abs(gain10 - 10) < 0.05 && Math.abs(gain16 - 16) < 0.08,
+      `${gain10.toFixed(3)} / ${gain16.toFixed(3)}`);
     const dense = TF2Audio.receiverAutoGain(musicLike(1, R, 5), {});
-    const pk = peakAbs(dense);
-    check('output is clamped to int16 full scale', pk <= 32767 / 32768 + 1e-7 && pk > 0.99, pk.toFixed(6));
+    const dpk = peakAbs(dense);
+    check('output is int16 PCM clamped to full scale', dpk <= 1 && dpk > 0.99 && dense.every(v => Number.isInteger(v * 32768)), dpk.toFixed(6));
     check('dense input is hard-clipped at the ceiling', clipFraction(dense, 0.999) > 0.02, `${(clipFraction(dense, 0.999) * 100).toFixed(1)}%`);
     const onsetAt = 128 * 172;          // a block boundary
     const silentThenTone = new Float32Array(R);
@@ -225,16 +241,26 @@ async function main() {
     check('digital silence stays silent', peakAbs(onset.subarray(0, onsetAt)) === 0);
     check('silent blocks hold the gain instead of arming maximum gain', peakAbs(onset.subarray(onsetAt, onsetAt + 128)) < 0.31,
       peakAbs(onset.subarray(onsetAt, onsetAt + 128)).toFixed(3));
-    const half = TF2Audio.receiverAutoGain(tone(440, 1, R, 0.2), { scale: 0.5 });
-    check('voice_scale scales the auto-gain target', Math.abs(meanAbs(half, R / 2) - 0.25) < 0.01, meanAbs(half, R / 2).toFixed(4));
+    // Level step at a block edge: the old gain covers the next block, the ramp the one after, then the new target holds.
+    const stepIn = new Float32Array(128 * 40);
+    stepIn.set(tone(440, 128 * 8 / R, R, 0.02));
+    stepIn.set(tone(440, 128 * 32 / R, R, 0.3), 128 * 8);
+    const st = TF2Audio.receiverAutoGain(stepIn, {});
+    const clipBlock = (b0, b1) => clipFraction(st.subarray(b0 * 128, b1 * 128), 0.95 * 32767 / 32768);
+    check('after a level step the old gain holds for one block, then settles', clipBlock(8, 9) > 0.7 && Math.abs(clipBlock(10, 40) - 0.43) < 0.04,
+      `${(clipBlock(8, 9) * 100).toFixed(0)}% -> ${(clipBlock(10, 40) * 100).toFixed(0)}%`);
+    // voice_scale s: each block starts at s*s*T_prev and steps toward s*T by whole 1/128 increments (truncated).
+    const x12 = tone(1000, 1, R, 0.25);
+    const saw = TF2Audio.receiverAutoGain(x12, { scale: 0.5 });
+    const gStart = avgGainOver(saw, x12, [0, 1, 2, 3, 4, 5, 6, 7], 100, 300), gEnd = avgGainOver(saw, x12, [120, 121, 122, 123, 124, 125, 126, 127], 100, 300);
+    // T = 32767 / (mean + 0.5 (peak - mean)) = 4.89 here: s*s*T = 1.22; step = trunc(0.5 (T - s T)) = 1/128 per sample.
+    check('voice_scale 0.5 saws from s*s*T toward s*T in 1/128 steps (take: 0.32 -> 0.55 FS at -12 dBFS)',
+      Math.abs(gStart - 1.23) < 0.04 && Math.abs(gEnd - 2.19) < 0.04, `${gStart.toFixed(3)} -> ${gEnd.toFixed(3)}`);
+    const loudSine = tone(1000, 1, R, 0.5);
+    const flat = TF2Audio.receiverAutoGain(loudSine, { scale: 0.5 });
+    const flatDb = 20 * Math.log10(rms(flat, R / 2));
+    check('voice_scale 0.5 on a loud sine truncates the step to zero (take: -13.4 dB rms)', Math.abs(flatDb + 13.3) < 0.2, `${flatDb.toFixed(2)} dB`);
     check('voice_scale 0 mutes exactly', peakAbs(TF2Audio.receiverAutoGain(tone(440, .2, R, .2), { scale: 0 })) === 0);
-    // A level step: the gain must ramp across blocks, never jump inside one.
-    const step = new Float32Array(2048).fill(0.1); step.fill(0.4, 1024);
-    const g = TF2Audio.receiverAutoGain(step, { avgGain: 0.5 });
-    let maxJump = 0; for (let i = 1; i < g.length; i++) maxJump = Math.max(maxJump, Math.abs(g[i] - g[i - 1]) * (i === 1024 ? 0 : 1));
-    check('gain ramps smoothly between 128-sample blocks', maxJump < 0.05, maxJump.toFixed(4));
-    check('block gain lags by one block, then reaches target', Math.abs(g[1024 + 255] - 0.5) < 1e-6 && g[1024 + 1] > 0.5,
-      `${g[1025].toFixed(3)} -> ${g[1279].toFixed(3)}`);
   }
 
   console.log('\n[4] Measured signature: dense music through the Steam path');
@@ -254,8 +280,9 @@ async function main() {
     check('without the receiver clamp, the codec band edge holds', hfOff < -80, `${hfOff.toFixed(1)} dB rel`);
     const vol = await TF2Audio.process(mkBuffer(src, SR), { codec: 'steam' });
     const expected = ENGINE.volume;
-    check('output volume scales the rendered file linearly', Math.abs(peakAbs(vol.samples) / peakAbs(r.samples) - expected) < 0.01,
-      (peakAbs(vol.samples) / peakAbs(r.samples)).toFixed(4));
+    // RMS rather than peak: at volume 1 the final soft limiter touches the clipped peaks.
+    check('output volume scales the rendered file linearly', Math.abs(rms(vol.samples) / rms(r.samples) - expected) < 0.01,
+      (rms(vol.samples) / rms(r.samples)).toFixed(4));
   }
 
   console.log('\n[5] Real codec modes per profile');
@@ -279,6 +306,41 @@ async function main() {
     const st = await TF2Audio.process(mkBuffer(wide, SR), { codec: 'steam', agc: false, volume: 1 });
     const stHi = bandRms(st.samples, SR, 'highpass', 4000) / rms(st.samples);
     check('steam keeps its 4-12 kHz band', db(stHi) > -8, `${db(stHi).toFixed(1)} dB rel`);
+  }
+
+  console.log('\n[5b] Sender voice gate (Steam VAD, measured)');
+  {
+    const rmsDbfs = (db) => 10 ** (db / 20) * Math.SQRT2;          // sine amplitude for an RMS level
+    const quiet = await TF2Audio.process(mkBuffer(tone(1000, 1.5, SR, rmsDbfs(-45)), SR), { codec: 'steam', volume: 1 });
+    check('a steady -45 dBFS RMS tone never opens the gate (take: -42 dB sine silent)', peakAbs(quiet.samples) === 0 && quiet.codecInfo.gatedFrames === quiet.codecInfo.frames,
+      `${quiet.codecInfo.gatedFrames}/${quiet.codecInfo.frames}`);
+    const open = await TF2Audio.process(mkBuffer(tone(1000, 1.5, SR, rmsDbfs(-38)), SR), { codec: 'steam', volume: 1 });
+    check('a -38 dBFS RMS tone is transmitted and boosted to the 20 dB cap', open.codecInfo.gatedFrames === 0 && Math.abs(db(rms(open.samples, SR / 2)) + 18) < 1,
+      `${open.codecInfo.gatedFrames} gated, ${db(rms(open.samples, SR / 2)).toFixed(1)} dB`);
+    const forced = await TF2Audio.process(mkBuffer(tone(1000, 1.5, SR, rmsDbfs(-45)), SR), { codec: 'steam', volume: 1, gate: false });
+    check('gate: false transmits everything', forced.codecInfo.gatedFrames === 0 && forced.codecInfo.gate === null && Math.abs(db(rms(forced.samples, SR / 2)) + 25) < 1);
+    const lower = await TF2Audio.process(mkBuffer(tone(1000, 1.5, SR, rmsDbfs(-45)), SR), { codec: 'steam', volume: 1, gateThresholdDb: -50 });
+    check('the gate threshold is adjustable', lower.codecInfo.gatedFrames === 0 && lower.codecInfo.gate === -50);
+    const legacy = await TF2Audio.process(mkBuffer(tone(1000, 1, SR, rmsDbfs(-45)), SR), { codec: 'speex', volume: 1 });
+    check('push-to-talk engine codecs have no gate by default', legacy.codecInfo.gatedFrames === 0 && legacy.codecInfo.gate === null);
+    // 0.5 s at -20 dBFS then 1.5 s at -60 dBFS: the gate holds 300 ms after the last loud frame, then closes.
+    const burst = new Float32Array(2 * SR);
+    burst.set(tone(700, 0.5, SR, rmsDbfs(-20)));
+    burst.set(tone(700, 1.5, SR, rmsDbfs(-60)), SR / 2);
+    const hb = await TF2Audio.process(mkBuffer(burst, SR), { codec: 'steam', volume: 1 });
+    const tail = (a, b) => rms(hb.samples, Math.round(a * SR), Math.round(b * SR));
+    check('the gate holds ~300 ms after speech, carrying the quiet tail at full auto-gain', Math.abs(db(tail(0.6, 0.75)) + 40) < 1.5 && peakAbs(hb.samples.subarray(Math.round(0.9 * SR))) === 0,
+      `${db(tail(0.55, 0.75)).toFixed(1)} dB then silence`);
+    check('closed frames are neither encoded nor sent', hb.codecInfo.gatedFrames > 50 && hb.codecInfo.modes.hybrid + hb.codecInfo.modes.silk + hb.codecInfo.modes.celt === hb.codecInfo.frames - hb.codecInfo.gatedFrames,
+      JSON.stringify({ gated: hb.codecInfo.gatedFrames, frames: hb.codecInfo.frames }));
+    // Stereo capture: the measured default takes the left channel, as a mono read of a stereo cable does.
+    const L = tone(500, 1, SR, 0.2), Rch = new Float32Array(SR);
+    const stereoSrc = { sampleRate: SR, length: SR, numberOfChannels: 2, getChannelData: (c) => c ? Rch : L };
+    const capL = await TF2Audio.process(stereoSrc, { codec: 'steam', volume: 1, enableWarble: false, agc: false });
+    const capR = await TF2Audio.process(stereoSrc, { codec: 'steam', volume: 1, enableWarble: false, agc: false, captureChannel: 'right' });
+    const capM = await TF2Audio.process(stereoSrc, { codec: 'steam', volume: 1, enableWarble: false, agc: false, captureChannel: 'mix' });
+    check('stereo input: left channel by default, right and mix on request', Math.abs(db(rms(capL.samples) / rms(L))) < 0.3 && rms(capR.samples) === 0 && Math.abs(db(rms(capM.samples) / rms(L)) + 6.02) < 0.3,
+      `${db(rms(capL.samples) / rms(L)).toFixed(2)} / ${db(rms(capM.samples) / rms(L)).toFixed(2)} dB`);
   }
 
   console.log('\n[6] Clean path and codec bypass');

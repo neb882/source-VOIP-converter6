@@ -65,16 +65,19 @@ const silent = await A.process(buffer(new Float32Array(rate), rate), base);
 check('Silence stays below -100 dBFS RMS without added hiss', energy(silent.samples) / silent.samples.length < 1e-10);
 const muted = await A.process(buffer(x, rate), { ...base, voiceScale: 0 });
 check('Receiver mute is exact silence', energy(muted.samples) === 0);
-const quiet = Float32Array.from(x, v => v * .1);
+// x is about -21 dBFS RMS; stay above the Steam voice gate (-39.5 dBFS) so the gain is what is tested.
+const quiet = Float32Array.from(x, v => v * .3);
 const leveled = await A.process(buffer(quiet, rate), base);
 const unleveled = await A.process(buffer(quiet, rate), { ...base, agc: false });
 check('Disabling receiver auto-gain preserves quiet input levels', energy(leveled.samples) > energy(unleveled.samples) * 20);
 const levelDb = (samples) => 10 * Math.log10(energy(samples) / energy(high.samples));
-const halfIn = await A.process(buffer(Float32Array.from(x, v => v * .5), rate), base);
-check('Receiver auto-gain levels a 6 dB input difference to within 0.5 dB', Math.abs(levelDb(halfIn.samples)) < .5);
-const faint = await A.process(buffer(Float32Array.from(x, v => v * .05), rate), base);
-// x needs ~7x gain; 26 dB quieter needs ~140x, so voice_maxgain (16) binds.
-check('voice_maxgain caps the boost for very quiet input', levelDb(faint.samples) < -15 && levelDb(faint.samples) > -22);
+const doubleIn = await A.process(buffer(Float32Array.from(x, v => v * 2), rate), base);
+check('Receiver auto-gain levels a 6 dB input difference to within 0.5 dB', Math.abs(levelDb(doubleIn.samples)) < .5);
+const faint = await A.process(buffer(Float32Array.from(x, v => v * .05), rate), { ...base, gate: false });
+// x needs ~6x gain; 26 dB quieter needs ~120x, so voice_maxgain (10) binds.
+check('voice_maxgain caps the boost for very quiet input', levelDb(faint.samples) < -19 && levelDb(faint.samples) > -26);
+const gatedFaint = await A.process(buffer(Float32Array.from(x, v => v * .05), rate), base);
+check('The Steam voice gate holds back input below -39.5 dBFS RMS', energy(gatedFaint.samples) === 0 && gatedFaint.codecInfo.gatedFrames === gatedFaint.codecInfo.frames);
 const quarter = await A.process(buffer(x, rate), { ...base, volume: .25 });
 const halfVol = await A.process(buffer(x, rate), { ...base, volume: .5 });
 check('Output volume is linear and applied after the voice clamp',
@@ -87,6 +90,17 @@ for (const sourceRate of [8000, 44100, 96000]) {
 }
 await assert.rejects(() => A.process(buffer(new Float32Array([NaN]), rate), base), /non-finite/);
 check('Invalid PCM is rejected before encoding', true);
+{
+  // Sender gate inside the round trip: 0.2 s at -10 dBFS, then -50 dBFS. Two hold frames follow the last loud one.
+  const gx = Float32Array.from({ length: rate }, (_, i) => (i < rate * .2 ? .45 : .0045) * Math.sin(2 * Math.PI * 500 * i / rate));
+  const { samples, info } = await opus.roundTrip(gx, rate, 32000, { gate: { thresholdDb: -30, holdFrames: 2 } });
+  const frameEnergy = f => energy(samples.subarray(f * 480, (f + 1) * 480));
+  check('Gate: loud frames and the hold are transmitted', frameEnergy(5) > 0 && frameEnergy(10) > 0 && frameEnergy(11) > 0);
+  check('Gate: closed frames are silent and counted', energy(samples.subarray(13 * 480)) === 0 && info.gatedFrames === info.frames - 12 && info.gate === -30);
+  check('Gate: only transmitted frames are encoded', Object.values(info.modes).reduce((a, b) => a + b, 0) === info.frames - info.gatedFrames);
+  const plain = await opus.roundTrip(gx, rate, 32000);
+  check('Gate is off unless requested', plain.info.gatedFrames === 0 && plain.info.gate === null);
+}
 const aliasSource = Float32Array.from({ length: 48000 }, (_, i) => Math.sin(2 * Math.PI * 16000 * i / 48000));
 const downsampled = A.resampleSinc(aliasSource, 48000, 24000).slice(100, -100);
 check('Downsampling rejects an out-of-band tone instead of aliasing it', energy(downsampled) / downsampled.length < 1e-7);

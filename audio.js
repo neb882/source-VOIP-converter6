@@ -1,15 +1,17 @@
 /* TF2 Voice Emulator — local DSP and codec orchestration.
  *
- * Sender:   downmix -> capture gain / int16 clip -> resample to the codec
- *           rate -> optional capture filters -> real libopus encode
+ * Sender:   mono capture (left channel by default) -> capture gain / int16
+ *           clip -> resample to the codec rate -> optional capture filters
+ *           -> Steam voice gate -> real libopus encode
  * Network:  20 ms packets grouped by net_split, seeded burst loss
  * Receiver: libopus decode + native concealment -> profile EQ -> engine
  *           voice rate -> Source-style auto-gain with int16 clamp -> 44.1 kHz
  *           mixer (room DSP) -> output stage -> output rate
  *
- * The Steam profile and receiver path are fitted to a paired 2026
- * voice_loopback recording (tests/REFERENCE_2026.md). Room processors are
- * effects built from Valve's preset data, not Valve's implementations.
+ * The Steam profile, voice gate and receiver path are identified from 2026
+ * voice_loopback recordings of music, speech and a calibrated test signal
+ * (tests/REFERENCE_2026.md). Room processors are effects built from Valve's
+ * preset data, not Valve's implementations.
  * Same decoded PCM + settings + pinned runtime gives repeatable output.
  *
  * TF2Audio.process(buffer, opts) -> { samples, sampleRate, blob, codecInfo }
@@ -25,6 +27,7 @@
 
   const TAU = Math.PI * 2;
   const INT16_FULL_SCALE = 32767 / 32768;
+  const DEFAULT_SENDER_GATE = { thresholdDb: -39.5, holdMs: 300 };
   const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
   const finiteOr = (value, fallback) => {
     const number = Number(value);
@@ -96,9 +99,14 @@
   /* Channel downmix                                                    */
   /* ------------------------------------------------------------------ */
 
-  function bufferToMono(buffer) {
+  // Mono capture of a (possibly stereo) buffer: 'mix' averages every channel;
+  // 'left' / 'right' take one channel, as a mono capture of a stereo virtual
+  // cable does (the 2026 music loopback matched the left channel).
+  function bufferToMono(buffer, channel = 'mix') {
     const ch = buffer.numberOfChannels;
     if (ch === 1) return buffer.getChannelData(0).slice(0);
+    if (channel === 'left') return buffer.getChannelData(0).slice(0);
+    if (channel === 'right') return buffer.getChannelData(1).slice(0);
     const out = new Float32Array(buffer.length);
     if (ch === 2) {
       const a = buffer.getChannelData(0), b = buffer.getChannelData(1);
@@ -307,38 +315,45 @@
   /* ------------------------------------------------------------------ */
   /* Receiver auto-gain (Source voice channel)                          */
   /*                                                                    */
-  /* Each finished block's mean |x| sets the NEXT gain: avgGain / mean,  */
-  /* capped at maxGain and multiplied by voice_scale. The gain ramps     */
-  /* linearly from the previous target across the following block and    */
-  /* every sample is clamped to int16. With music this keeps the mean at */
-  /* ~half scale and flattens ~13% of samples: the hard-clipped, level-  */
-  /* locked sound measured in the 2026 recording. Digitally silent       */
-  /* blocks hold the previous target instead of jumping to maxGain.      */
+  /* Identified from the 2026 test-signal takes (tests/REFERENCE_2026). */
+  /* The decoded voice is int16. Each 128-sample block sets a target    */
+  /*   T = min(maxGain, 32767 / (mean + avgGain * (peak - mean)))       */
+  /* so voice_avggain 0 drives the block mean to full scale and 1 the   */
+  /* block peak; the default 0.5 overdrives a sine by 1.22x. Over the   */
+  /* following block the gain starts at s*s*T_prev and steps toward s*T */
+  /* in 1/128 fixed-point increments truncated toward zero, with        */
+  /* s = voice_scale, and every sample is clamped to int16. At s = 1 the */
+  /* gain ramps from the previous target and the sub-step remainder     */
+  /* jumps at the block edge; other scales give the recorded sawtooth.  */
+  /* All-zero blocks (no voice data) leave the state untouched.         */
   /* ------------------------------------------------------------------ */
 
   function receiverAutoGain(samples, options = {}) {
     const block = Math.max(1, Math.round(finiteOr(options.blockSize, 128)));
     const avgGain = Math.max(0, finiteOr(options.avgGain, 0.5));
-    const maxGain = Math.max(0, finiteOr(options.maxGain, 16));
+    const maxGain = Math.max(0, finiteOr(options.maxGain, 10));
     const scale = Math.max(0, finiteOr(options.scale, 1));
-    const silence = 1 / 32768;
     const out = new Float32Array(samples.length);
-    let current = scale, next = scale;
+    let fixed = Math.trunc(scale * 128), step = 0, prevTarget = 1;
     for (let start = 0; start < samples.length; start += block) {
       const end = Math.min(samples.length, start + block);
-      const step = (next - current) / block;
-      let gain = current, total = 0;
-      for (let i = start; i < end; i++) {
-        const x = samples[i];
-        total += Math.abs(x);
-        gain += step;
-        const y = x * gain;
-        out[i] = y > INT16_FULL_SCALE ? INT16_FULL_SCALE : (y < -INT16_FULL_SCALE ? -INT16_FULL_SCALE : y);
+      let total = 0, peak = 0;
+      for (let i = start, j = 0; i < end; i++, j++) {
+        const x = clamp(Math.round(samples[i] * 32768), -32768, 32767);
+        const a = x < 0 ? -x : x;
+        total += a;
+        if (a > peak) peak = a;
+        const y = Math.floor(x * (fixed + j * step) / 128);
+        out[i] = (y > 32767 ? 32767 : (y < -32768 ? -32768 : y)) / 32768;
       }
       if (end - start < block) break;
-      current = next;
+      if (peak === 0) { fixed += block * step; step = 0; continue; }
       const mean = total / block;
-      if (mean > silence) next = Math.min(maxGain, avgGain / mean) * scale;
+      const target = Math.min(maxGain, 32767 / (mean + avgGain * (peak - mean)));
+      const current = prevTarget * scale;
+      fixed = Math.trunc(current * scale * 128);
+      step = Math.trunc((target - current) / block * scale * 128);
+      prevTarget = target;
     }
     return out;
   }
@@ -669,6 +684,7 @@
    *   listenerPos:  key of LISTENER_POSITIONS. Overrides dspRoom.
    *   dspRoom:      numeric id into DSP_PRESETS (when listenerPos absent)
    *   customEnv:    { duration, decay, mix } override for DSP_PRESETS[99]
+   *   captureChannel: 'left' | 'right' | 'mix' for stereo input    ['left']
    *   micGain:      sender capture gain; > 1 clips the int16 capture   [1]
    *   hp / lp:      optional sender filters in Hz (off: hp <= 10,
    *                 lp >= 0.45 x codec rate)                           [off]
@@ -677,9 +693,11 @@
    *   frameMs:      net_split packet duration (whole 20 ms frames)      [20]
    *   jitterPct:    net_jitter crackle % (artistic)                     [0]
    *   enableWarble: false bypasses the codec (filters/engine remain)    [true]
+   *   gate:         Steam sender voice gate; null = profile default     [null]
+   *   gateThresholdDb: gate opening level, frame RMS in dBFS [profile/-39.5]
    *   agc:          receiver auto-gain (false = unity gain)             [true]
-   *   avgGain:      voice_avggain target mean |x| / full scale          [0.5]
-   *   maxGain:      voice_maxgain gain cap                              [16]
+   *   avgGain:      voice_avggain, mean (0) to peak (1) normalization   [0.5]
+   *   maxGain:      voice_maxgain gain cap                              [10]
    *   voiceScale:   voice_scale, applied inside the auto-gain           [1]
    *   volume:       output level after the mixer                        [0.5]
    *   seed:         PRNG seed for the loss pattern / crackle        [0xC0FFEE]
@@ -709,7 +727,11 @@
     const jitterPct    = clamp(finiteOr(opts.jitterPct, 0), 0, 100);
     const enableCodec  = opts.enableWarble !== false;
     const autoGain     = opts.agc !== false;
-    const avgGain      = clamp(finiteOr(opts.avgGain, engine.autoGain.avgGain), 0.01, 2);
+    const captureChannel = ['left', 'right', 'mix'].includes(opts.captureChannel) ? opts.captureChannel : 'left';
+    const gateSpec     = codec.senderGate || DEFAULT_SENDER_GATE;
+    const gateOn       = opts.gate == null ? !!codec.senderGate : !!opts.gate;
+    const gateDb       = clamp(finiteOr(opts.gateThresholdDb, gateSpec.thresholdDb), -90, 0);
+    const avgGain      = clamp(finiteOr(opts.avgGain, engine.autoGain.avgGain), 0, 2);
     const maxGain      = clamp(finiteOr(opts.maxGain, engine.autoGain.maxGain), 1, 100);
     const voiceScale   = clamp(finiteOr(opts.voiceScale, 1), 0, 4);
     const volume       = clamp(finiteOr(opts.volume, engine.volume), 0, 1);
@@ -723,7 +745,7 @@
     const report = (f) => { if (typeof opts.onProgress === 'function') opts.onProgress(f); };
 
     /* ---- 1) Sender capture: downmix, capture gain, int16 clip ---- */
-    let samples = bufferToMono(audioBuffer);
+    let samples = bufferToMono(audioBuffer, captureChannel);
     if (!samples.every(Number.isFinite)) throw new TypeError('Source PCM contains a non-finite sample.');
     const playbackLength = Math.round(samples.length * playbackRate / srcRate);
     if (micGain !== 1) {
@@ -750,6 +772,7 @@
       const bitrate = Math.max(6000, Math.round(codec.bitrate * bits / 16));
       const result = await opus.roundTrip(samples, codecRate, bitrate, {
         application: codec.application, signal: codec.signal,
+        gate: gateOn ? { thresholdDb: gateDb, holdFrames: Math.round(gateSpec.holdMs / frameMs) } : null,
         makeLossMask: count => buildLossMask(count, framesPerPacket, lossPct, rand),
         yieldControl: microYield,
         onProgress: f => report(0.2 + 0.5 * f)

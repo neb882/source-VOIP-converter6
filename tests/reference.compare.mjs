@@ -305,11 +305,14 @@ async function main() {
     const length = Math.round(seconds * rate);
     const recorded = ref48.subarray(Math.round(start * rate), Math.round(start * rate) + length);
     const comparisons = [];
-    for (const channel of ['mix', 'left']) {
+    // Which source channel reaches the game depends on the capture device's
+    // stereo-to-mono handling, so every channel is rendered.
+    for (const channel of ['mix', 'left', 'right']) {
       const source48 = audio.resampleSinc(mono(source, channel), source.rate, rate);
       const input = sampleTimeline(source48, rate, timeline.offsetSeconds + start * timeline.scale, timeline.scale, length);
       const settings = [
         ['modern', { codec: preset.codec, listenerPos: preset.position, micGain: preset.gain, voiceScale: preset.voice_scale, hp: preset.hp, lp: preset.lp }],
+        ['voice-gate-off', { codec: preset.codec, listenerPos: preset.position, micGain: preset.gain, voiceScale: preset.voice_scale, hp: preset.hp, lp: preset.lp, gate: false }],
         ['receiver-auto-gain-off', { codec: preset.codec, listenerPos: preset.position, agc: false, volume: 1 }]
       ];
       const variants = [];
