@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import * as opus from '../opus-codec.mjs';
@@ -46,7 +47,7 @@ const base = { codec: 'steam', micGain: 1, voiceScale: 1, listenerPos: 'open', b
 const high = await A.process(buffer(x, rate), base);
 const low = await A.process(buffer(x, rate), { ...base, bits: 6 });
 check('Both quality settings use real Opus', high.realOpus && low.realOpus);
-check('Quality changes the actual encoder bitrate', high.codecInfo.bitrate === 34000 && low.codecInfo.bitrate === 12750);
+check('Quality changes the actual encoder bitrate', high.codecInfo.bitrate === 32000 && low.codecInfo.bitrate === 12000);
 check('Lower bitrate produces fewer encoded bytes', low.codecInfo.encodedBytes < high.codecInfo.encodedBytes * .6);
 check('Quality changes the decoded audio', difference(high.samples, low.samples) > .01);
 const repeat = await A.process(buffer(x, rate), base);
@@ -119,6 +120,23 @@ check('Invalid PCM is rejected before encoding', true);
   const withDtx = await opus.roundTrip(steadyTone, rate, 32000, { complexity: 6, vbr: true, dtx: true });
   const noDtx = await opus.roundTrip(steadyTone, rate, 32000);
   check('DTX is opt-in and its comfort-noise frames are counted', withDtx.info.dtx && withDtx.info.dtxFrames > 20 && noDtx.info.dtxFrames === 0 && withDtx.info.encodedBytes < noDtx.info.encodedBytes / 2);
+}
+{
+  // The Steam profile's libopus 1.1.5 build: the release Steam's voice packets match.
+  const hash = crypto.createHash('sha256');
+  const r = await opus.roundTrip(x, rate, 32000, { runtime: '1.1.5', application: 'voip', signal: 'voice', complexity: 10,
+    vbr: true, dtx: true, onPacket: (f, packet) => hash.update(packet) });
+  check('libopus 1.1.5 runtime reports its release and codec delay', r.info.version === 'libopus 1.1.5' && r.info.runtime === '1.1.5' && r.info.lookahead === 156);
+  // Same packets as a native gcc build of the tagged release (vendor/libopus-1.1/README.md).
+  check('libopus 1.1.5 packets match the native reference build bit for bit',
+    hash.digest('hex') === '187a77a8beb6582013a2695566f0254d770c2d91c6f574f938cdaf5db616a892' && r.info.encodedBytes === 4681);
+  // Steam's DTX follows the SILK voice detector at complexity 10, as 1.1.x does; 1.6.1's tonality analysis keeps a steady tone active.
+  const steadyTone = Float32Array.from({ length: 2 * rate }, (_, i) => .03 * Math.sin(2 * Math.PI * 1000 * i / rate));
+  const old = await opus.roundTrip(steadyTone, rate, 32000, { runtime: '1.1.5', complexity: 10, vbr: true, dtx: true, signal: 'voice' });
+  const cur = await opus.roundTrip(steadyTone, rate, 32000, { runtime: '1.6.1', complexity: 10, vbr: true, dtx: true, signal: 'voice' });
+  check('At complexity 10, libopus 1.1.5 puts a steady tone into DTX and 1.6.1 does not', old.info.dtxFrames > 50 && cur.info.dtxFrames === 0);
+  await assert.rejects(() => opus.roundTrip(x, rate, 32000, { runtime: '0.9' }), /Unknown libopus runtime/);
+  check('Unknown runtimes are rejected', true);
 }
 const aliasSource = Float32Array.from({ length: 48000 }, (_, i) => Math.sin(2 * Math.PI * 16000 * i / 48000));
 const downsampled = A.resampleSinc(aliasSource, 48000, 24000).slice(100, -100);

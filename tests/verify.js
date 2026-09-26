@@ -205,16 +205,15 @@ async function main() {
 
   console.log('\n[2] Profile calibration FIR');
   {
-    const eq = vm.runInContext('CODEC_PROFILES.steam.decoderEq', sandbox);
+    // libopus 1.1.5 reproduces Steam's decoded spectrum, so only the capture resampler's band edge remains.
+    check('steam has no decoder EQ', vm.runInContext('CODEC_PROFILES.steam.decoderEq', sandbox) == null);
+    const eq = vm.runInContext('CODEC_PROFILES.steam.captureEq', sandbox);
     const taps = TF2Audio.firwin2(eq.taps, eq.freqs, eq.gainsDb, 24000);
-    const g1k = firGainDb(taps, 1000, 24000), g5k = firGainDb(taps, 5000, 24000), g9k = firGainDb(taps, 9000, 24000);
-    check('steam EQ is transparent at low frequencies', Math.abs(g1k) < 0.15, `${g1k.toFixed(2)} dB`);
-    check('steam EQ adds the measured 1 dB to the SILK band above 3 kHz', Math.abs(g5k - 1) < 0.2, `${g5k.toFixed(2)} dB`);
-    check('steam EQ trims the CELT band above 8 kHz by the measured 1 dB', Math.abs(g9k + 1) < 0.2, `${g9k.toFixed(2)} dB`);
-    const g75 = firGainDb(taps, 7500, 24000), g11 = firGainDb(taps, 11000, 24000), g115 = firGainDb(taps, 11500, 24000), g12 = firGainDb(taps, 12000, 24000);
-    check('steam EQ keeps the SILK side of the 8 kHz crossover', g75 > 0.6, `${g75.toFixed(2)} dB at 7.5 kHz`);
-    check('steam EQ follows the capture resampler roll-off from 11.2 kHz', g11 > -1.6 && g115 < -3 && g115 > -5 && g12 < -5.5,
-      `${g11.toFixed(2)} / ${g115.toFixed(2)} / ${g12.toFixed(2)} dB`);
+    const gains = [1000, 5000, 9000, 10500].map(f => firGainDb(taps, f, 24000));
+    check('steam capture EQ is transparent up to 10.5 kHz', gains.every(g => Math.abs(g) < 0.15), gains.map(g => g.toFixed(2)).join(' / '));
+    const g114 = firGainDb(taps, 11450, 24000), g1175 = firGainDb(taps, 11750, 24000), g12 = firGainDb(taps, 12000, 24000);
+    check('steam capture EQ follows the capture resampler roll-off from 11.1 kHz', Math.abs(g114 + 2.2) < 0.6 && Math.abs(g1175 + 6.6) < 1 && g12 < -7,
+      `${g114.toFixed(2)} / ${g1175.toFixed(2)} / ${g12.toFixed(2)} dB`);
     const js = TF2Audio.firwin2(95, [0, 6000, 12000], [0, -6, -6], 24000);
     // Gains interpolate linearly: halfway from 1.0 to 0.501 is 0.75 (-2.5 dB).
     check('firwin2 design follows its gain points', Math.abs(firGainDb(js, 9000, 24000) + 6) < 0.1 && Math.abs(firGainDb(js, 3000, 24000) + 2.5) < 0.2);
@@ -308,13 +307,16 @@ async function main() {
   console.log('\n[5] Real codec modes per profile');
   {
     const src = musicLike(1, SR, 3);
-    const expect = { steam: ['hybrid', 34000], steam_48: ['hybrid', 64000], celt_22: ['celt', 22000], celt_44: ['celt', 44000], speex: ['silk', 8000] };
+    const expect = { steam: ['hybrid', 32000], steam_48: ['hybrid', 64000], celt_22: ['celt', 22000], celt_44: ['celt', 44000], speex: ['silk', 8000] };
     for (const [codec, [mode, bitrate]] of Object.entries(expect)) {
       const r = await TF2Audio.process(mkBuffer(src, SR), { codec });
       const m = r.codecInfo.modes;
       const total = m.silk + m.hybrid + m.celt;
       check(`${codec}: libopus runs in ${mode} mode at ${bitrate / 1000} kbps`,
         r.codecInfo.backend === 'libopus' && r.codecInfo.bitrate === bitrate && m[mode] / total > 0.8, JSON.stringify(m));
+      // The Steam profiles run the libopus release Steam's packets match; the stand-ins keep 1.6.1.
+      const release = codec.startsWith('steam') ? 'libopus 1.1.5' : 'libopus 1.6.1';
+      check(`${codec}: encodes and decodes with ${release}`, r.codecInfo.version === release, r.codecInfo.version);
       check(`${codec}: finite output`, !hasBadValues(r.samples) && r.samples.length === Math.round(src.length * r.sampleRate / SR));
     }
     const wide = whiteNoise(1, SR, 0.15, 7);

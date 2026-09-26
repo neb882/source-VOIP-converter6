@@ -228,10 +228,11 @@ const PRESETS = {
  *   application : 'voip' (SILK/hybrid capable) or 'lowdelay' (CELT only)
  *   signal      : Opus signal hint; 'voice' keeps music in hybrid mode,
  *                 matching the SILK/CELT crossover seen in the recording
- *   encoder     : libopus complexity / vbr / dtx. Without it: complexity 10,
- *                 CBR, no DTX
- *   decoderEq   : optional FIR (linear gains interpolated between points)
- *                 applied to decoded audio at codecRate
+ *   encoder     : libopus runtime ('1.1.5' or '1.6.1') / complexity / vbr /
+ *                 dtx. Without it: libopus 1.6.1, complexity 10, CBR, no DTX
+ *   captureEq   : optional FIR (linear gains interpolated between points)
+ *                 applied at codecRate before the gate and encoder
+ *   decoderEq   : optional FIR applied to decoded audio at codecRate
  *   senderGate  : Steam's sender voice gate. A 20 ms frame above thresholdDb
  *                 (RMS, dBFS) is sent with the prerollMs before it and the
  *                 holdMs after it; other frames are not sent. Profiles
@@ -245,21 +246,17 @@ const PRESETS = {
  * ------------------------------------------------------------------------- */
 const CODEC_PROFILES = {
   steam: {
-    displayName: 'Steam voice (Opus 24 kHz VBR, ~32 kbps)',
-    // Steam's packets are VBR with DTX, about 32 kbps on noise and 26 kbps on
-    // voiced speech. libopus 1.6.1 spends the same bytes at a 34 kbps target.
-    // Complexity 6 is the highest at which it takes DTX decisions from the
-    // SILK voice detector, as Steam's encoder does (tests/REFERENCE_2026.md).
-    codecRate: 24000, bitrate: 34000, application: 'voip', signal: 'voice',
-    encoder: { complexity: 6, vbr: true, dtx: true },
-    // Steam's decoded packets against libopus 1.6.1 on the same input: about
-    // 1 dB more above 3 kHz in the SILK band, 1 dB less in the CELT band
-    // above 8 kHz, and Steam's capture resampler rolling off from 11.2 kHz.
-    // The receiver adds nothing (measured within 0.1 dB to 11.5 kHz).
-    decoderEq: {
-      taps: 95,
-      freqs:   [0, 1000, 2000, 3000, 4000, 7800, 8100, 11000, 11200, 11400, 11500, 11650, 11750, 12000],
-      gainsDb: [0, 0,    0.4,  0.7,  1.0,  1.0,  -1.0, -1.0,  -1.3,  -2.5,  -4.0,  -4.8,  -6.5,  -6.5]
+    displayName: 'Steam voice (Opus 24 kHz VBR, 32 kbps)',
+    // Steam's voice packets are libopus 1.1.x at its default complexity 10,
+    // 32 kbps VBR with DTX: the same frame sizes, DTX decisions and decoded
+    // spectrum as the SourceTV packets (tests/REFERENCE_2026.md).
+    codecRate: 24000, bitrate: 32000, application: 'voip', signal: 'voice',
+    encoder: { runtime: '1.1.5', complexity: 10, vbr: true, dtx: true },
+    // Steam's capture resampler rolls the band edge off from 11.1 kHz.
+    captureEq: {
+      taps: 255,
+      freqs:   [0, 11000, 11150, 11250, 11350, 11450, 11550, 11650, 11750, 11850, 12000],
+      gainsDb: [0, 0,     -0.1,  -0.35, -0.9,  -2.2,  -3.4,  -4.8,  -6.6,  -7.8,  -8.5]
     },
     senderGate: { thresholdDb: -39.5, prerollMs: 120, holdMs: 440 },
     voiceRate: 44100, mixer: 'sinc', status: 'measured'
@@ -268,7 +265,7 @@ const CODEC_PROFILES = {
   steam_48: {
     displayName: 'Fullband Opus (48 kHz / 64 kbps, experimental)',
     codecRate: 48000, bitrate: 64000, application: 'voip', signal: 'voice',
-    encoder: { complexity: 6, vbr: true, dtx: true },
+    encoder: { runtime: '1.1.5', complexity: 10, vbr: true, dtx: true },
     senderGate: { thresholdDb: -39.5, prerollMs: 120, holdMs: 440 },
     voiceRate: 44100, mixer: 'sinc', status: 'experimental'
   },

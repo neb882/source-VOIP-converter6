@@ -25,3 +25,15 @@ for (const [from, to] of Object.entries(files)) {
   }
 }
 console.log('Opus runtime matches libopus-wasm 0.4.0.');
+
+// The libopus 1.1.5 build for the Steam profile comes from tests/libopus11/build.mjs,
+// which needs clang and wasm-ld; here only its recorded hash is checked.
+if (process.argv.includes('--check')) {
+  const { createHash } = await import('node:crypto');
+  const built = fs.readFileSync(path.join(root, 'vendor/libopus-1.1/libopus-1.1.5.wasm.mjs'));
+  const expected = 'b7a03edba67393bbe23b3c531486f1e56f9ebdba3727e2b90c97025821f718d0';
+  if (createHash('sha256').update(built).digest('hex') !== expected) {
+    throw new Error('vendor/libopus-1.1/libopus-1.1.5.wasm.mjs differs from the recorded build');
+  }
+  console.log('libopus 1.1.5 build matches its recorded hash.');
+}

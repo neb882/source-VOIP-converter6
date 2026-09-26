@@ -204,16 +204,14 @@ Every frame in the demo is a 20 ms Opus packet with TOC configuration 13: hybrid
 - **No in-band FEC:** the LBRR flag is never set.
 - **Spurt ends:** each talk spurt ends with Steam's end-of-transmission marker, which resets the receiver's decoder, and a silence record of 62.5 ms (sometimes 31 ms).
 
-libopus 1.6.1 reproduces Steam's DTX decisions only at complexity 6 or below:
+libopus 1.6.1 reproduces Steam's DTX decisions only at complexity 6 or below, where it decides from the SILK voice detector. From complexity 7 its tonality analysis decides:
 
-| Setting | DTX frames in both Steam and libopus | Steam only | libopus only |
+| libopus 1.6.1 setting | DTX frames in both Steam and libopus | Steam only | libopus only |
 | --- | ---: | ---: | ---: |
 | Complexity ≤ 6 | 588 | 105 | 14 |
 | Complexity 7–10 | 97 | 596 | 4 |
 
-At complexity 6 or below libopus decides from the SILK voice detector. From complexity 7 its tonality analysis decides, and that analysis entered libopus in 1.3. Steam's encoder therefore likely predates 1.3 or runs at a low complexity.
-
-Steam spends up to 15% more bytes than libopus 1.6.1 at 32 kbps on the same input, about 10% more on noise and the vowel. A 34 kbps target matches its total within 0.2% and each segment type within about 8%.
+It also spends up to 15% fewer bytes than Steam at 32 kbps. Finding 16 explains both: Steam runs libopus 1.1.x.
 
 A client demo made with `record` keeps the voice messages but not their payloads. That held for both client demos checked.
 
@@ -231,11 +229,11 @@ Opus's voice detector marks a steady tone inactive after a while. The encoder th
 
 | Segment | First DTX frame, Steam / model | DTX frames, Steam / model |
 | --- | ---: | ---: |
-| sine −36 dBFS | 0.42 / 0.40 s | 75 / 77 |
-| sine −30 dBFS | 1.16 / 1.20 s | 40 / 39 |
+| sine −36 dBFS | 0.42 / 0.38 s | 75 / 78 |
+| sine −30 dBFS | 1.16 / 1.18 s | 40 / 40 |
 | sine −24 to −1 dBFS | none / none | 0 / 0 |
-| 8, 8.5 and 11 kHz tones | — | 41, 47, 42 / 40, 47, 40 |
-| pink noise −36 to −18 dB | — | 19 / 16 |
+| 8, 8.5 and 11 kHz tones | — | 41, 47, 42 / 41, 47, 41 |
+| pink noise −36 to −18 dB | — | 19 / 19 |
 | synthetic vowel | — | 0 / 0 |
 
 Speech-like material keeps the detector active; steady tones and very even noise do not.
@@ -249,7 +247,7 @@ Against libopus 1.6.1 on the same input, Steam's decoded packets have:
 - 1.0 dB less in the CELT band above it
 - a roll-off from 11.2 kHz to −7 dB at 11.8 kHz (the capture resampler)
 
-The earlier profile EQ trimmed 2.5 dB above 8.2 kHz and nothing below. That left the old model 1–2 dB dull from 2 to 12 kHz against recording A. It is replaced by an EQ fitted to the packets. Moving the roll-off in front of the encoder fits worse, so the whole EQ stays after the decoder.
+The earlier profile EQ trimmed 2.5 dB above 8.2 kHz and nothing below. That left the old model 1–2 dB dull from 2 to 12 kHz against recording A. Finding 16 shows that the ±1 dB comes from the libopus release. Only the capture roll-off is Steam's own, and the model now applies it before the gate and the encoder.
 
 ### 15. A remote listener hears the same chain
 
@@ -259,14 +257,40 @@ Both also re-time talk spurts:
 - In A, some spurts start up to 330 ms early against their neighbours, shortening the silence before them.
 - In B the spurt-to-spurt changes stay within about 90 ms.
 
+### 16. Steam's voice runs libopus 1.1.x at both ends
+
+libopus releases from 1.1 to 1.6.1 were built natively. Each one re-encoded the test signal on Steam's frame grid, one fresh encoder per talk spurt, at 32 kbps VBR with DTX and the voice hint:
+
+| Release, complexity 10 | Frames with Steam's exact size | Mean size difference | DTX frames in both / Steam only | Bytes on noise / vowel / sines vs Steam |
+| --- | ---: | ---: | --- | --- |
+| 1.1, 1.1.2, 1.1.5 | 28.6–28.8% | 3.4 bytes | 627 / 66 | 1.00 / 1.00 / 1.00 |
+| 1.2.1 | 5.6% | 12.3 bytes | 84 / 609 | 1.06 / 0.99 / 1.00 |
+| 1.3.1 | 4.4% | 13.6 bytes | 97 / 596 | 1.13 / 1.03 / 1.01 |
+| 1.4, 1.5.2, 1.6.1 | 4.6% | 13.2 bytes | 97 / 596 | 1.11 / 1.10 / 1.01 |
+
+Steam's input is a resampled capture, so exact sizes cannot all match. The DTX frames, which carry no audio, are bit-identical.
+
+**Encoder.** Decoded with its own release, the 1.1.x re-encode matches Steam's decoded packets within ±0.1 dB from 0 to 11 kHz. The SILK/CELT tilt of finding 14 disappears. 1.1.2 to 1.1.5 give identical packets here. Release 1.1 is 0.4 dB low at 7.6–8 kHz, so Steam's build is most likely 1.1.2 or later. What remains is the capture resampler: −0.5 dB at 11.25 kHz, −2.6 dB at 11.45 kHz and −6.5 dB at 11.75 kHz.
+
+**Decoder.** Steam's receiver decodes with the same release. Decoding Steam's packets with 1.1.5 reproduces recording A where 1.6.1 does not. Levels in dBFS:
+
+| Measurement | Recording A | libopus 1.1.5 | libopus 1.6.1 |
+| --- | ---: | ---: | ---: |
+| 8 kHz tone, DTX frames (comfort noise) | −32.5 | −32.5 | −44.5 |
+| 8.5 kHz tone, coded frames | −22.8 | −22.6 | −26.4 |
+| 11.5 kHz tone, coded frames | −30.9 | −30.6 | −33.8 |
+| 1 kHz DTX tails, three talk spurts | −50.5 / −48.0 / −52.3 | −50.2 / −48.5 / −52.1 | −51.3 / −49.6 / −55.2 |
+
+The Steam profile therefore encodes and decodes with libopus 1.1.5, compiled to WebAssembly with musl's libm (`vendor/libopus-1.1`, built by `tests/libopus11/build.mjs`). It runs at libopus's default complexity 10. Its packets are bit-identical to a native build of the same release.
+
 ## Model
 
 | Stage | Setting | Basis |
 | --- | --- | --- |
 | Capture | left channel of stereo input; int16 | finding 6 |
 | Voice gate | a 20 ms frame with RMS > −39.5 dBFS is sent with the 6 frames before it and the 22 after it; other frames not sent; a fresh encoder and decoder per talk spurt | findings 5 and 12 |
-| Codec | Opus 24 kHz mono, VOIP, signal=voice, VBR at a 34 kbps target, DTX, complexity 6, 20 ms, libopus 1.6.1 | findings 11 and 13 |
-| Profile EQ | 0 dB to 1 kHz, rising to +1 dB from 4 to 7.8 kHz, −1 dB from 8.1 to 11 kHz, then −2.5 dB at 11.4, −4 dB at 11.5 and −6.5 dB from 11.75 kHz (95-tap FIR at 24 kHz, after decoding) | finding 14 |
+| Capture roll-off | 0 dB to 11 kHz, −2.2 dB at 11.45 kHz, −6.6 dB at 11.75 kHz, −8.5 dB at 12 kHz (255-tap FIR at 24 kHz, before the gate and encoder) | findings 14 and 16 |
+| Codec | libopus 1.1.5 at both ends: Opus 24 kHz mono, VOIP, signal=voice, 32 kbps VBR, complexity 10, DTX, 20 ms | findings 11, 13 and 16 |
 | Voice rate | 44.1 kHz | block-rate lines, post-decode clipping, SDK mix rate |
 | Auto-gain | finding 3 law and finding 4 update; `voice_avggain 0.5`, `voice_maxgain 10`, `voice_scale 1` | Set B |
 | Output stage | 3-tap `[0.1, 0.8, 0.1]` at 44.1 kHz, then `volume` | fitted to Set A's 13–18 kHz slope |
@@ -278,48 +302,52 @@ Both also re-time talk spurts:
 
 | Segment | Default: real / model | `voice_avggain 0.25` | `voice_scale 0.5` |
 | --- | ---: | ---: | ---: |
-| sine −36 dBFS (DTX after 0.4 s) | −26.2 / −26.8 dB | −25.6 / −26.8 dB | −32.6 / −35.8 dB |
-| sine −30 dBFS (DTX after 1.2 s) | −14.9 / −14.7 dB | −14.6 / −14.7 dB | −23.5 / −23.8 dB |
-| sine −24 dBFS (gain at the cap) | −6.9 / −7.0 dB, 0 / 0% | −6.9 / −7.0 dB, 0 / 0% | −16.1 / −16.1 dB |
-| sine −12 dBFS | −2.1 / −2.1 dB, 42 / 42% | −1.8 / −1.8 dB, 50 / 50% | −10.1 / −10.3 dB |
-| sine −1 dBFS | −2.2 / −2.1 dB, 42 / 42% | −1.8 / −1.8 dB, 50 / 50% | −13.4 / −13.4 dB |
+| sine −36 dBFS (DTX after 0.4 s) | −26.2 / −27.3 dB | −25.6 / −27.3 dB | −32.6 / −36.3 dB |
+| sine −30 dBFS (DTX after 1.2 s) | −14.9 / −14.6 dB | −14.6 / −14.6 dB | −23.5 / −23.6 dB |
+| sine −24 dBFS (gain at the cap) | −6.9 / −6.6 dB, 0 / 0% | −6.9 / −6.6 dB, 0 / 0% | −16.1 / −15.7 dB |
+| sine −12 dBFS | −2.1 / −2.1 dB, 42 / 39% | −1.8 / −1.8 dB, 50 / 46% | −10.1 / −10.1 dB |
+| sine −1 dBFS | −2.2 / −2.1 dB, 42 / 39% | −1.8 / −1.8 dB, 50 / 46% | −13.4 / −13.5 dB |
 | pink −18 dB RMS | −5.3 / −5.3 dB, 10 / 10% | −4.2 / −3.9 dB, 19 / 18% | −13.5 / −13.5 dB |
-| pink −20 dB RMS, 10 s | −5.5 / −5.5 dB, 9 / 8% | −4.5 / −4.5 dB, 15 / 13% | −13.6 / −13.7 dB |
+| pink −20 dB RMS, 10 s | −5.5 / −5.4 dB, 9 / 9% | −4.5 / −4.5 dB, 15 / 13% | −13.6 / −13.6 dB |
 | pink steps −45/−18 | −8.1 / −8.1 dB, 5 / 5% | −6.8 / −6.8 dB, 10 / 9% | −16.3 / −16.3 dB |
-| synthetic vowel −18 dB | −5.0 / −5.0 dB, 22 / 21% | −4.5 / −4.6 dB, 23 / 22% | −9.9 / −9.8 dB |
-| sweep −20 dB | −4.1 / −4.2 dB, 16 / 11% | −4.1 / −4.2 dB, 16 / 10% | −12.9 / −13.2 dB |
+| synthetic vowel −18 dB | −5.0 / −4.9 dB, 22 / 21% | −4.5 / −4.4 dB, 23 / 23% | −9.9 / −9.8 dB |
+| sweep −20 dB | −4.1 / −4.0 dB, 16 / 13% | −4.1 / −4.0 dB, 16 / 13% | −12.9 / −12.9 dB |
 
-The model before Set D put the −36 dBFS sine at −19.1 dB and the −30 dBFS sine at −13.1 dB, because it had no DTX.
+A pure sine's codec noise moves by about 2 dB with where the 20 ms frames fall on it. That explains the 3–4 point spread in the sines' clipped share: Steam's own packets through the receiver model give 39%. The quiet −36 dBFS rows include game ambience in the recordings. Before Set D, the model put the −36 dBFS sine at −19.1 dB and the −30 dBFS sine at −13.1 dB, because it had no DTX.
 
 **Speech.** The owner's raw speech was rendered by the app and compared spurt by spurt. The spectrum error is the largest band deviation from 100 Hz to 11.5 kHz:
 
-| Metric | Recording | Current model | Before Set D | Before Set B |
-| --- | ---: | ---: | ---: | ---: |
-| 50 ms level error (mean ± SD) | — | +0.12 ± 0.38 dB | +0.03 ± 0.47 dB | +1.34 ± 1.70 dB |
-| 50 ms level correlation | — | 0.997 | 0.996 | 0.968 |
-| Spectrum error | — | 0.3 dB | 1.7 dB (above 3 kHz) | — |
-| Samples at the clamp | 8.4% | 9.1% | 9.1% | — |
-| Overall level | −6.62 dB | −6.50 dB | −6.51 dB | — |
+| Metric | Recording | Current model (libopus 1.1.5) | Set D fit on 1.6.1 | Before Set D | Before Set B |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 50 ms level error (mean ± SD) | — | +0.08 ± 0.37 dB | +0.12 ± 0.38 dB | +0.03 ± 0.47 dB | +1.34 ± 1.70 dB |
+| 50 ms level correlation | — | 0.998 | 0.997 | 0.996 | 0.968 |
+| Spectrum error | — | 0.3 dB | 0.3 dB | 1.7 dB (above 3 kHz) | — |
+| Samples at the clamp | 8.4% | 9.0% | 9.1% | 9.1% | — |
+| Overall level | −6.62 dB | −6.51 dB | −6.50 dB | −6.51 dB | — |
 
 **Set D.** The app against Steam's packets and recording A:
 - **Talk spurts:** 18 against Steam's 20. Steam closes and reopens where the model runs on across a 440–500 ms gap. Both boundaries of 16 of 18 spurts fall within 4 frames. 98.7% of 20 ms frames agree on sent or not sent.
-- **DTX and bytes:** 571 DTX frames against 693. Nearly all of the difference is in the 11.5–12 kHz tones. Bytes per coded frame are within 8% on every segment type.
-- **Codec spectrum against the packets:** within ±0.3 dB from 0 to 11.4 kHz on noise.
-- **Full render against recording A:** spectrum within ±0.3 dB from 100 Hz to 11.8 kHz on noise and the vowel, where the model before Set D was 1–2 dB low above 2 kHz. Median segment levels are within ±0.2 dB on segments more than 15 dB above the ambience.
+- **Bytes:** 330 031 in total against Steam's 330 735 (−0.2%). Bytes per coded frame are within 1% on sines, noise, bursts, the sweep and the vowel.
+- **DTX:** 629 frames against 693. The segment counts match to within 5 frames (sines 130/130, noise 19/19, bursts 54/54, vowel 0/0). Most of the gap is in the 11.5–12 kHz tones (173 against 243).
+- **Codec spectrum against the packets:** within ±0.06 dB from 0 to 11.4 kHz on noise, and ±0.2 dB to 12 kHz.
+- **Full render against recording A:** spectrum within ±0.5 dB from 100 Hz to 11.8 kHz on noise and the vowel, most bands within ±0.2 dB. Median segment levels are within ±0.2 dB on segments more than 15 dB above the ambience. On the DTX'd 8 kHz tone, the recording has −32.5 dBFS and the model −33.0.
 
 **Set C.** The app rendered the network test signal and was measured the same way as the takes:
 
 | Take | App setting | Events per second, real / app | Frames lost, real / app | Events of 1 / 2 / 3 / 4+ frames, real / app |
 | --- | --- | ---: | ---: | --- |
-| loss5 | 22% | 4.3 / 4.4 | 17 / 16% | 51/23/17/9 / 54/25/11/10% |
-| loss15 | 64% | 14.1 / 14.9 | 58 / 60% | 54/21/10/15 / 49/30/8/12% |
-| jitter | 50 ms | 1.36 / 1.39 | 3.1 / 2.8% | 81/11/9/0 / 100/0/0/0% |
-| combined | 45%, 50 ms | 12.0 / 10.6 | 43 / 41% | 57/25/9/9 / 54/24/9/13% |
+| loss5 | 22% | 4.3 / 4.4 | 17 / 17% | 51/23/17/9 / 49/28/15/7% |
+| loss15 | 64% | 14.1 / 14.8 | 58 / 60% | 54/21/10/15 / 50/29/9/12% |
+| jitter | 50 ms | 1.36 / 1.49 | 3.1 / 3.6% | 81/11/9/0 / 97/0/0/3% |
+| combined | 45%, 50 ms | 12.0 / 10.2 | 43 / 42% | 57/25/9/9 / 52/27/6/14% |
 
 **Set A.** From `pnpm compare:reference`, left channel:
-- **Level tracking (half-second RMS deviation):** River 0.10 dB, Take It Off 0.09 dB. The model before Set D gave 0.16 and 0.07 dB; the one before Set B gave 0.55 and 0.42 dB.
-- **Spectrum:** within ±0.5 dB from 80 Hz to 12 kHz (River −0.95 dB at 40–80 Hz). Before Set D, 8–12 kHz sat 0.9–1.4 dB low. From 12 to 16 kHz it is 0.6–0.9 dB low; from 16 to 19 kHz it is within 2.5 dB.
-- **Clip statistics:** higher than the MP3 shows (16–18% against 13%), as finding 7 predicts.
+- **Level tracking (half-second RMS deviation):** River 0.11 dB, Take It Off 0.07 dB. The model before Set D gave 0.16 and 0.07 dB; the one before Set B gave 0.55 and 0.42 dB.
+- **Spectrum:**
+  - From 80 Hz to 12 kHz: within ±0.3 dB, and within ±0.1 dB for Take It Off. River is −1.7 dB at 40–80 Hz.
+  - Before Set D, 8–12 kHz sat 0.9–1.4 dB low.
+  - From 12 to 16 kHz: 0.8–1.0 dB low. From 16 to 19 kHz: within 2.5 dB.
+- **Clip statistics:** higher than the MP3 shows (16–19% against 13%), as finding 7 predicts.
 - **Receiver auto-gain off:** misses by 3–4 dB in level tracking and 20–60 dB above 12 kHz.
 
 ## What remains unverified
@@ -330,8 +358,7 @@ The model before Set D put the −36 dBFS sine at −19.1 dB and the −30 dBFS 
   - the −0.4 ms/s drift (finding 15)
   
   They occur with a remote listener on a dedicated server too (Set D).
-- **Steam's libopus build.** The model uses libopus 1.6.1 at the settings that match Steam's packets best (finding 11). Steam's own build is not known. Pure tones at 11.5–12 kHz fall into DTX in Steam's encoder but not in the model.
-- **Comfort noise at the receiver.** Steam's receiver is assumed to decode DTX frames as libopus does. The recordings' ambience hides that level.
+- **Steam's libopus build.** Finding 16 identifies libopus 1.1.x, most likely 1.1.2 or later, which give identical packets here. Steam's compiler and math library could still change packets in their last bits. Steam's capture resampler is modeled by its measured roll-off, not reproduced. Pure tones at 11.5–12 kHz fall into DTX in Steam's encoder more often than in the model.
 - **Stereo capture.** Finding 6 is one capture chain (a stereo virtual cable). A physical microphone is mono either way.
 - **Output stage.** The small post-clip roll-off may come from the recording chain rather than the game.
 - **Legacy profiles and rooms.** Speex and CELT stand-ins, and room presets, are not validated against recordings.

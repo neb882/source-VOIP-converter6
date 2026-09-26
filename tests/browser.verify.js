@@ -101,7 +101,7 @@ async function verifySampleRateMatrix(browser, base) {
         await page.waitForFunction(() => !document.getElementById('download').disabled, null, { timeout: 60000 });
         checkRenderedTone(await readRenderedWav(page), source, label);
         const log = await page.locator('#console-out').textContent();
-        check(log.includes('libopus 1.6.1, 34 kbps VBR + DTX') && !log.includes('compatibility path'),
+        check(log.includes('libopus 1.1.5, 32 kbps VBR + DTX') && !log.includes('compatibility path'),
           `${label}: real Opus conversion completes in the worker`);
       }
       check(errors.length === 0, `${decodeRate} Hz browser: no page errors`, errors.join('; '));
@@ -225,7 +225,7 @@ async function main() {
     checkRenderedTone(await readRenderedWav(page), decodedSource, 'Default browser');
     const consoleText = await page.locator('#console-out').textContent();
     check(!consoleText.includes('compatibility path'), 'dedicated audio worker completed the render');
-    check(consoleText.includes('libopus 1.6.1, 34 kbps VBR + DTX'), 'worker used the pinned real Opus codec');
+    check(consoleText.includes('libopus 1.1.5, 32 kbps VBR + DTX'), 'worker used the pinned real Opus codec');
     await page.evaluate(() => { document.getElementById('preview').volume = .25; document.getElementById('preview').playbackRate = 1.25; });
     await page.waitForFunction(() => {
       const dry = document.getElementById('preview-dry');
@@ -350,7 +350,7 @@ async function main() {
       'worker replacement preserves the loaded audio without reloading');
     check(afterUpdate.processEnabled, 'worker replacement leaves Process Audio enabled');
     check(afterUpdate.keys.includes('unrelated-test-cache'), 'activation preserves unrelated origin caches');
-    check(afterUpdate.keys.includes('tf2ve-v10'), 'current app shell cache is populated');
+    check(afterUpdate.keys.includes('tf2ve-v11'), 'current app shell cache is populated');
     // Restore the normal registration while still online. Otherwise reloading
     // registers sw.js again and races another replacement against file loading.
     await activateServiceWorker(page, 'sw.js');
@@ -363,7 +363,7 @@ async function main() {
     await page.waitForFunction(() => state.sourceName === 'offline-tone.wav' && state.decodedSource && !document.getElementById('process').disabled);
     await page.locator('#process').click();
     await page.waitForFunction(() => !document.getElementById('download').disabled);
-    check((await page.locator('#console-out').textContent()).includes('libopus 1.6.1'), 'bundled real codec converts audio offline');
+    check((await page.locator('#console-out').textContent()).includes('libopus 1.1.5'), 'bundled real codec converts audio offline');
     await context.setOffline(false);
     check(pageErrors.length === 0, 'complete conversion and recording flow has no page errors', pageErrors.join('; '));
 

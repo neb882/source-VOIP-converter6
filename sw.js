@@ -12,7 +12,7 @@
  */
 
 const CACHE_PREFIX = 'tf2ve-';
-const CACHE = `${CACHE_PREFIX}v10`;
+const CACHE = `${CACHE_PREFIX}v11`;
 const ASSETS = [
   './',
   './index.html',
@@ -23,6 +23,8 @@ const ASSETS = [
   './opus-codec.mjs',
   './vendor/libopus/index.mjs',
   './vendor/libopus/generated/libopus.generated.mjs',
+  './vendor/libopus-1.1/index.mjs',
+  './vendor/libopus-1.1/libopus-1.1.5.wasm.mjs',
   './mic-capture.js',
   './script.js',
   './favicon.ico',

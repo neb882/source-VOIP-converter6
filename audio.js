@@ -2,13 +2,13 @@
  *
  * Sender:   mono capture (left channel by default) -> capture gain / int16
  *           clip -> resample to the codec rate -> optional capture filters
- *           -> Steam voice gate (pre-roll, hold, one encoder per talk spurt)
- *           -> real libopus encode with Steam's VBR and DTX settings
+ *           -> Steam capture roll-off -> Steam voice gate (pre-roll, hold, one
+ *           encoder per talk spurt) -> libopus 1.1.5 encode, as in Steam
  * Network:  20 ms packets grouped by net_split; measured burst loss and
  *           late (jittered) frames, seeded
- * Receiver: libopus decode + native concealment and comfort noise -> sender
- *           EQ -> engine voice rate -> Source-style auto-gain with int16
- *           clamp -> 44.1 kHz mixer (room DSP) -> output stage -> output rate
+ * Receiver: libopus 1.1.5 decode + native concealment and comfort noise ->
+ *           engine voice rate -> Source-style auto-gain with int16 clamp ->
+ *           44.1 kHz mixer (room DSP) -> output stage -> output rate
  *
  * The Steam profile, voice gate and receiver path are identified from 2026
  * voice_loopback recordings of music, speech and a calibrated test signal,
@@ -646,8 +646,8 @@
   /* ------------------------------------------------------------------ */
 
   const firCache = new Map();
-  function profileEq(codec) {
-    const eq = codec.decoderEq;
+  function profileEq(codec, stage = 'decoderEq') {
+    const eq = codec[stage];
     if (!eq) return null;
     const key = `${codec.codecRate}:${eq.taps}:${eq.freqs}:${eq.gainsDb}`;
     if (!firCache.has(key)) firCache.set(key, firwin2(eq.taps, eq.freqs, eq.gainsDb, codec.codecRate));
@@ -759,6 +759,8 @@
       samples = applyBiquad(samples, biquadCoefs('lowpass', codecRate, lp, 0.707));
       samples = applyBiquad(samples, biquadCoefs('lowpass', codecRate, lp, 0.707));
     }
+    const captureEq = enableCodec ? profileEq(codec, 'captureEq') : null;
+    if (captureEq) samples = applyFirZeroPhase(samples, captureEq);
     report(0.2);
     await microYield();
 
@@ -769,7 +771,7 @@
       const bitrate = Math.max(6000, Math.round(codec.bitrate * bits / 16));
       const result = await opus.roundTrip(samples, codecRate, bitrate, {
         application: codec.application, signal: codec.signal,
-        complexity: codec.encoder?.complexity, vbr: codec.encoder?.vbr, dtx: codec.encoder?.dtx,
+        runtime: codec.encoder?.runtime, complexity: codec.encoder?.complexity, vbr: codec.encoder?.vbr, dtx: codec.encoder?.dtx,
         gate: gateOn ? { thresholdDb: gateDb, prerollFrames: Math.round(gateSpec.prerollMs / frameMs),
           holdFrames: Math.round(gateSpec.holdMs / frameMs) } : null,
         makeLossMask: count => buildLossMask(count, framesPerPacket, lossPct, rand, jitterMs),
