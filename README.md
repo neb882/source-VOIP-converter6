@@ -1,6 +1,6 @@
 # TF2 Voice Emulator
 
-Make any audio sound like it came through Team Fortress 2 voice chat. The default profile runs **real Opus** (bundled libopus). Around it the app applies:
+Make any audio sound like it came through Team Fortress 2 voice chat. The default profile runs **real Opus**: libopus 1.1.5, the release Steam's own voice packets match, bundled as WebAssembly. Around it the app applies:
 - Steam's sender voice gate
 - TF2's receiver auto-gain with int16 clipping
 
@@ -15,7 +15,7 @@ pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-For GitHub Pages, enable Pages from the root of your publishing branch; no build is required. **Keep `.nojekyll`, `vendor/`, `opus-codec.mjs`, `audio-worker.js` and `mic-capture.js`** alongside the HTML, CSS, other scripts and icons. `node_modules/` is not needed on the website.
+For GitHub Pages, enable Pages from the root of your publishing branch; no build is required. **Keep `.nojekyll`, `vendor/` (both codec folders), `opus-codec.mjs`, `audio-worker.js` and `mic-capture.js`** alongside the HTML, CSS, other scripts and icons. `node_modules/` is not needed on the website.
 
 Use HTTPS or localhost. Opening `index.html` as a local file does not reliably support codec modules or microphone capture. After the app and its service worker load, conversion works offline. Background cache updates never reload the page or discard loaded audio; refresh when you are ready to use updated page code.
 
@@ -27,12 +27,12 @@ Choose a file or record, pick a preset, process, and download the mono 16-bit PC
    - Stereo input is captured from its **left channel** (measured through a stereo virtual cable); a mix is optional.
    - Optional mic gain is applied, then int16 capture clipping. The audio is resampled to the codec rate, with optional high-/low-pass filters (off by default).
    - **Steam's voice gate** decides which 20 ms frames are sent. A frame above −39.5 dBFS RMS is sent together with the 120 ms before it (pre-roll) and the 440 ms after it (hold). Longer pauses become silence instead of boosted noise, and each talk spurt starts a fresh encoder and decoder.
-2. **Codec and network:** real libopus encodes the sent frames with the settings that reproduce Steam's packets: VBR at a 34 kbps target (about 32 kbps on noise, 26 on speech) and complexity 6, with DTX. When Opus's voice detector calls a frame inactive, as it does in held pauses and on steady tones, the encoder sends a 1-byte DTX packet and the decoder plays comfort noise. `net_split` groups whole frames into packets. Both network effects were measured in TF2:
+2. **Codec and network:** Steam's capture resampler rolls off the band above 11.1 kHz. libopus 1.1.5 then encodes the sent frames as Steam does: 32 kbps VBR, complexity 10, with DTX. When Opus's voice detector calls a frame inactive, as it does in held pauses and on steady tones, the encoder sends a 1-byte DTX packet and the decoder plays comfort noise. `net_split` groups whole frames into packets. Both network effects were measured in TF2:
    - **Loss** (`net_fakeloss`, the share of voice frames lost) comes in bursts averaging 2.2 frames, and the decoder's own concealment fills them.
    - **Jitter** (`net_fakejitter`) makes isolated frames arrive too late. At 50 ms that's 3% of frames; nine in ten are concealed and one plays as silence.
 
    Encoding continues through loss, and the encoder's reported delay is removed.
-3. **Receiver:** the profile EQ runs, then the audio moves to the engine voice rate (44.1 kHz for Steam). The EQ is the ±1 dB difference between Steam's encoder and libopus 1.6.1 plus Steam's capture roll-off above 11.2 kHz; the receiver itself adds none. Next comes the **auto-gain** on the int16 voice.
+3. **Receiver:** libopus 1.1.5 decodes, as Steam's receiver does, and the audio moves to the engine voice rate (44.1 kHz for Steam). Next comes the **auto-gain** on the int16 voice.
    - Each 128-sample block sets a target `min(voice_maxgain, 32767 / (mean + voice_avggain × (peak − mean)))`. The defaults are 0.5 and 10.
    - The next block steps toward it in truncated 1/128 fixed-point increments, scaled by `voice_scale`, and every sample is clamped to int16.
    - A steady tone ends up 1.22× over full scale (42% of samples flattened), and speech and music about 5–6 dB under it: the dominant "TF2 voice" character.
@@ -44,25 +44,29 @@ The quick presets reset every control. The live chain strip under the controls s
 
 | Profile | Codec | Receiver | Status |
 | --- | --- | --- | --- |
-| Modern / `steam` | Opus 24 kHz, VBR ~32 kbps with DTX, VOIP, voice hint (SILK/CELT hybrid) | auto-gain at 44.1 kHz | **Measured** against 2026 TF2 recordings and Steam's own packets |
-| `steam_48` | Opus 48 kHz, 64 kbps, VBR with DTX | auto-gain at 44.1 kHz | Experimental |
+| Modern / `steam` | libopus 1.1.5: Opus 24 kHz, 32 kbps VBR with DTX, VOIP, voice hint (SILK/CELT hybrid) | auto-gain at 44.1 kHz | **Measured** against 2026 TF2 recordings and Steam's own packets |
+| `steam_48` | libopus 1.1.5: Opus 48 kHz, 64 kbps VBR with DTX | auto-gain at 44.1 kHz | Experimental |
 | `celt_22` | Opus CELT layer, 24 kHz, 22 kbps (stand-in for vaudio_celt) | auto-gain at 22.05 kHz, linear-interpolation mixer | Modeled |
 | `celt_44` | Opus CELT layer, 48 kHz, 44 kbps | auto-gain at 44.1 kHz | Modeled |
 | `speex` | Opus SILK, 8 kHz, 8 kbps (stand-in for vaudio_speex) | auto-gain at 11.025 kHz, linear-interpolation mixer | Modeled |
 
-Every profile runs the pinned **libopus 1.6.1 via libopus-wasm 0.4.0**; nothing is a hand-made approximation. The status line and console report the Opus modes the encoder actually chose (SILK / hybrid / CELT, from each packet's TOC byte). The legacy profiles are stand-ins built on the modern codec: CELT 0.x and Speex bitstreams are not reproduced.
+Every profile runs real libopus; nothing is a hand-made approximation. The Steam profiles use **libopus 1.1.5**, built to WebAssembly by `tests/libopus11/build.mjs`. The others use **libopus 1.6.1 via libopus-wasm 0.4.0**. The status line and console report the Opus modes the encoder actually chose (SILK / hybrid / CELT, from each packet's TOC byte). The legacy profiles are stand-ins built on the modern codec: CELT 0.x and Speex bitstreams are not reproduced.
 
 ## Accuracy
 
 The Steam profile, voice gate and receiver path come from 2026 recordings made with `voice_loopback 1`. The main set is a calibrated 143 s test signal recorded losslessly at default settings and with `voice_scale 0.5`, `voice_maxgain 1` and `voice_avggain 0.25`. The owner's speech and an earlier music recording validate it.
 
-A SourceTV demo of the same test signal holds Steam's own voice packets. Decoding them gave the sender side exactly: its gate timing, DTX and encoder settings. With those packets as input, the receiver model matches the game's output within 0.1 dB per band up to 11.5 kHz, for both the sender's loopback and a second account on another PC.
+A SourceTV demo of the same test signal holds Steam's own voice packets. Decoding them gave the sender side exactly: its gate timing, DTX and encoder settings. Re-encoding the test signal with every libopus release from 1.1 to 1.6.1 identified Steam's codec as libopus 1.1.x, at both the sender and the receiver. With those packets as input, the receiver model matches the game's output within 0.1 dB per band up to 11.5 kHz, for both the sender's loopback and a second account on another PC.
 
 Rendered through the app with each take's settings:
 - **Test signal:** levels and clipped-sample shares match to within about 0.3 dB and 1–2%. That holds for sines, noise and a synthetic vowel across all three receiver settings.
-- **Sender:** 16 of 18 talk spurts start and end within 4 frames of Steam's, and 98.7% of 20 ms frames agree on sent or not sent. Steady tones fall into DTX at the same moment as in Steam's packets (0.40 s against 0.42 s for a −36 dBFS sine).
-- **Speech:** tracks within ±0.38 dB in 50 ms windows (correlation 0.997), with the spectrum within 0.3 dB.
-- **Music:** tracks within 0.09–0.10 dB in half-second windows, and the spectrum agrees within ±0.5 dB from 80 Hz to 12 kHz.
+- **Sender:**
+  - Talk spurts: 16 of 18 start and end within 4 frames of Steam's, and 98.7% of 20 ms frames agree on sent or not sent.
+  - Bytes: the total is within 0.2% of Steam's packets.
+  - Decoded spectrum: within ±0.06 dB of Steam's packets up to 11.4 kHz.
+  - Steady tones: they fall into DTX at the same moment as in Steam's packets (0.38 s against 0.42 s for a −36 dBFS sine).
+- **Speech:** tracks within ±0.37 dB in 50 ms windows (correlation 0.998), with the spectrum within 0.3 dB.
+- **Music:** tracks within 0.07–0.11 dB in half-second windows, and the spectrum agrees within ±0.3 dB from 80 Hz to 12 kHz.
 - **Packet loss and jitter:** a one-minute network test signal was recorded under simulated loss and jitter. The app reproduces the loss-event rate, burst sizes and lost-frame share of every take (for example 4.4 against 4.3 events per second, and 16% against 17% of frames).
 
 Evidence, method, residuals and open questions are in [tests/REFERENCE_2026.md](tests/REFERENCE_2026.md).
@@ -70,7 +74,7 @@ Evidence, method, residuals and open questions are in [tests/REFERENCE_2026.md](
 What that does **not** establish:
 - Valve's source code for the gain stage or Steam's gate. Neither is in the public Source SDK 2013; both are identified from recordings.
 - The receiver's per-talk-spurt delay changes and latency trimming. Neither is modeled; renders keep the source timeline.
-- The exact Steam libopus build. libopus 1.6.1 at complexity 6 reproduces its DTX decisions, and an EQ fitted to its packets covers the remaining ±1 dB. Pure tones at 11.5–12 kHz still differ.
+- Steam's exact libopus build and capture resampler. The release is 1.1.x (1.1.2–1.1.5 give identical packets). The resampler is modeled by its measured roll-off, and pure tones at 11.5–12 kHz still differ.
 - The absolute playback level. That depends on game and OS volume; the rendered file uses `volume 0.5`, where the recordings used 0.15.
 - Real internet loss. The network model comes from simulated loss and jitter in TF2 (`net_fakeloss`, `net_fakejitter` on a listen server), and the receiver's per-spurt re-timing is not modeled.
 
@@ -127,20 +131,22 @@ pnpm test:all
 ```
 
 - **`tests/verify.js`:** resampler passband/stopband/alignment, the profile FIR, and the auto-gain law. The law checks cover the measured sine overdrive at `voice_avggain` 0.5 and 0.25, the cap, the int16 clamp, silence hold, step timing and the `voice_scale` sawtooth and truncation. Also the voice gate (threshold, pre-roll, hold, talk spurts, DTX comfort noise on steady tones, send/skip accounting), stereo capture, real codec modes per profile, all room presets 0–29, the measured loss bursts and late-frame jitter with PLC, option robustness and WAV structure.
-- **`tests/opus.verify.mjs`:** frame timing and boundary pulses, exact lengths, bitrates and packet sizes, TOC mode reporting, native concealment, silence, mute, determinism, the sender gate inside the round trip (pre-roll, hold, talk spurts), opt-in DTX, leveling and cap behavior, output-volume linearity, pre-encoder filtering, and codec-failure reporting.
+- **`tests/opus.verify.mjs`:** frame timing and boundary pulses, exact lengths, bitrates and packet sizes, TOC mode reporting, native concealment, silence, mute, determinism, the sender gate inside the round trip (pre-roll, hold, talk spurts), opt-in DTX, leveling and cap behavior, output-volume linearity, pre-encoder filtering, and codec-failure reporting. Also the libopus 1.1.5 build: its packets are bit-identical to a native build of the release, and its DTX differs from 1.6.1's as Steam's does.
 - **`tests/reference.verify.mjs`:** alignment, clock drift, polarity, fractional delay, clip-signature and level-tracking metrics.
 - **Chromium checks:** worker parity, cancellation, PCM recording, offline conversion, every visualizer mode, the chain strip, presets, console completion, `net_graph`, accessibility, mobile layout, and the 44.1/48 kHz file × decode-rate matrix. Set `CHROMIUM_EXECUTABLE` to use a preinstalled browser whose build differs from Playwright's pin.
 
 These tests establish implementation behavior; the accuracy claims rest on the paired comparison above. CI runs Node 22 and Chromium.
 
-`pnpm vendor:opus` copies the pinned runtime and notices verbatim; `pnpm test:vendor` checks the vendored files against the installed dependency. The runtime and licenses are required distribution files.
+`pnpm vendor:opus` copies the pinned 1.6.1 runtime and notices verbatim. `pnpm build:opus11` rebuilds the libopus 1.1.5 module from the tagged sources; it needs clang with the wasm32 target and wasm-ld. `pnpm test:vendor` checks the 1.6.1 files against the installed dependency and the 1.1.5 module against its recorded hash. The runtimes and licenses are required distribution files.
 
 ## Files and licensing
 
 | File | Role |
 | --- | --- |
 | `audio.js` | DSP and orchestration |
-| `opus-codec.mjs` | packets, modes and delay |
+| `opus-codec.mjs` | packets, modes and delay; picks the libopus runtime |
+| `vendor/libopus-1.1/` | libopus 1.1.5 WebAssembly for the Steam profile |
+| `vendor/libopus/` | libopus 1.6.1 (libopus-wasm) for the other profiles |
 | `audio-worker.js` | cancellable background processing |
 | `mic-capture.js` | PCM recording |
 | `constants.js` | presets, codec profiles, receiver model, room data |
@@ -148,4 +154,4 @@ These tests establish implementation behavior; the accuracy claims rest on the p
 
 Tests and local tooling are under `tests/`.
 
-Application code: MIT. Codec notices: `vendor/libopus/LICENSE`, `COPYING.opus` and `THIRD_PARTY_NOTICES.md`. TF2, Source and Steam are Valve trademarks. This independent tool is not affiliated with Valve.
+Application code: MIT. Codec notices: `vendor/libopus/LICENSE`, `COPYING.opus` and `THIRD_PARTY_NOTICES.md`, and `vendor/libopus-1.1/COPYING.opus` (libopus, BSD) and `COPYRIGHT.musl` (musl libm, MIT). TF2, Source and Steam are Valve trademarks. This independent tool is not affiliated with Valve.

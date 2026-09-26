@@ -1,9 +1,20 @@
 // Real Opus packets, 20 ms framing, and decoder packet-loss concealment.
-// Pinned libopus version, not a claim of Valve's exact encoder build.
-import { createEncoder, createDecoder, Application, Signal, loadLibopus } from './vendor/libopus/index.mjs';
+// Two pinned libopus builds: 1.1.5, the release Steam's voice packets match
+// (tests/REFERENCE_2026.md), and 1.6.1 from libopus-wasm for the other profiles.
+const RUNTIMES = {
+  '1.6.1': () => import('./vendor/libopus/index.mjs'),
+  '1.1.5': () => import('./vendor/libopus-1.1/index.mjs')
+};
+const loaded = new Map();
+function runtime(version) {
+  if (!(version in RUNTIMES)) throw new RangeError(`Unknown libopus runtime "${version}"`);
+  if (!loaded.has(version)) loaded.set(version, RUNTIMES[version]());
+  return loaded.get(version);
+}
 
-const APPLICATIONS = { voip: Application.Voip, audio: Application.Audio, lowdelay: Application.RestrictedLowDelay };
-const SIGNALS = { auto: Signal.Auto, voice: Signal.Voice, music: Signal.Music };
+// Opus API constants, identical in every libopus release.
+const APPLICATIONS = { voip: 2048, audio: 2049, lowdelay: 2051 };
+const SIGNALS = { auto: -1000, voice: 3001, music: 3002 };
 
 // RFC 6716 section 3.1: the TOC configuration number selects the coding mode.
 function packetMode(packet) {
@@ -36,6 +47,7 @@ export async function roundTrip(samples, sampleRate, bitrate, options = {}) {
   if (!(signal in SIGNALS)) throw new RangeError(`Unknown Opus signal "${signal}"`);
   const complexity = options.complexity ?? 10;
   const vbr = !!options.vbr, dtx = !!options.dtx;
+  const { createEncoder, createDecoder, loadLibopus } = await runtime(options.runtime ?? '1.6.1');
   const encoderOptions = { sampleRate, channels: 1, frameSize,
     application: APPLICATIONS[application], signal: SIGNALS[signal], bitrate, complexity, vbr, dtx, fec: false };
   let encoder, decoder;
@@ -108,7 +120,7 @@ export async function roundTrip(samples, sampleRate, bitrate, options = {}) {
     }
     options.onProgress?.(1);
     return { samples: output, info: { backend: 'libopus', version: (await loadLibopus()).version,
-      sampleRate, bitrate, application, signal, complexity, vbr, dtx, frameSamples: frameSize, frameMs: 20,
+      runtime: options.runtime ?? '1.6.1', sampleRate, bitrate, application, signal, complexity, vbr, dtx, frameSamples: frameSize, frameMs: 20,
       lookahead, frames, lostFrames, underrunFrames, gatedFrames, dtxFrames, spurts,
       gate: gate ? Number(options.gate.thresholdDb) : null,
       prerollFrames: gate ? gate.preroll : 0, holdFrames: gate ? gate.hold : 0,
