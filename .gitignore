@@ -5,3 +5,8 @@ test-results/
 .DS_Store
 Thumbs.db
 tests/testsignal/*.wav
+tests/demovoice/target/
+tests/demovoice/*.dem
+tests/demovoice/*.voice
+tests/demovoice/*.wav
+tests/demovoice/*.tsv

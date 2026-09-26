@@ -2,15 +2,17 @@
  *
  * Sender:   mono capture (left channel by default) -> capture gain / int16
  *           clip -> resample to the codec rate -> optional capture filters
- *           -> Steam voice gate -> real libopus encode
+ *           -> Steam voice gate (pre-roll, hold, one encoder per talk spurt)
+ *           -> real libopus encode with Steam's VBR and DTX settings
  * Network:  20 ms packets grouped by net_split; measured burst loss and
  *           late (jittered) frames, seeded
- * Receiver: libopus decode + native concealment -> profile EQ -> engine
- *           voice rate -> Source-style auto-gain with int16 clamp -> 44.1 kHz
- *           mixer (room DSP) -> output stage -> output rate
+ * Receiver: libopus decode + native concealment and comfort noise -> sender
+ *           EQ -> engine voice rate -> Source-style auto-gain with int16
+ *           clamp -> 44.1 kHz mixer (room DSP) -> output stage -> output rate
  *
  * The Steam profile, voice gate and receiver path are identified from 2026
- * voice_loopback recordings of music, speech and a calibrated test signal
+ * voice_loopback recordings of music, speech and a calibrated test signal,
+ * and from Steam's own voice packets in a SourceTV demo
  * (tests/REFERENCE_2026.md). Room processors are effects built from Valve's
  * preset data, not Valve's implementations.
  * Same decoded PCM + settings + pinned runtime gives repeatable output.
@@ -28,7 +30,7 @@
 
   const TAU = Math.PI * 2;
   const INT16_FULL_SCALE = 32767 / 32768;
-  const DEFAULT_SENDER_GATE = { thresholdDb: -39.5, holdMs: 300 };
+  const DEFAULT_SENDER_GATE = { thresholdDb: -39.5, prerollMs: 120, holdMs: 440 };
   const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
   const finiteOr = (value, fallback) => {
     const number = Number(value);
@@ -767,7 +769,9 @@
       const bitrate = Math.max(6000, Math.round(codec.bitrate * bits / 16));
       const result = await opus.roundTrip(samples, codecRate, bitrate, {
         application: codec.application, signal: codec.signal,
-        gate: gateOn ? { thresholdDb: gateDb, holdFrames: Math.round(gateSpec.holdMs / frameMs) } : null,
+        complexity: codec.encoder?.complexity, vbr: codec.encoder?.vbr, dtx: codec.encoder?.dtx,
+        gate: gateOn ? { thresholdDb: gateDb, prerollFrames: Math.round(gateSpec.prerollMs / frameMs),
+          holdFrames: Math.round(gateSpec.holdMs / frameMs) } : null,
         makeLossMask: count => buildLossMask(count, framesPerPacket, lossPct, rand, jitterMs),
         yieldControl: microYield,
         onProgress: f => report(0.2 + 0.5 * f)

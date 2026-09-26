@@ -1,6 +1,6 @@
 {
   "name": "tf2-voice-emulator",
-  "version": "4.2.0",
+  "version": "4.3.0",
   "private": true,
   "description": "Browser-based TF2 voice-chat emulator: real Opus plus the measured Steam voice gate and Source receiver auto-gain and clipping.",
   "scripts": {

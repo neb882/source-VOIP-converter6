@@ -18,7 +18,7 @@
       <h1>TF2 Voice Emulator</h1>
       <p class="tagline">Make any audio sound like it came through Team Fortress 2 voice chat.</p>
       <ul class="facts" aria-label="What the emulator models">
-        <li><b>Real Opus</b> 24 kHz · 32 kbps · SILK/CELT hybrid</li>
+        <li><b>Real Opus</b> 24 kHz · VBR + DTX · SILK/CELT hybrid</li>
         <li><b>Receiver auto-gain</b> with the in-game int16 clip</li>
         <li><b>Measured</b> against real TF2 recordings</li>
         <li><b>Local</b> — nothing is uploaded</li>
@@ -53,7 +53,7 @@
         <div class="control control-wide">
           <label for="codec">Codec <code class="cvar">sv_voicecodec</code></label>
           <select id="codec">
-            <option value="steam" selected>Steam voice (Opus 24 kHz / 32 kbps)</option>
+            <option value="steam" selected>Steam voice (Opus 24 kHz VBR, ~32 kbps)</option>
             <option value="steam_48">Fullband Opus (48 kHz / 64 kbps, experimental)</option>
             <option value="celt_22">CELT era (Opus CELT layer, 22 kbps)</option>
             <option value="celt_44">CELT high (Opus CELT layer, 44 kbps)</option>

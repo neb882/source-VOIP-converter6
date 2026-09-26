@@ -67,6 +67,25 @@ function musicLike(seconds, rate, seed) {
   return out;
 }
 
+// Syllabic voiced signal: 115 Hz harmonics with a 3.2 Hz syllable envelope, scaled to an RMS level.
+// Opus's voice detector keeps it active, as it did the test signal's vowel synth.
+function speechLike(seconds, rate, rmsDb) {
+  const n = Math.round(seconds * rate);
+  const out = new Float32Array(n);
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i / rate;
+    const env = Math.pow(Math.abs(Math.sin(Math.PI * ((t * 3.2) % 1))), 0.6);
+    const f0 = 115 * (1 + 0.05 * Math.sin(2 * Math.PI * 0.7 * t));
+    let v = 0;
+    for (let h = 1; h <= 30; h++) v += Math.sin(2 * Math.PI * f0 * h * t) / h;
+    out[i] = env * v; sum += out[i] * out[i];
+  }
+  const k = 10 ** (rmsDb / 20) / Math.sqrt(sum / n);
+  for (let i = 0; i < n; i++) out[i] *= k;
+  return out;
+}
+
 function rms(x, from, to) {
   const a = from || 0, b = to || x.length;
   let s = 0;
@@ -189,11 +208,12 @@ async function main() {
     const eq = vm.runInContext('CODEC_PROFILES.steam.decoderEq', sandbox);
     const taps = TF2Audio.firwin2(eq.taps, eq.freqs, eq.gainsDb, 24000);
     const g1k = firGainDb(taps, 1000, 24000), g5k = firGainDb(taps, 5000, 24000), g9k = firGainDb(taps, 9000, 24000);
-    check('steam EQ is transparent below the SILK/CELT crossover', Math.abs(g1k) < 0.1 && Math.abs(g5k) < 0.1, `${g1k.toFixed(2)} / ${g5k.toFixed(2)} dB`);
-    check('steam EQ trims the hybrid high band by the measured 2.5 dB', Math.abs(g9k + 2.5) < 0.2, `${g9k.toFixed(2)} dB`);
+    check('steam EQ is transparent at low frequencies', Math.abs(g1k) < 0.15, `${g1k.toFixed(2)} dB`);
+    check('steam EQ adds the measured 1 dB to the SILK band above 3 kHz', Math.abs(g5k - 1) < 0.2, `${g5k.toFixed(2)} dB`);
+    check('steam EQ trims the CELT band above 8 kHz by the measured 1 dB', Math.abs(g9k + 1) < 0.2, `${g9k.toFixed(2)} dB`);
     const g75 = firGainDb(taps, 7500, 24000), g11 = firGainDb(taps, 11000, 24000), g115 = firGainDb(taps, 11500, 24000), g12 = firGainDb(taps, 12000, 24000);
-    check('steam EQ leaves the SILK/CELT crossover near unity', g75 > -0.8, `${g75.toFixed(2)} dB at 7.5 kHz`);
-    check('steam EQ rolls the band edge off from 11.5 kHz', g11 > -3.2 && g115 < -3 && g115 > -6.5 && g12 < -8,
+    check('steam EQ keeps the SILK side of the 8 kHz crossover', g75 > 0.6, `${g75.toFixed(2)} dB at 7.5 kHz`);
+    check('steam EQ follows the capture resampler roll-off from 11.2 kHz', g11 > -1.6 && g115 < -3 && g115 > -5 && g12 < -5.5,
       `${g11.toFixed(2)} / ${g115.toFixed(2)} / ${g12.toFixed(2)} dB`);
     const js = TF2Audio.firwin2(95, [0, 6000, 12000], [0, -6, -6], 24000);
     // Gains interpolate linearly: halfway from 1.0 to 0.501 is 0.75 (-2.5 dB).
@@ -288,7 +308,7 @@ async function main() {
   console.log('\n[5] Real codec modes per profile');
   {
     const src = musicLike(1, SR, 3);
-    const expect = { steam: ['hybrid', 32000], steam_48: ['hybrid', 64000], celt_22: ['celt', 22000], celt_44: ['celt', 44000], speex: ['silk', 8000] };
+    const expect = { steam: ['hybrid', 34000], steam_48: ['hybrid', 64000], celt_22: ['celt', 22000], celt_44: ['celt', 44000], speex: ['silk', 8000] };
     for (const [codec, [mode, bitrate]] of Object.entries(expect)) {
       const r = await TF2Audio.process(mkBuffer(src, SR), { codec });
       const m = r.codecInfo.modes;
@@ -314,25 +334,46 @@ async function main() {
     const quiet = await TF2Audio.process(mkBuffer(tone(1000, 1.5, SR, rmsDbfs(-45)), SR), { codec: 'steam', volume: 1 });
     check('a steady -45 dBFS RMS tone never opens the gate (take: -42 dB sine silent)', peakAbs(quiet.samples) === 0 && quiet.codecInfo.gatedFrames === quiet.codecInfo.frames,
       `${quiet.codecInfo.gatedFrames}/${quiet.codecInfo.frames}`);
-    const open = await TF2Audio.process(mkBuffer(tone(1000, 1.5, SR, rmsDbfs(-38)), SR), { codec: 'steam', volume: 1 });
-    check('a -38 dBFS RMS tone is transmitted and boosted to the 20 dB cap', open.codecInfo.gatedFrames === 0 && Math.abs(db(rms(open.samples, SR / 2)) + 18) < 1,
+    const open = await TF2Audio.process(mkBuffer(speechLike(1.5, SR, -38), SR), { codec: 'steam', volume: 1 });
+    check('speech-like input at -38 dBFS RMS is transmitted and boosted to the 20 dB cap', open.codecInfo.gatedFrames === 0 && open.codecInfo.dtxFrames === 0 && Math.abs(db(rms(open.samples, SR / 2)) + 18) < 1.5,
       `${open.codecInfo.gatedFrames} gated, ${db(rms(open.samples, SR / 2)).toFixed(1)} dB`);
-    const forced = await TF2Audio.process(mkBuffer(tone(1000, 1.5, SR, rmsDbfs(-45)), SR), { codec: 'steam', volume: 1, gate: false });
-    check('gate: false transmits everything', forced.codecInfo.gatedFrames === 0 && forced.codecInfo.gate === null && Math.abs(db(rms(forced.samples, SR / 2)) + 25) < 1);
+    const forced = await TF2Audio.process(mkBuffer(speechLike(1.5, SR, -45), SR), { codec: 'steam', volume: 1, gate: false });
+    check('gate: false transmits everything', forced.codecInfo.gatedFrames === 0 && forced.codecInfo.gate === null && Math.abs(db(rms(forced.samples, SR / 2)) + 25) < 1.5,
+      `${db(rms(forced.samples, SR / 2)).toFixed(1)} dB`);
     const lower = await TF2Audio.process(mkBuffer(tone(1000, 1.5, SR, rmsDbfs(-45)), SR), { codec: 'steam', volume: 1, gateThresholdDb: -50 });
     check('the gate threshold is adjustable', lower.codecInfo.gatedFrames === 0 && lower.codecInfo.gate === -50);
     const legacy = await TF2Audio.process(mkBuffer(tone(1000, 1, SR, rmsDbfs(-45)), SR), { codec: 'speex', volume: 1 });
     check('push-to-talk engine codecs have no gate by default', legacy.codecInfo.gatedFrames === 0 && legacy.codecInfo.gate === null);
-    // 0.5 s at -20 dBFS then 1.5 s at -60 dBFS: the gate holds 300 ms after the last loud frame, then closes.
+    // 0.5 s at -20 dBFS then 1.5 s at -60 dBFS. Steam's packets: the quiet tail is coded normally for ~10
+    // frames, then DTX comfort noise, and transmission ends 22 frames (440 ms) after the last loud frame.
     const burst = new Float32Array(2 * SR);
     burst.set(tone(700, 0.5, SR, rmsDbfs(-20)));
     burst.set(tone(700, 1.5, SR, rmsDbfs(-60)), SR / 2);
     const hb = await TF2Audio.process(mkBuffer(burst, SR), { codec: 'steam', volume: 1 });
     const tail = (a, b) => rms(hb.samples, Math.round(a * SR), Math.round(b * SR));
-    check('the gate holds ~300 ms after speech, carrying the quiet tail at full auto-gain', Math.abs(db(tail(0.6, 0.75)) + 40) < 1.5 && peakAbs(hb.samples.subarray(Math.round(0.9 * SR))) === 0,
-      `${db(tail(0.55, 0.75)).toFixed(1)} dB then silence`);
+    check('the gate holds 440 ms after speech, carrying the quiet tail at full auto-gain', Math.abs(db(tail(0.52, 0.66)) + 40) < 1.5 && peakAbs(hb.samples.subarray(Math.round(0.96 * SR))) === 0,
+      `${db(tail(0.52, 0.66)).toFixed(1)} dB then silence`);
+    check('the held tail falls into DTX comfort noise', hb.codecInfo.dtxFrames >= 5 && db(tail(0.74, 0.92)) < db(tail(0.52, 0.66)) - 6,
+      `${hb.codecInfo.dtxFrames} DTX frames, ${db(tail(0.74, 0.92)).toFixed(1)} dB`);
     check('closed frames are neither encoded nor sent', hb.codecInfo.gatedFrames > 50 && hb.codecInfo.modes.hybrid + hb.codecInfo.modes.silk + hb.codecInfo.modes.celt === hb.codecInfo.frames - hb.codecInfo.gatedFrames,
       JSON.stringify({ gated: hb.codecInfo.gatedFrames, frames: hb.codecInfo.frames }));
+    // A -60 dBFS floor, then speech at 1.0 s: the 120 ms before the onset is sent too (Steam's pre-roll).
+    const onset = new Float32Array(2 * SR);
+    onset.set(whiteNoise(1, SR, 10 ** (-60 / 20) * Math.sqrt(3), 5));
+    onset.set(speechLike(1, SR, -20), SR);
+    const po = await TF2Audio.process(mkBuffer(onset, SR), { codec: 'steam', volume: 1 });
+    const pre = db(rms(po.samples, Math.round(0.89 * SR), Math.round(0.99 * SR)));
+    // The white floor loses half its power in the 24 kHz resample and ~3 dB in the codec, then gains 20 dB.
+    check('the gate sends 120 ms of pre-roll before an onset', peakAbs(po.samples.subarray(0, Math.round(0.86 * SR))) === 0 && pre > -49 && pre < -43, `${pre.toFixed(1)} dB`);
+    const twoBursts = (gap) => { const x = new Float32Array(Math.round((1 + gap) * SR)); x.set(speechLike(0.5, SR, -20)); x.set(speechLike(0.5, SR, -20), Math.round((0.5 + gap) * SR)); return x; };
+    const near = await TF2Audio.process(mkBuffer(twoBursts(0.5), SR), { codec: 'steam', volume: 1 });
+    const far = await TF2Audio.process(mkBuffer(twoBursts(0.8), SR), { codec: 'steam', volume: 1 });
+    check('pauses under hold + pre-roll stay in one talk spurt; longer ones restart the encoder', near.codecInfo.spurts === 1 && far.codecInfo.spurts === 2,
+      `${near.codecInfo.spurts} / ${far.codecInfo.spurts}`);
+    // Steam's encoder put the test signal's steady -36 and -30 dB sines into DTX; so does the model.
+    const steady = await TF2Audio.process(mkBuffer(tone(1000, 2, SR, rmsDbfs(-30)), SR), { codec: 'steam', volume: 1 });
+    const early = db(rms(steady.samples, 0, Math.round(0.3 * SR))), late = db(rms(steady.samples, SR, 2 * SR));
+    check('a steady tone decays into DTX comfort noise', steady.codecInfo.dtxFrames > 30 && late < early - 3, `${steady.codecInfo.dtxFrames} DTX frames, ${early.toFixed(1)} -> ${late.toFixed(1)} dB`);
     // Stereo capture: the measured default takes the left channel, as a mono read of a stereo cable does.
     const L = tone(500, 1, SR, 0.2), Rch = new Float32Array(SR);
     const stereoSrc = { sampleRate: SR, length: SR, numberOfChannels: 2, getChannelData: (c) => c ? Rch : L };

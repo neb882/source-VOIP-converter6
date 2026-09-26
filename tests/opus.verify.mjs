@@ -46,7 +46,7 @@ const base = { codec: 'steam', micGain: 1, voiceScale: 1, listenerPos: 'open', b
 const high = await A.process(buffer(x, rate), base);
 const low = await A.process(buffer(x, rate), { ...base, bits: 6 });
 check('Both quality settings use real Opus', high.realOpus && low.realOpus);
-check('Quality changes the actual encoder bitrate', high.codecInfo.bitrate === 32000 && low.codecInfo.bitrate === 12000);
+check('Quality changes the actual encoder bitrate', high.codecInfo.bitrate === 34000 && low.codecInfo.bitrate === 12750);
 check('Lower bitrate produces fewer encoded bytes', low.codecInfo.encodedBytes < high.codecInfo.encodedBytes * .6);
 check('Quality changes the decoded audio', difference(high.samples, low.samples) > .01);
 const repeat = await A.process(buffer(x, rate), base);
@@ -73,7 +73,8 @@ check('Disabling receiver auto-gain preserves quiet input levels', energy(levele
 const levelDb = (samples) => 10 * Math.log10(energy(samples) / energy(high.samples));
 const doubleIn = await A.process(buffer(Float32Array.from(x, v => v * 2), rate), base);
 check('Receiver auto-gain levels a 6 dB input difference to within 0.5 dB', Math.abs(levelDb(doubleIn.samples)) < .5);
-const faint = await A.process(buffer(Float32Array.from(x, v => v * .05), rate), { ...base, gate: false });
+// Receiver only: Steam's encoder would put this faint, steady mix into DTX comfort noise.
+const faint = await A.process(buffer(Float32Array.from(x, v => v * .05), rate), { ...base, gate: false, enableWarble: false });
 // x needs ~6x gain; 26 dB quieter needs ~120x, so voice_maxgain (10) binds.
 check('voice_maxgain caps the boost for very quiet input', levelDb(faint.samples) < -19 && levelDb(faint.samples) > -26);
 const gatedFaint = await A.process(buffer(Float32Array.from(x, v => v * .05), rate), base);
@@ -103,7 +104,21 @@ check('Invalid PCM is rejected before encoding', true);
   const at = f => energy(late.samples.subarray(f * 480 - late.info.lookahead, (f + 1) * 480 - late.info.lookahead));
   check('Late frame plays as silence; lost frame is concealed', at(5) === 0 && at(7) > 0 && late.info.underrunFrames === 1 && late.info.lostFrames === 1);
   const plain = await opus.roundTrip(gx, rate, 32000);
-  check('Gate is off unless requested', plain.info.gatedFrames === 0 && plain.info.gate === null);
+  check('Gate is off unless requested', plain.info.gatedFrames === 0 && plain.info.gate === null && plain.info.spurts === 1);
+  // Pre-roll: the frames before the first loud one are sent too. Loud frames 25-29, so 22-31 go out.
+  const px = Float32Array.from({ length: rate }, (_, i) => (i >= rate * .5 && i < rate * .6 ? .45 : .0045) * Math.sin(2 * Math.PI * 500 * i / rate));
+  const pr = await opus.roundTrip(px, rate, 32000, { gate: { thresholdDb: -30, prerollFrames: 3, holdFrames: 2 } });
+  const prAt = f => energy(pr.samples.subarray(f * 480 - pr.info.lookahead, (f + 1) * 480 - pr.info.lookahead));
+  check('Gate: pre-roll frames before an onset are transmitted', pr.info.gatedFrames === pr.info.frames - 10 && prAt(22) > 0 && prAt(21) === 0 && pr.info.prerollFrames === 3);
+  // Two bursts 20 frames apart with a 2-frame hold are two talk spurts, each with its own encoder and decoder.
+  const bx = Float32Array.from({ length: rate }, (_, i) => ((i < rate * .1) || (i >= rate * .5 && i < rate * .6) ? .45 : 0) * Math.sin(2 * Math.PI * 500 * i / rate));
+  const two = await opus.roundTrip(bx, rate, 32000, { gate: { thresholdDb: -30, holdFrames: 2 } });
+  check('Gate: separate talk spurts are counted', two.info.spurts === 2);
+  // DTX: a steady tone falls silent in Opus's voice detector and is sent as 1-byte comfort-noise packets.
+  const steadyTone = Float32Array.from({ length: 2 * rate }, (_, i) => .03 * Math.sin(2 * Math.PI * 1000 * i / rate));
+  const withDtx = await opus.roundTrip(steadyTone, rate, 32000, { complexity: 6, vbr: true, dtx: true });
+  const noDtx = await opus.roundTrip(steadyTone, rate, 32000);
+  check('DTX is opt-in and its comfort-noise frames are counted', withDtx.info.dtx && withDtx.info.dtxFrames > 20 && noDtx.info.dtxFrames === 0 && withDtx.info.encodedBytes < noDtx.info.encodedBytes / 2);
 }
 const aliasSource = Float32Array.from({ length: 48000 }, (_, i) => Math.sin(2 * Math.PI * 16000 * i / 48000));
 const downsampled = A.resampleSinc(aliasSource, 48000, 24000).slice(100, -100);
