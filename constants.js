@@ -16,8 +16,8 @@
  *     DFR/DLY/AMP/MDY processor parameters below are copied verbatim.
  *   - zhenyangli.me "Reversing Steam Voice Codec" — Steam voice is Opus at
  *     24 kHz mono.
- *   - tests/REFERENCE_2026.md — paired loopback measurements behind the
- *     Steam profile and VOICE_ENGINE values.
+ *   - tests/REFERENCE_2026.md — paired loopback and test-signal measurements
+ *     behind the Steam profile and VOICE_ENGINE values.
  * ========================================================================= */
 
 const TF2_DATA = {
@@ -228,6 +228,10 @@ const PRESETS = {
  *                 matching the SILK/CELT crossover seen in the recording
  *   decoderEq   : optional FIR (linear gains interpolated between points)
  *                 applied to decoded audio at codecRate
+ *   senderGate  : Steam's sender voice gate. 20 ms frames above thresholdDb
+ *                 (RMS, dBFS) open it; it stays open holdMs after the last
+ *                 one. Closed frames are not sent. Profiles without it
+ *                 transmit continuously (push-to-talk engine codecs).
  *   voiceRate   : rate at which the engine receives decoded voice and runs
  *                 its auto-gain (128-sample blocks)
  *   mixer       : how voiceRate is converted to the 44.1 kHz mixer:
@@ -238,19 +242,22 @@ const CODEC_PROFILES = {
   steam: {
     displayName: 'Steam voice (Opus 24 kHz / 32 kbps)',
     codecRate: 24000, bitrate: 32000, application: 'voip', signal: 'voice',
-    // The recorded hybrid high band sits ~2.5 dB below libopus 1.6.1's,
-    // with a band edge just under 12 kHz (see tests/REFERENCE_2026.md).
+    // Above the SILK/CELT crossover the recorded high band sits ~2.5 dB
+    // below libopus 1.6.1's, and the band edge falls from 11.5 kHz. Fitted
+    // to steady pink noise and music (see tests/REFERENCE_2026.md).
     decoderEq: {
       taps: 95,
-      freqs:   [0, 7300, 7800, 10500, 11000, 11500, 11800, 12000],
-      gainsDb: [0, 0,   -2.5, -2.5,  -2.5,  -2.5,  -2.5,  -60]
+      freqs:   [0, 7700, 8200, 10500, 11000, 11500, 11800, 12000],
+      gainsDb: [0, 0,   -2.5, -2.5,  -2.5,  -4,    -8,    -60]
     },
+    senderGate: { thresholdDb: -39.5, holdMs: 300 },
     voiceRate: 44100, mixer: 'sinc', status: 'measured'
   },
   // Optional fullband profile, NOT a verified TF2-era or native-rate preset.
   steam_48: {
     displayName: 'Fullband Opus (48 kHz / 64 kbps, experimental)',
     codecRate: 48000, bitrate: 64000, application: 'voip', signal: 'voice',
+    senderGate: { thresholdDb: -39.5, holdMs: 300 },
     voiceRate: 44100, mixer: 'sinc', status: 'experimental'
   },
   // vaudio_celt ran CELT at 22.05 kHz / ~22 kbps. Opus's CELT layer is its
@@ -275,21 +282,22 @@ const CODEC_PROFILES = {
 };
 
 /* -------------------------------------------------------------------------
- * Receiver voice path, fitted to the 2026 voice_loopback recording:
+ * Receiver voice path, identified from the 2026 test-signal takes:
  *
- *   autoGain  : per 128-sample block, the next gain brings the block's mean
- *               |x| to avgGain of full scale (voice_avggain), capped at
- *               maxGain (effective voice_maxgain), ramped linearly across the
- *               following block and clamped to int16. The recording shows
- *               this signature: mean |y| = 0.49-0.52 of a hard clip ceiling
- *               that ~13% of samples reach, gain updates at 44100/128 Hz.
+ *   autoGain  : Source's voice-channel auto-gain on int16 voice at 44.1 kHz.
+ *               Per 128-sample block the target gain is
+ *                 min(maxGain, 32767 / (mean + avgGain * (peak - mean)))
+ *               (voice_avggain 0.5 and voice_maxgain 10 by default). The
+ *               next block steps toward it in truncated 1/128 fixed-point
+ *               increments, scaled by voice_scale, and clamps to int16.
+ *               audio.js receiverAutoGain() has the exact update.
  *   outputFir : gentle post-mixer rolloff measured above 12 kHz
- *   volume    : output level. The recording's ceiling sat at -16.4 dBFS, but
- *               that includes the owner's game/OS volume, so it is a setting.
+ *   volume    : output level. The recordings' ceiling (-16.5 dBFS) is the
+ *               owner's `volume 0.15`, so this is a setting, not a fit.
  * ------------------------------------------------------------------------- */
 const VOICE_ENGINE = {
   mixRate: 44100,
-  autoGain: { blockSize: 128, avgGain: 0.5, maxGain: 16 },
+  autoGain: { blockSize: 128, avgGain: 0.5, maxGain: 10 },
   outputFir: [0.1, 0.8, 0.1],
   volume: 0.5
 };

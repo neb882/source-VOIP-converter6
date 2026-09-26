@@ -57,6 +57,9 @@ const els = {
   agc:       document.getElementById('agc'),
   maxGain:   document.getElementById('maxgain'),
   avgGain:   document.getElementById('avggain'),
+  vad:       document.getElementById('vad'),
+  captureChannel: document.getElementById('capture_channel'),
+  vadThreshold: document.getElementById('vad_threshold'),
   volume:    document.getElementById('volume'),
   loss:      document.getElementById('loss'),
   frameMs:   document.getElementById('frameMs'),
@@ -488,8 +491,11 @@ const cvars = {
   'voice_micgain':   { help: 'Sender capture gain; above 1 clips the int16 capture', link: 'gain' },
   'voice_scale':     { help: 'Receiver voice scale, applied inside the auto-gain (more = more clipping)', link: 'voice_scale' },
   'voice_agc':       { help: 'Receiver auto-gain with int16 clamp (0 = unity gain)', link: 'agc' },
-  'voice_maxgain':   { help: 'Auto-gain cap (fitted effective value: 16)', link: 'maxgain' },
-  'voice_avggain':   { help: 'Auto-gain target mean level, fraction of full scale', link: 'avggain' },
+  'voice_maxgain':   { help: 'Auto-gain cap (TF2 default 10)', link: 'maxgain' },
+  'voice_avggain':   { help: 'Auto-gain normalizes each block between its mean (0) and peak (1) to full scale; 0.5 = TF2 default', link: 'avggain' },
+  'voice_capture_channel': { help: 'Stereo input to the mono mic: left (measured through a virtual cable) / mix / right', link: 'capture_channel' },
+  'voice_vad':       { help: 'Steam sender voice gate: auto (profile default) / 1 / 0', link: 'vad' },
+  'voice_vad_threshold': { help: 'Gate opening level: 20 ms frame RMS in dBFS (measured -39.5), 300 ms hold', link: 'vad_threshold' },
   'volume':          { help: 'Output volume of the rendered file (0.0 - 1.0)', link: 'volume' },
   'dsp_hpf':         { help: 'Optional sender high-pass cutoff (0 = off)', link: 'hp' },
   'dsp_lpf':         { help: 'Optional sender low-pass cutoff (20000 = off)', link: 'lp' },
@@ -649,6 +655,10 @@ function updateSignalChain() {
   const gain = num(els.gain, 1), bits = num(els.bits, 16), loss = num(els.loss, 0);
   const maxGain = num(els.maxGain, VOICE_ENGINE.autoGain.maxGain), volume = num(els.volume, VOICE_ENGINE.volume);
   const codecOn = els.warble.value === '1', agcOn = els.agc.value === '1';
+  const gateOn = codecOn && (els.vad.value === 'auto' ? !!codec.senderGate : els.vad.value === '1');
+  const gateDb = num(els.vadThreshold, -39.5);
+  const stereoIn = !!(state.decodedSource && state.decodedSource.left);
+  const channelLabel = stereoIn ? ({ left: 'left ch · ', right: 'right ch · ', mix: 'L+R mix · ' })[els.captureChannel.value] || '' : '';
   const kbps = Math.round(Math.max(6000, codec.bitrate * bits / 16) / 1000);
   const mode = codec.application === 'lowdelay' ? 'CELT' : codec.codecRate <= 8000 ? 'SILK' : 'SILK/CELT hybrid';
   const packetMs = Math.max(20, Math.round(num(els.frameMs, 20) / 20) * 20);
@@ -657,7 +667,7 @@ function updateSignalChain() {
     : (LISTENER_POSITIONS[els.position.value] || LISTENER_POSITIONS.open).label;
   const filters = [num(els.hp, 0) > 10 ? `HP ${num(els.hp, 0)} Hz` : '', num(els.lp, 20000) < 20000 ? `LP ${num(els.lp, 20000)} Hz` : ''].filter(Boolean);
   const steps = [
-    ['Capture', `mic ×${gain.toFixed(1)}${filters.length ? ' · ' + filters.join(' · ') : ''}`, gain > 1 ? 'hot' : ''],
+    ['Capture', `${channelLabel}mic ×${gain.toFixed(1)}${filters.length ? ' · ' + filters.join(' · ') : ''} · ${gateOn ? `gate > ${gateDb} dBFS` : 'no gate'}`, gain > 1 ? 'hot' : ''],
     ['Codec', codecOn ? `Opus ${codec.codecRate / 1000} kHz · ${kbps} kbps · ${mode}` : 'bypassed', codecOn ? '' : 'off'],
     ['Network', `${packetMs} ms packets · ${loss}% loss`, loss > 0 ? 'hot' : ''],
     ['Receiver', agcOn ? `auto-gain ≤${maxGain}× · int16 clip` : 'unity gain · int16 clip', ''],
@@ -703,6 +713,9 @@ function runPreset(name) {
   execCommand('voice_agc 1');
   execCommand(`voice_maxgain ${VOICE_ENGINE.autoGain.maxGain}`);
   execCommand(`voice_avggain ${VOICE_ENGINE.autoGain.avgGain}`);
+  execCommand('voice_capture_channel left');
+  execCommand('voice_vad auto');
+  execCommand('voice_vad_threshold -39.5');
   execCommand(`volume ${VOICE_ENGINE.volume}`);
   execCommand('net_split 20');
   execCommand('net_jitter 0');
@@ -777,6 +790,9 @@ const CONFIG_FIELDS = [
   configControl('agc', els.agc),
   configControl('maxgain', els.maxGain),
   configControl('avggain', els.avgGain),
+  configControl('chan', els.captureChannel),
+  configControl('vad', els.vad),
+  configControl('vadthr', els.vadThreshold),
   configControl('vol', els.volume),
   configControl('frame', els.frameMs),
   configControl('loss', els.loss),
@@ -870,7 +886,9 @@ function deletePreset(name) {
 /* Source loading (file or microphone)                                */
 /* ------------------------------------------------------------------ */
 
-function mountSource(mono, sampleRate, name) {
+// `mono` is the L+R mix used for display and the dry A/B; stereo sources also
+// keep their left channel so the render can capture it like a stereo cable.
+function mountSource(mono, sampleRate, name, left = null) {
   const duration = mono.length / sampleRate;
   if (!Number.isFinite(duration) || duration <= 0) throw new Error('the clip has no decodable audio');
   if (duration > MAX_AUDIO_SECONDS) throw new Error('the clip exceeds the 10 minute limit');
@@ -880,7 +898,7 @@ function mountSource(mono, sampleRate, name) {
   state.lastBlob = null;
   state.processedBuffer = null;
   state.decodedSource = { sampleRate, duration, length: mono.length,
-    numberOfChannels: 1, getChannelData: () => mono };
+    numberOfChannels: 1, getChannelData: () => mono, left };
   state.dryBlob = URL.createObjectURL(TF2Audio.encodeWav(mono, sampleRate));
   els.process.disabled = false;
   els.dl.disabled = true;
@@ -895,6 +913,7 @@ function mountSource(mono, sampleRate, name) {
   refreshVisualizer();
   setStatus(`${name} · ${duration.toFixed(1)}s · ${sampleRate.toLocaleString()} Hz`, 'success');
   logLine(`FS_MountFile: "${name}" (${duration.toFixed(1)}s) mounted.`, 'sys');
+  updateSignalChain();
 }
 
 let sourceLoadId = 0;
@@ -907,7 +926,8 @@ async function loadSourceFromArrayBuffer(ab, name) {
     const decoded = await state.decodeCtx.decodeAudioData(ab);
     if (id !== sourceLoadId) return; // A newer selection superseded this decode.
     if (decoded.duration > MAX_AUDIO_SECONDS) throw new Error('the clip exceeds the 10 minute limit');
-    mountSource(TF2Audio.bufferToMono(decoded), decoded.sampleRate, name);
+    mountSource(TF2Audio.bufferToMono(decoded), decoded.sampleRate, name,
+      decoded.numberOfChannels > 1 ? decoded.getChannelData(0).slice() : null);
   } catch (e) {
     if (id !== sourceLoadId) return;
     logLine(`decodeAudioData failed: ${e.message}`, 'err');
@@ -1208,7 +1228,20 @@ function describeModes(modes) {
   return parts.length ? parts.join(', ') : 'no packets';
 }
 
+// The mono signal the game's microphone input receives from the source.
+function captureSource(source, channel) {
+  if (!source.left || channel === 'mix') return source;
+  const mix = source.getChannelData(0), left = source.left;
+  let mono = left;
+  if (channel === 'right') {
+    mono = new Float32Array(mix.length);
+    for (let i = 0; i < mono.length; i++) mono[i] = 2 * mix[i] - left[i];
+  }
+  return { sampleRate: source.sampleRate, duration: source.duration, length: mono.length, numberOfChannels: 1, getChannelData: () => mono };
+}
+
 async function runAudioProcess(source, opts) {
+  source = captureSource(source, opts.captureChannel);
   if (typeof Worker !== 'undefined' && location.protocol !== 'file:') {
     try {
       return await processInWorker(source, opts);
@@ -1263,6 +1296,7 @@ els.process.addEventListener('click', async () => {
         decay:    Number(els.cDec.value),
         mix:      Number(els.cMix.value) / 100
       } : null,
+      captureChannel: els.captureChannel.value,
       micGain:     Number(els.gain.value),
       voiceScale:  Number(els.voiceScale.value),
       hp:          Number(els.hp.value),
@@ -1271,6 +1305,8 @@ els.process.addEventListener('click', async () => {
       agc:         els.agc.value === '1',
       maxGain:     Number(els.maxGain.value),
       avgGain:     Number(els.avgGain.value),
+      gate:        els.vad.value === 'auto' ? null : els.vad.value === '1',
+      gateThresholdDb: Number(els.vadThreshold.value),
       volume:      Number(els.volume.value),
       lossPct:     Number(els.loss.value),
       frameMs:     Number(els.frameMs.value),  // net_split — previously never passed
@@ -1294,6 +1330,10 @@ els.process.addEventListener('click', async () => {
     logLine(realOpus
       ? `S_Voice: ${codecInfo.version}, ${codecInfo.bitrate / 1000} kbps, 20 ms frames, native PLC (${describeModes(codecInfo.modes)})`
       : 'S_Voice: codec bypassed', 'sys');
+    if (realOpus && codecInfo.gate != null) {
+      const held = codecInfo.frames ? Math.round(100 * codecInfo.gatedFrames / codecInfo.frames) : 0;
+      logLine(`S_Voice: voice gate at ${codecInfo.gate} dBFS held back ${codecInfo.gatedFrames} of ${codecInfo.frames} frames (${held}%)`, 'sys');
+    }
     logLine(`S_Voice: receiver auto-gain ${codecInfo.autoGain ? 'on' : 'off'} at ${codecInfo.voiceRate} Hz`, 'sys');
 
     state.processedBuffer = samples;
@@ -1786,12 +1826,14 @@ function updateNetGraph() {
     els.ngLerp.textContent = '100.0';
     const info = state.lastCodecInfo;
     if (info && info.frames) {
+      // Averages over the render; frames held back by the voice gate send nothing.
       const seconds = info.frames * info.frameMs / 1000;
-      const pps = (50 / (info.framesPerPacket || 1)).toFixed(0);
+      const sent = info.frames - (info.gatedFrames || 0);
+      const pps = (sent / seconds / (info.framesPerPacket || 1)).toFixed(0);
       const kps = (info.encodedBytes / seconds / 1024).toFixed(2);
       els.ngIn.textContent = `${pps} ${kps}`;
       els.ngOut.textContent = `${pps} ${kps}`;
-      els.ngLoss.textContent = Math.round(100 * info.lostFrames / info.frames);
+      els.ngLoss.textContent = sent ? Math.round(100 * info.lostFrames / sent) : 0;
     } else {
       els.ngIn.textContent = '0 0.00';
       els.ngOut.textContent = '0 0.00';

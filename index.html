@@ -20,7 +20,7 @@
       <ul class="facts" aria-label="What the emulator models">
         <li><b>Real Opus</b> 24 kHz · 32 kbps · SILK/CELT hybrid</li>
         <li><b>Receiver auto-gain</b> with the in-game int16 clip</li>
-        <li><b>Measured</b> against a real TF2 recording</li>
+        <li><b>Measured</b> against real TF2 recordings</li>
         <li><b>Local</b> — nothing is uploaded</li>
       </ul>
     </header>
@@ -86,6 +86,14 @@
         <fieldset class="chain-group advanced-control">
           <legend><span class="chain-index">A</span> Sender</legend>
           <div class="control">
+            <label for="capture_channel">Stereo capture <code class="cvar">voice_capture_channel</code></label>
+            <select id="capture_channel">
+              <option value="left" selected>Left (measured)</option>
+              <option value="mix">Mix L+R</option>
+              <option value="right">Right</option>
+            </select>
+          </div>
+          <div class="control">
             <label for="gain">Mic gain <code class="cvar">voice_micgain</code></label>
             <input id="gain" type="number" value="1.0" min="0.5" max="5.0" step="0.1">
           </div>
@@ -96,6 +104,18 @@
           <div class="control">
             <label for="lp">Lo-pass Hz, 20000 = off <code class="cvar">dsp_lpf</code></label>
             <input id="lp" type="number" value="20000" min="1000" max="20000">
+          </div>
+          <div class="control">
+            <label for="vad">Voice gate <code class="cvar">voice_vad</code></label>
+            <select id="vad">
+              <option value="auto" selected>Auto (Steam: on)</option>
+              <option value="1">On</option>
+              <option value="0">Off (always send)</option>
+            </select>
+          </div>
+          <div class="control">
+            <label for="vad_threshold">Gate opens above dBFS <code class="cvar">voice_vad_threshold</code></label>
+            <input id="vad_threshold" type="number" value="-39.5" min="-70" max="-10" step="0.5">
           </div>
         </fieldset>
 
@@ -132,12 +152,12 @@
             </select>
           </div>
           <div class="control">
-            <label for="avggain">Average target <code class="cvar">voice_avggain</code></label>
-            <input id="avggain" type="number" value="0.5" min="0.05" max="1" step="0.05">
+            <label for="avggain">Mean → peak normalize <code class="cvar">voice_avggain</code></label>
+            <input id="avggain" type="number" value="0.5" min="0" max="1" step="0.05">
           </div>
           <div class="control">
             <label for="maxgain">Max gain <code class="cvar">voice_maxgain</code></label>
-            <input id="maxgain" type="number" value="16" min="1" max="100" step="1">
+            <input id="maxgain" type="number" value="10" min="1" max="100" step="1">
           </div>
           <div class="control">
             <label for="voice_scale">Voice scale <code class="cvar">voice_scale</code></label>
