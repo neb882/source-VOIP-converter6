@@ -1,13 +1,14 @@
 # 2026 TF2 voice recordings: what they show
 
-Measured locally from 2026-09-24 to 2026-09-26. No recording, source music or derived audio is distributed with this project. The one exception is the synthetic test signal, whose generator is in [`tests/testsignal/`](testsignal/).
+Measured locally from 2026-09-24 to 2026-09-26. No recording, source music or derived audio is distributed with this project. The exceptions are the synthetic test signals, whose generators are in [`tests/testsignal/`](testsignal/).
 
 Two sets of recordings were made with `voice_loopback 1` on a private server, playing files into TF2's microphone input through a virtual audio cable:
 
 - **Set A** (music): one MP3 of two songs.
 - **Set B**: a calibrated test signal recorded under four settings, plus the owner's own speech. All are lossless FLAC.
+- **Set C**: a one-minute network test signal recorded under simulated packet loss and jitter, plus the owner's speech under loss. All are lossless FLAC.
 
-Set B identified the receiver law. Set A and the speech take validate it.
+Set B identified the receiver law, and Set A and the speech take validate it. Set C measured what loss and jitter do to the voice.
 
 ## Provenance
 
@@ -63,6 +64,21 @@ Each take was aligned to the test signal from its level envelope, then from 10�
 | take3_voice_avggain_0.25 | −208 ppm | 4.4 ms SD |
 
 The speech take needed a separate alignment for each talk spurt. The delay changes between spurts, between 1.94 s and 2.29 s, which is consistent with the receiver's jitter buffer restarting at each spurt.
+
+### Set C: packet loss and jitter
+
+The network test signal (`tf2_voice_nettest_v1.wav`, 58.2 s, SHA-256 `1b8b6ac0…8633`) was played the same way on a listen server with `net_usesocketsforloopback 1` and `sv_cheats 1`. Its segments are 12 s of pink noise, a 10 s chirp, 12 s of synthetic voice and eight separate 1.2 s noise bursts. Levels keep the voice gate open and the auto-gain at its +20 dB cap. `net_graph` showed 14–19 ms ping without `net_fakelag` and 204–210 ms with `net_fakelag 100`.
+
+| Take | Console | `net_graph` loss | Duration | SHA-256 (FLAC) |
+| --- | --- | ---: | --- | --- |
+| baseline | all 0 | 0 | 64.1 s | `87f513579b2543633e2c91b59a2f70c0fdd987f524a08598d3f8b46a0a28fa4e` |
+| loss5 | `net_fakeloss 5` | 13 | 60.8 s | `e032ab14c4ca3642625308ff77c20aff69bb00921a75e862645393a060fa6708` |
+| loss15 | `net_fakeloss 15` | 34 | 61.9 s | `b10e2b4ebc8b2551100508c4278dfccb61d68dbddaca20ebb291dffbf962b7a6` |
+| jitter | `net_fakelag 100; net_fakejitter 50` | 0 | 61.6 s | `031e2d62813ca105349b0c247e4d97697e903550818cf46dde577672e3a10094` |
+| combined | `net_fakeloss 10; net_fakelag 100; net_fakejitter 50` | 20 | 61.7 s | `e5215d465ada55cbe63735b7650331f101a6b87b8cfa6b76207550d0bf2c1938` |
+| speech_loss10 | `net_fakeloss 10`, owner's raw speech | — | 87.9 s | `7aba8b3921c32e918d0753872721cde2811a11c798dc772aa3d754ffac445ef3` |
+
+Each take was compared with the app's lossless render in 10 ms windows every 2.5 ms (300–4000 Hz correlation), following the delay at 20 ms resolution. A window below 0.4 correlation counts as damaged; a damaged stretch of at least 15 ms counts as one loss event. In the clean baseline, received frames correlate at a median of 0.86–0.99, and false events occur about 0.9 times per second. The rates below have that subtracted.
 
 ## Findings
 
@@ -133,6 +149,30 @@ Set A was delivered as VBR MP3. Encoding the model's lossless output with LAME:
 
 Set B is lossless and matches the model's clip statistics directly. The previous model had been tuned to Set A's biased values.
 
+### 8. Lost voice frames are concealed in bursts averaging 2.2 frames
+
+Lost audio is replaced in place, not skipped or left silent. Across 54 of 55 isolated events the delay is the same before and after, and the damaged stretch carries noise within about 3 dB of the true level: Opus's own concealment. It fades toward silence only in long bursts at high loss.
+
+The damage comes in bursts:
+
+| Take | Events per second | Frames lost | Events of 1 / 2 / 3 / 4+ frames |
+| --- | ---: | ---: | --- |
+| loss5 | 4.3 | 17% | 51 / 23 / 17 / 9% |
+| loss15 | 14.1 | 58% | 54 / 21 / 10 / 15% |
+| combined | 12.0 | 43% | 57 / 25 / 9 / 9% |
+
+A two-state (Gilbert-Elliott) loss process whose mean burst is 2.2 frames reproduces all three when set to 22%, 64% and 45% of frames lost. `net_fakeloss` on this listen server therefore removed far more voice than its number: about 22%, 45% and 64% of frames at 5, 10 and 15. It applies to the packets in both directions, and `net_graph` itself reported 13%, 20% and 34%.
+
+The speech take agrees. Under `net_fakeloss 10`, 38% of active speech frames correlate below 0.5 with the clean render (median 0.71). The app at 45% loss gives 37% (median 0.67), against 23% at 30% and 51% at 60%.
+
+### 9. Jitter adds isolated late frames
+
+With `net_fakelag 100` and `net_fakejitter 50`, about 1.4 extra events per second appear (3% of frames). They are single frames: 81% last one frame, against 51% for packet loss. Nine in ten are concealed and about one in ten plays as a short silence, consistent with a frame that arrived too late for playback.
+
+### 10. The receiver re-times talk spurts and trims latency in 256-sample skips
+
+The delay from source to output changes from one talk spurt to the next. In the baseline, alternate noise bursts came out about 240 ms apart in delay (2.02 s against 1.74–1.81 s), so the receiver shortens some silences between spurts and restores others. Within continuous voice, the delay falls by 2–8 ms per second in steps of about 5.8 ms, the length of 256 samples at 44.1 kHz. That happens in every take, including the clean baseline, so it is the receiver trimming buffered latency rather than an effect of jitter. `help voice_buffer_ms` describes the 100 ms voice buffer as avoiding "dropouts due to jitter and frame time differences".
+
 ## Model
 
 | Stage | Setting | Basis |
@@ -144,6 +184,7 @@ Set B is lossless and matches the model's clip statistics directly. The previous
 | Voice rate | 44.1 kHz | block-rate lines, post-decode clipping, SDK mix rate |
 | Auto-gain | finding 3 law and finding 4 update; `voice_avggain 0.5`, `voice_maxgain 10`, `voice_scale 1` | Set B |
 | Output stage | 3-tap `[0.1, 0.8, 0.1]` at 44.1 kHz, then `volume` | fitted to Set A's 13–18 kHz slope |
+| Network | lost frames in Gilbert-Elliott bursts, mean 2.2 frames, concealed by Opus; jitter makes 3.2% of frames late at 50 ms (scaled linearly), one in ten silent | findings 8 and 9 |
 
 ## Results
 
@@ -169,6 +210,15 @@ Set B is lossless and matches the model's clip statistics directly. The previous
 | Samples at the clamp | 8.4% | 9.1% | — |
 | Overall level | −6.62 dB | −6.51 dB | — |
 
+**Set C.** The app rendered the network test signal and was measured the same way as the takes:
+
+| Take | App setting | Events per second, real / app | Frames lost, real / app | Events of 1 / 2 / 3 / 4+ frames, real / app |
+| --- | --- | ---: | ---: | --- |
+| loss5 | 22% | 4.3 / 4.4 | 17 / 16% | 51/23/17/9 / 54/25/11/10% |
+| loss15 | 64% | 14.1 / 14.9 | 58 / 60% | 54/21/10/15 / 49/30/8/12% |
+| jitter | 50 ms | 1.36 / 1.39 | 3.1 / 2.8% | 81/11/9/0 / 100/0/0/0% |
+| combined | 45%, 50 ms | 12.0 / 10.6 | 43 / 41% | 57/25/9/9 / 54/24/9/13% |
+
 **Set A.** From `pnpm compare:reference`:
 - **Level tracking (half-second RMS deviation):** River 0.16 dB (left channel), Take It Off 0.07 dB. The previous model gave 0.55 and 0.42 dB.
 - **Spectrum:** within ±1.4 dB from 40 Hz to 12 kHz, with 8–12 kHz sitting 0.9–1.4 dB low against this MP3. Within ±2 dB from 12 to 19 kHz.
@@ -178,17 +228,18 @@ Set B is lossless and matches the model's clip statistics directly. The previous
 ## What remains unverified
 
 - **Steady tones.** The real gate also closes on steady tones after a while. A −36 dBFS sine closes after 0.4 s, −30 dBFS after about 1.1 s, and −24 dBFS near 2 s. Noise and sweeps at similar levels stay open. The modeled gate has no such adaptation; a floor-tracking version fitted the tones but closed wrongly on steady noise.
-- **Talk-spurt timing.** The receiver's per-spurt delay changes (±100 ms) are not modeled. Renders keep the source timeline.
+- **Talk-spurt timing and latency trimming.** The per-spurt delay changes (up to about 300 ms) and the 5.8 ms latency-trimming skips (finding 10) are not modeled. Renders keep the source timeline. The skip rate may depend on this single-PC setup.
 - **High-band pure tones and the sweep's top octave.** The real encoder attenuates them more than libopus 1.6.1 (finding 2). This is attributed to a different libopus build in Steam, which is not confirmed.
 - **Stereo capture.** Finding 6 is one capture chain (a stereo virtual cable). A physical microphone is mono either way.
 - **Output stage.** The small post-clip roll-off may come from the recording chain rather than the game.
 - **Legacy profiles and rooms.** Speex and CELT stand-ins, and room presets, are not validated against recordings.
-- **Network loss.** Real network loss was not recorded.
+- **Network settings.** Set C used simulated loss on a listen server, where `net_fakeloss` hits both directions. How a given real-world or one-way loss rate maps to lost frames is not measured, so the app's control is the share of frames lost. The jitter rate is calibrated at one setting (`net_fakejitter 50` with `net_fakelag 100`) and scaled linearly. Real internet loss was not recorded.
 
 ## Reproduce
 
 ```sh
 python3 tests/testsignal/make_testsignal.py   # writes the v1 WAV and segment map (numpy, scipy)
+python3 tests/testsignal/make_nettest.py      # the network test signal
 pnpm install --frozen-lockfile
 pnpm compare:reference 'path/to/tf2 VOIP test 2026 pure.mp3' 'path/to/Joni Mitchell - River.mp3' 'path/to/Ke$ha - Take It Off.mp3'
 ```

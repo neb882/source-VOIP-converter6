@@ -98,6 +98,10 @@ check('Invalid PCM is rejected before encoding', true);
   check('Gate: loud frames and the hold are transmitted', frameEnergy(5) > 0 && frameEnergy(10) > 0 && frameEnergy(11) > 0);
   check('Gate: closed frames are silent and counted', energy(samples.subarray(13 * 480)) === 0 && info.gatedFrames === info.frames - 12 && info.gate === -30);
   check('Gate: only transmitted frames are encoded', Object.values(info.modes).reduce((a, b) => a + b, 0) === info.frames - info.gatedFrames);
+  // Loss mask 2: a late frame plays silence and skips the decoder; 1 is concealed.
+  const late = await opus.roundTrip(gx, rate, 32000, { makeLossMask: n => Uint8Array.from({ length: n }, (_, f) => (f === 5 ? 2 : f === 7 ? 1 : 0)) });
+  const at = f => energy(late.samples.subarray(f * 480 - late.info.lookahead, (f + 1) * 480 - late.info.lookahead));
+  check('Late frame plays as silence; lost frame is concealed', at(5) === 0 && at(7) > 0 && late.info.underrunFrames === 1 && late.info.lostFrames === 1);
   const plain = await opus.roundTrip(gx, rate, 32000);
   check('Gate is off unless requested', plain.info.gatedFrames === 0 && plain.info.gate === null);
 }

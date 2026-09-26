@@ -36,7 +36,7 @@ export async function roundTrip(samples, sampleRate, bitrate, options = {}) {
       threshold: 10 ** (Number(options.gate.thresholdDb) / 20),
       hold: Math.max(0, Math.round(Number(options.gate.holdFrames) || 0))
     } : null;
-    let encodedBytes = 0, lostFrames = 0, gatedFrames = 0, holdLeft = 0;
+    let encodedBytes = 0, lostFrames = 0, underrunFrames = 0, gatedFrames = 0, holdLeft = 0;
     for (let f = 0; f < frames; f++) {
       input.fill(0);
       const start = f * frameSize;
@@ -54,16 +54,21 @@ export async function roundTrip(samples, sampleRate, bitrate, options = {}) {
         const packet = encoder.encodeFloat(input);
         encodedBytes += packet.byteLength;
         modes[packetMode(packet)]++;
-        const lost = !!(lossMask && lossMask[f]);
-        if (lost) lostFrames++;
-        const decoded = lost ? decoder.decodePacketLossFloat(frameSize)
-          : decoder.decodeFloat(packet, { frameSize });
-        if (decoded.length !== frameSize) throw new Error('Unexpected Opus frame length');
-        // Trim only libopus's declared delay. Padding remains at the END.
-        const destStart = start - lookahead;
-        const begin = Math.max(0, -destStart);
-        const end = Math.min(frameSize, samples.length - destStart);
-        if (end > begin) output.set(decoded.subarray(begin, end), destStart + begin);
+        // Loss mask: 1 = lost, concealed by the decoder; 2 = arrived too late
+        // for playback, so the slot plays silence and the decoder skips it.
+        const miss = lossMask ? lossMask[f] : 0;
+        if (miss === 1) lostFrames++;
+        else if (miss === 2) underrunFrames++;
+        if (miss !== 2) {
+          const decoded = miss === 1 ? decoder.decodePacketLossFloat(frameSize)
+            : decoder.decodeFloat(packet, { frameSize });
+          if (decoded.length !== frameSize) throw new Error('Unexpected Opus frame length');
+          // Trim only libopus's declared delay. Padding remains at the END.
+          const destStart = start - lookahead;
+          const begin = Math.max(0, -destStart);
+          const end = Math.min(frameSize, samples.length - destStart);
+          if (end > begin) output.set(decoded.subarray(begin, end), destStart + begin);
+        }
       } else {
         gatedFrames++;
       }
@@ -75,7 +80,7 @@ export async function roundTrip(samples, sampleRate, bitrate, options = {}) {
     options.onProgress?.(1);
     return { samples: output, info: { backend: 'libopus', version: (await loadLibopus()).version,
       sampleRate, bitrate, application, signal, vbr: !!options.vbr, frameSamples: frameSize, frameMs: 20,
-      lookahead, frames, lostFrames, gatedFrames, gate: gate ? Number(options.gate.thresholdDb) : null,
+      lookahead, frames, lostFrames, underrunFrames, gatedFrames, gate: gate ? Number(options.gate.thresholdDb) : null,
       encodedBytes, modes, plc: 'opus' } };
   } finally {
     decoder?.free();
