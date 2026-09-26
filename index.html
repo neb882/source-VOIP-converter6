@@ -46,7 +46,7 @@
         <button class="preset-btn" type="button" data-cmd="exec preset_sewers" data-preset="sewers" aria-label="2fort Sewers">
           <span class="preset-name">2fort Sewers</span><span class="preset-desc">Underwater, muffled</span></button>
         <button class="preset-btn" type="button" data-cmd="exec preset_laggy" data-preset="laggy" aria-label="Laggy 18% Loss">
-          <span class="preset-name">Laggy</span><span class="preset-desc">18% burst packet loss</span></button>
+          <span class="preset-name">Laggy</span><span class="preset-desc">18% lost frames + 50 ms jitter</span></button>
       </div>
 
       <div class="controls" id="controls-wrapper">
@@ -137,8 +137,12 @@
             <input id="frameMs" type="number" value="20" min="20" max="100" step="20">
           </div>
           <div class="control">
-            <label for="loss">Loss % <code class="cvar">net_fakeloss</code></label>
-            <input id="loss" type="number" value="0" min="0" max="40">
+            <label for="loss">Frames lost % <code class="cvar">net_fakeloss</code></label>
+            <input id="loss" type="number" value="0" min="0" max="60">
+          </div>
+          <div class="control">
+            <label for="jitter">Jitter ms <code class="cvar">net_fakejitter</code></label>
+            <input id="jitter" type="number" value="0" min="0" max="100" step="10">
           </div>
         </fieldset>
 

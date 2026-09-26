@@ -393,26 +393,36 @@ async function main() {
     check('rva with sizeMin=0 stays finite and sane', !hasBadValues(out) && r2 > 0.2 && r2 < 3, `${db(r2).toFixed(2)} dB`);
   }
 
-  console.log('\n[9] Burst loss (Gilbert-Elliott) + native PLC');
+  console.log('\n[9] Packet loss and jitter (measured) + native PLC');
   {
-    const rand = TF2Audio.mulberry32(1234);
-    const mask = TF2Audio.buildLossMask(20000, 1, 25, rand);
-    let ones = 0, runs = 0, runLen = 0, runSum = 0;
-    for (let i = 0; i < mask.length; i++) {
-      if (mask[i]) { ones++; runLen++; }
-      else if (runLen > 0) { runs++; runSum += runLen; runLen = 0; }
-    }
-    if (runLen > 0) { runs++; runSum += runLen; }
-    const meanLoss = ones / mask.length;
-    const meanBurst = runs ? runSum / runs : 0;
-    check('loss rate near target 25%', meanLoss > 0.18 && meanLoss < 0.32, `${(meanLoss * 100).toFixed(1)}%`);
-    check('loss is bursty (mean run > 1.5 frames)', meanBurst > 1.5, meanBurst.toFixed(2));
+    const burstStats = (mask, value = 1) => {
+      let ones = 0, runs = 0, runLen = 0, runSum = 0;
+      for (let i = 0; i <= mask.length; i++) {
+        if (i < mask.length && mask[i] === value) { ones++; runLen++; }
+        else if (runLen > 0) { runs++; runSum += runLen; runLen = 0; }
+      }
+      return { rate: ones / mask.length, meanBurst: runs ? runSum / runs : 0, runs };
+    };
+    const lossMask = TF2Audio.buildLossMask(40000, 1, 22, TF2Audio.mulberry32(1234));
+    const ls = burstStats(lossMask);
+    check('loss rate near target 22%', Math.abs(ls.rate - 0.22) < 0.02, `${(ls.rate * 100).toFixed(1)}%`);
+    // Measured: net_fakeloss 5 on a listen server lost ~22% of frames in bursts of ~2.2 frames,
+    // i.e. about 50 * 0.22 / 2.2 = 5 bursts per second.
+    check('bursts average ~2.2 frames, ~5 per second at 22%', Math.abs(ls.meanBurst - 2.2) < 0.25 && Math.abs(ls.runs / (40000 / 50) - 5) < 0.6,
+      `${ls.meanBurst.toFixed(2)} frames, ${(ls.runs / (40000 / 50)).toFixed(2)}/s`);
     for (const target of [1, 50, 70, 90, 99]) {
       const m = TF2Audio.buildLossMask(200000, 3, target, TF2Audio.mulberry32(56));
       const measured = m.reduce((a, b) => a + b, 0) * 100 / m.length;
       check(`loss ${target}% stays near target`, Math.abs(measured - target) < 1.5, `${measured.toFixed(2)}%`);
       check(`loss ${target}% groups complete packets`, m.every((x, i) => x === m[i - i % 3]));
     }
+    const jm = TF2Audio.buildLossMask(200000, 1, 0, TF2Audio.mulberry32(9), 50);
+    const late = jm.reduce((a, v) => a + (v > 0 ? 1 : 0), 0) / jm.length;
+    const silentShare = jm.reduce((a, v) => a + (v === 2 ? 1 : 0), 0) / Math.max(1, jm.reduce((a, v) => a + (v > 0 ? 1 : 0), 0));
+    check('50 ms jitter makes ~3.2% of frames late, a tenth of them silent', Math.abs(late - 0.032) < 0.003 && Math.abs(silentShare - 0.1) < 0.02,
+      `${(late * 100).toFixed(2)}% late, ${(silentShare * 100).toFixed(0)}% silent`);
+    check('late frames are isolated, not bursts', burstStats(jm, 1).meanBurst < 1.1, burstStats(jm, 1).meanBurst.toFixed(2));
+    check('no loss and no jitter means no mask', TF2Audio.buildLossMask(100, 1, 0, TF2Audio.mulberry32(1), 0) === null);
 
     const src = whiteNoise(2, SR, 0.2, 42);
     const opts = { codec: 'steam', agc: false, volume: 1, listenerPos: 'open', lossPct: 25, frameMs: 20 };
@@ -426,14 +436,9 @@ async function main() {
     const dead = await TF2Audio.process(mkBuffer(src, SR), { ...opts, lossPct: 100 });
     check('100% loss -> silence', rms(dead.samples) < 1e-6, `rms ${rms(dead.samples).toExponential(2)}`);
 
-    const jx = whiteNoise(1, 24000, 0.2, 9);
-    const jout = TF2Audio.applyJitterCrackle(jx, 24000, 512, 40, TF2Audio.mulberry32(7));
-    let zeros = 0;
-    for (let i = 0; i < jout.length; i++) if (jout[i] === 0) zeros++;
-    check('net_jitter zeroes short gaps', zeros > 24, `${zeros} zeroed samples`);
-    check('net_jitter deterministic', diffRms(jout, TF2Audio.applyJitterCrackle(jx, 24000, 512, 40, TF2Audio.mulberry32(7))) === 0);
-    const jproc = await TF2Audio.process(mkBuffer(src, SR), { ...opts, lossPct: 0, jitterPct: 30 });
-    check('jitterPct wired into process()', diffRms(jproc.samples, none.samples) > 1e-4);
+    const jproc = await TF2Audio.process(mkBuffer(src, SR), { ...opts, lossPct: 0, jitterMs: 100 });
+    check('jitterMs wired into process(): late frames concealed or silent', diffRms(jproc.samples, none.samples) > 1e-4
+      && jproc.codecInfo.lostFrames + jproc.codecInfo.underrunFrames > 0, `${jproc.codecInfo.lostFrames} concealed, ${jproc.codecInfo.underrunFrames} silent`);
   }
 
   console.log('\n[10] Input and option robustness');
@@ -449,7 +454,7 @@ async function main() {
       codec: 'not-a-codec', listenerPos: 'not-a-place', dspRoom: 99,
       customEnv: { duration: NaN, decay: Infinity, mix: 'bad' },
       micGain: NaN, voiceScale: Infinity, hp: 'bad', lp: NaN, maxGain: NaN, avgGain: 'x', volume: -3,
-      bits: NaN, lossPct: Infinity, jitterPct: NaN, frameMs: 'bad', seed: NaN
+      bits: NaN, lossPct: Infinity, jitterMs: NaN, frameMs: 'bad', seed: NaN
     });
     check('invalid options fall back without NaN/Inf', robust.samples.length > 0 && !hasBadValues(robust.samples));
     const unknown = await TF2Audio.process(mkBuffer(src, SR), { codec: 'not-a-codec' });

@@ -62,6 +62,7 @@ const els = {
   vadThreshold: document.getElementById('vad_threshold'),
   volume:    document.getElementById('volume'),
   loss:      document.getElementById('loss'),
+  jitter:    document.getElementById('jitter'),
   frameMs:   document.getElementById('frameMs'),
   warble:    document.getElementById('warble_on'),
   cDur:      document.getElementById('c_dur'),
@@ -94,7 +95,6 @@ const state = {
   renderId: 0,           // invalidates cached visualizer images per render
   lastCodecInfo: null,   // codec statistics of the last render (net_graph)
   sourceName: null,      // name of the loaded clip (file or mic)
-  netJitter: 0,          // net_jitter cvar (console-only)
   recorder: null,        // active PCM capture session
   recTick: null,         // recording timer interval
   processing: false,
@@ -324,11 +324,8 @@ const cvars = {
     }
   },
   'net_jitter': {
-    val: 0, help: 'Late-packet crackle % (buffer-starvation pops, 0-50)',
-    action: (v) => {
-      const n = parseFloat(v);
-      if (!isNaN(n)) state.netJitter = Math.min(50, Math.max(0, n));
-    }
+    help: 'Alias of net_fakejitter',
+    action: (v) => { if (v !== undefined) execCommand(`net_fakejitter ${v}`); else execCommand('net_fakejitter'); }
   },
   '+voicerecord': { help: 'Start microphone capture', action: () => startRecord() },
   '-voicerecord': { help: 'Stop microphone capture and mount the clip', action: () => stopRecord() },
@@ -412,7 +409,7 @@ const cvars = {
         logLine('Dev limits removed. God speed.');
       } else {
         els.gain.setAttribute('max', '5.0');
-        els.loss.setAttribute('max', '40');
+        els.loss.setAttribute('max', '60');
         els.voiceScale.setAttribute('max', '2.0');
         logLine('Cheats disabled.');
       }
@@ -500,7 +497,8 @@ const cvars = {
   'dsp_hpf':         { help: 'Optional sender high-pass cutoff (0 = off)', link: 'hp' },
   'dsp_lpf':         { help: 'Optional sender low-pass cutoff (20000 = off)', link: 'lp' },
   'snd_bits':        { help: 'Codec bitrate scale (16 = profile bitrate)', link: 'bits' },
-  'net_fakeloss':    { help: 'Simulated packet loss %',        link: 'loss' },
+  'net_fakeloss':    { help: 'Voice frames lost %, in bursts of ~2.2 frames concealed by Opus (TF2 net_fakeloss 5/10/15 on a listen server lost ~22/45/64%)', link: 'loss' },
+  'net_fakejitter':  { help: 'Network jitter in ms: late voice frames, 3.2% at 50 ms, one in ten played as silence', link: 'jitter' },
   'net_split':       { help: 'Packet grouping in ms (whole 20 ms frames)', link: 'frameMs' },
   'snd_codec':       { help: 'Run the codec (0 = bypass; filters and receiver remain)', link: 'warble_on' },
   'sv_voicecodec':   {
@@ -652,7 +650,7 @@ function updateSignalChain() {
   if (!els.chain) return;
   const codec = CODEC_PROFILES[els.codec.value] || CODEC_PROFILES.steam;
   const num = (el, fallback) => { const v = Number(el.value); return Number.isFinite(v) ? v : fallback; };
-  const gain = num(els.gain, 1), bits = num(els.bits, 16), loss = num(els.loss, 0);
+  const gain = num(els.gain, 1), bits = num(els.bits, 16), loss = num(els.loss, 0), jitter = num(els.jitter, 0);
   const maxGain = num(els.maxGain, VOICE_ENGINE.autoGain.maxGain), volume = num(els.volume, VOICE_ENGINE.volume);
   const codecOn = els.warble.value === '1', agcOn = els.agc.value === '1';
   const gateOn = codecOn && (els.vad.value === 'auto' ? !!codec.senderGate : els.vad.value === '1');
@@ -669,7 +667,7 @@ function updateSignalChain() {
   const steps = [
     ['Capture', `${channelLabel}mic ×${gain.toFixed(1)}${filters.length ? ' · ' + filters.join(' · ') : ''} · ${gateOn ? `gate > ${gateDb} dBFS` : 'no gate'}`, gain > 1 ? 'hot' : ''],
     ['Codec', codecOn ? `Opus ${codec.codecRate / 1000} kHz · ${kbps} kbps · ${mode}` : 'bypassed', codecOn ? '' : 'off'],
-    ['Network', `${packetMs} ms packets · ${loss}% loss`, loss > 0 ? 'hot' : ''],
+    ['Network', `${packetMs} ms packets · ${loss}% lost${jitter > 0 ? ` · ${jitter} ms jitter` : ''}`, loss > 0 || jitter > 0 ? 'hot' : ''],
     ['Receiver', agcOn ? `auto-gain ≤${maxGain}× · int16 clip` : 'unity gain · int16 clip', ''],
     ['Mixer', `44.1 kHz · ${room}`, ''],
     ['Output', `volume ${Math.round(volume * 100)}%`, '']
@@ -718,7 +716,7 @@ function runPreset(name) {
   execCommand('voice_vad_threshold -39.5');
   execCommand(`volume ${VOICE_ENGINE.volume}`);
   execCommand('net_split 20');
-  execCommand('net_jitter 0');
+  execCommand(`net_fakejitter ${p.jitter || 0}`);
   state.sv_cheats = tempCheats;
   setActivePreset(cleanName);
   updateSignalChain();
@@ -800,9 +798,7 @@ const CONFIG_FIELDS = [
   configControl('cdur', els.cDur),
   configControl('cdec', els.cDec),
   configControl('cmix', els.cMix),
-  ['jit', () => String(state.netJitter),
-    (v) => { state.netJitter = Number(v); },
-    (v) => { const n = Number(v); return Number.isFinite(n) ? String(Math.min(50, Math.max(0, n))) : null; }]
+  configControl('jit', els.jitter)
 ];
 
 function collectConfig() {
@@ -1311,7 +1307,7 @@ els.process.addEventListener('click', async () => {
       lossPct:     Number(els.loss.value),
       frameMs:     Number(els.frameMs.value),  // net_split — previously never passed
       enableWarble: els.warble.value === '1',
-      jitterPct:   state.netJitter,
+      jitterMs:    Number(els.jitter.value),
       onProgress:  (p) => {
         const percent = Math.min(100, Math.max(0, Math.round(p * 100)));
         els.process.textContent = `Processing… ${percent}%`;
@@ -1333,6 +1329,9 @@ els.process.addEventListener('click', async () => {
     if (realOpus && codecInfo.gate != null) {
       const held = codecInfo.frames ? Math.round(100 * codecInfo.gatedFrames / codecInfo.frames) : 0;
       logLine(`S_Voice: voice gate at ${codecInfo.gate} dBFS held back ${codecInfo.gatedFrames} of ${codecInfo.frames} frames (${held}%)`, 'sys');
+    }
+    if (realOpus && (codecInfo.lostFrames || codecInfo.underrunFrames)) {
+      logLine(`S_Voice: ${codecInfo.lostFrames} frames lost and concealed, ${codecInfo.underrunFrames || 0} late frames played as silence`, 'sys');
     }
     logLine(`S_Voice: receiver auto-gain ${codecInfo.autoGain ? 'on' : 'off'} at ${codecInfo.voiceRate} Hz`, 'sys');
 
@@ -1822,7 +1821,7 @@ function updateNetGraph() {
   if (els.ng.style.display === 'block') {
     const fps = Math.round(frameCount * 1000 / (now - lastTime));
     els.ngFps.textContent = fps;
-    els.ngPing.textContent = 5 + Math.floor(Math.random() * 4 + state.netJitter / 5 * Math.random());
+    els.ngPing.textContent = 5 + Math.floor(Math.random() * 4 + Number(els.jitter.value) / 5 * Math.random());
     els.ngLerp.textContent = '100.0';
     const info = state.lastCodecInfo;
     if (info && info.frames) {
@@ -1833,7 +1832,7 @@ function updateNetGraph() {
       const kps = (info.encodedBytes / seconds / 1024).toFixed(2);
       els.ngIn.textContent = `${pps} ${kps}`;
       els.ngOut.textContent = `${pps} ${kps}`;
-      els.ngLoss.textContent = sent ? Math.round(100 * info.lostFrames / sent) : 0;
+      els.ngLoss.textContent = sent ? Math.round(100 * (info.lostFrames + (info.underrunFrames || 0)) / sent) : 0;
     } else {
       els.ngIn.textContent = '0 0.00';
       els.ngOut.textContent = '0 0.00';

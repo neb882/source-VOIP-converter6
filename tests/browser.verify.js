@@ -180,7 +180,7 @@ async function main() {
     console.log('\n[Browser 2] Accessibility, disclosure, and safe console');
     const controlIds = ['codec', 'listener_position', 'gain', 'voice_scale', 'hp', 'lp', 'env',
       'c_dur', 'c_dec', 'c_mix', 'agc', 'maxgain', 'avggain', 'volume', 'bits', 'frameMs', 'loss', 'warble_on',
-      'capture_channel', 'vad', 'vad_threshold'];
+      'capture_channel', 'vad', 'vad_threshold', 'jitter'];
     const unlabeled = await page.evaluate((ids) => ids.filter((id) => {
       const element = document.getElementById(id);
       return !element || !element.labels || element.labels.length === 0;
@@ -249,11 +249,14 @@ async function main() {
     await page.locator('#viz-wave').click();
     await page.locator('#loss').fill('12');
     await page.locator('#loss').dispatchEvent('change');
-    check((await page.locator('#signal-chain').textContent()).includes('12% loss'), 'signal chain follows control edits');
+    check((await page.locator('#signal-chain').textContent()).includes('12% lost'), 'signal chain follows control edits');
     check(await page.locator('.preset-row .preset-btn[aria-pressed="true"]').count() === 0, 'a hand-edited control clears the active preset');
     await page.getByRole('button', { name: 'Laggy 18% Loss', exact: true }).click();
     check(await page.locator('.preset-btn[data-preset="laggy"]').getAttribute('aria-pressed') === 'true'
-      && (await page.locator('#signal-chain').textContent()).includes('18% loss'), 'preset highlights itself and updates the chain');
+      && (await page.locator('#signal-chain').textContent()).includes('18% lost · 50 ms jitter')
+      && await page.locator('#jitter').inputValue() === '50', 'preset highlights itself and updates the chain, including jitter');
+    await page.getByRole('button', { name: 'Modern (Steam Voice)', exact: true }).click();
+    check(await page.locator('#jitter').inputValue() === '0', 'presets reset jitter');
     await page.getByRole('button', { name: 'Modern (Steam Voice)', exact: true }).click();
     await page.locator('#console-input').fill('net_g');
     await page.locator('#console-input').press('Tab');
@@ -347,7 +350,7 @@ async function main() {
       'worker replacement preserves the loaded audio without reloading');
     check(afterUpdate.processEnabled, 'worker replacement leaves Process Audio enabled');
     check(afterUpdate.keys.includes('unrelated-test-cache'), 'activation preserves unrelated origin caches');
-    check(afterUpdate.keys.includes('tf2ve-v8'), 'current app shell cache is populated');
+    check(afterUpdate.keys.includes('tf2ve-v9'), 'current app shell cache is populated');
     // Restore the normal registration while still online. Otherwise reloading
     // registers sw.js again and races another replacement against file loading.
     await activateServiceWorker(page, 'sw.js');

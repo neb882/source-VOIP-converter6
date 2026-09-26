@@ -203,6 +203,8 @@ const TF2_DATA = {
  * hp 0 / lp 20000 leave the optional sender filters off: the measured TF2
  * path has no capture EQ beyond Opus's own voice high-pass and band edge.
  * gain > 1 overdrives the sender's int16 capture before encoding.
+ * loss is the % of voice frames lost (net_fakeloss), jitter is net_fakejitter in ms;
+ * omitted = 0.
  * ------------------------------------------------------------------------- */
 const PRESETS = {
   // Measured baseline: Steam voice as recorded with voice_loopback in 2026.
@@ -213,8 +215,8 @@ const PRESETS = {
   spam:    { codec: 'steam',   position: 'tunnel', hp: 0, lp: 20000, voice_scale: 1.0, gain: 3.0, loss: 0  },
   // 2fort sewers micspam classic
   sewers:  { codec: 'steam',   position: 'water',  hp: 0, lp: 20000, voice_scale: 1.0, gain: 2.0, loss: 0  },
-  // Terrible connection
-  laggy:   { codec: 'steam',   position: 'open',   hp: 0, lp: 20000, voice_scale: 1.0, gain: 1.0, loss: 18 }
+  // Bad connection: 18% of voice frames lost in bursts, plus 50 ms jitter.
+  laggy:   { codec: 'steam',   position: 'open',   hp: 0, lp: 20000, voice_scale: 1.0, gain: 1.0, loss: 18, jitter: 50 }
 };
 
 /* -------------------------------------------------------------------------
@@ -294,12 +296,19 @@ const CODEC_PROFILES = {
  *   outputFir : gentle post-mixer rolloff measured above 12 kHz
  *   volume    : output level. The recordings' ceiling (-16.5 dBFS) is the
  *               owner's `volume 0.15`, so this is a setting, not a fit.
+ *   network   : packet loss and jitter, measured with net_fakeloss /
+ *               net_fakelag / net_fakejitter takes of the network test signal.
+ *               Lost 20 ms voice frames come in bursts of 2.2 on average and
+ *               are concealed by Opus. Jitter adds late frames (3.2% of frames
+ *               at net_fakejitter 50, scaled linearly), one in ten of which
+ *               plays as silence instead of concealment.
  * ------------------------------------------------------------------------- */
 const VOICE_ENGINE = {
   mixRate: 44100,
   autoGain: { blockSize: 128, avgGain: 0.5, maxGain: 10 },
   outputFir: [0.1, 0.8, 0.1],
-  volume: 0.5
+  volume: 0.5,
+  network: { burstMeanFrames: 2.2, lateFramesAt50ms: 0.032, underrunShare: 0.1 }
 };
 
 /* -------------------------------------------------------------------------

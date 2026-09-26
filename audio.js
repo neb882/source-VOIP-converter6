@@ -3,7 +3,8 @@
  * Sender:   mono capture (left channel by default) -> capture gain / int16
  *           clip -> resample to the codec rate -> optional capture filters
  *           -> Steam voice gate -> real libopus encode
- * Network:  20 ms packets grouped by net_split, seeded burst loss
+ * Network:  20 ms packets grouped by net_split; measured burst loss and
+ *           late (jittered) frames, seeded
  * Receiver: libopus decode + native concealment -> profile EQ -> engine
  *           voice rate -> Source-style auto-gain with int16 clamp -> 44.1 kHz
  *           mixer (room DSP) -> output stage -> output rate
@@ -359,50 +360,44 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Network: bursty packet loss (Gilbert-Elliott two-state model)       */
-  /* Real loss is bursty — a bad stretch kills several consecutive       */
-  /* packets, each packet carrying one or more codec frames.             */
+  /* Network: packet loss and jitter, measured in TF2                   */
+  /*                                                                    */
+  /* Loss is a two-state (Gilbert-Elliott) process over packets whose   */
+  /* stationary rate is lossPct of voice frames and whose bursts last    */
+  /* 2.2 frames on average, which reproduces the event rate, burst       */
+  /* sizes and lost share of the 2026 net_fakeloss takes. The decoder    */
+  /* conceals lost frames (mask 1). Jitter makes frames arrive too late: */
+  /* 3.2% of frames at net_fakejitter 50, scaled linearly; one in ten    */
+  /* plays as silence (mask 2) instead of being concealed. Packets group */
+  /* net_split frames. See tests/REFERENCE_2026.md.                      */
   /* ------------------------------------------------------------------ */
 
-  function buildLossMask(nFrames, framesPerPacket, lossPct, rand) {
+  function buildLossMask(nFrames, framesPerPacket, lossPct, rand, jitterMs = 0) {
     nFrames = Math.max(0, Math.floor(finiteOr(nFrames, 0)));
     framesPerPacket = Math.max(1, Math.round(finiteOr(framesPerPacket, 1)));
     rand = typeof rand === 'function' ? rand : mulberry32(0xC0FFEE);
+    const net = VOICE_ENGINE.network;
     const p = clamp(finiteOr(lossPct, 0) / 100, 0, 1);
-    if (p <= 0 || nFrames <= 0) return null;
+    const late = clamp(net.lateFramesAt50ms * finiteOr(jitterMs, 0) / 50, 0, 0.5);
+    if ((p <= 0 && late <= 0) || nFrames <= 0) return null;
     const mask = new Uint8Array(nFrames);
     if (p >= 1) { mask.fill(1); return mask; }
-    const meanBurst = 2.2;                       // packets per loss burst (avg)
-    // At high loss rates, increase burst length instead of clipping the
-    // requested stationary loss probability to ~68%.
-    const pBG = Math.min(1 / meanBurst, 0.98 * (1 - p) / p);
-    const pGB = pBG * p / (1 - p);
+    // Mean burst in packets; at high loss, lengthen bursts rather than cap the rate.
+    const meanBurst = Math.max(1, net.burstMeanFrames / framesPerPacket);
+    const pBG = p > 0 ? Math.min(1 / meanBurst, 0.98 * (1 - p) / p) : 1;
+    const pGB = p > 0 ? pBG * p / (1 - p) : 0;
     let bad = rand() < p;
     for (let f = 0; f < nFrames; f += framesPerPacket) {
-      if (bad) {
-        for (let i = f; i < Math.min(f + framesPerPacket, nFrames); i++) mask[i] = 1;
+      const end = Math.min(f + framesPerPacket, nFrames);
+      if (bad) mask.fill(1, f, end);
+      else if (late > 0) {
+        for (let i = f; i < end; i++) {
+          if (rand() < late) mask[i] = rand() < net.underrunShare ? 2 : 1;
+        }
       }
       bad = bad ? (rand() >= pBG) : (rand() < pGB);
     }
     return mask;
-  }
-
-  /* Late-packet "crackle": when the jitter buffer starves, playback emits
-   * short hard gaps (1-3 ms) at packet boundaries. An artistic effect, not
-   * a jitter-buffer simulation. Deterministic via the seeded PRNG.        */
-  function applyJitterCrackle(samples, rate, packetSamples, pct, rand) {
-    if (!(pct > 0) || !samples.length) return samples;
-    const rnd = rand || Math.random;
-    const out = samples.slice(0);
-    const step = Math.max(32, packetSamples | 0);
-    for (let off = 0; off < out.length; off += step) {
-      if (rnd() * 100 < pct) {
-        const gap = Math.round((1 + rnd() * 2) * rate / 1000);   // 1-3 ms
-        const end = Math.min(off + gap, out.length);
-        for (let i = off; i < end; i++) out[i] = 0;
-      }
-    }
-    return out;
   }
 
   // The same pinned codec runs in browsers, workers, and the Node tests.
@@ -689,9 +684,9 @@
    *   hp / lp:      optional sender filters in Hz (off: hp <= 10,
    *                 lp >= 0.45 x codec rate)                           [off]
    *   bits:         bitrate scale; 16 = profile bitrate                 [16]
-   *   lossPct:      simulated packet loss %                             [0]
+   *   lossPct:      % of voice frames lost, in bursts of ~2.2 frames     [0]
    *   frameMs:      net_split packet duration (whole 20 ms frames)      [20]
-   *   jitterPct:    net_jitter crackle % (artistic)                     [0]
+   *   jitterMs:     net_fakejitter in ms: late frames, measured          [0]
    *   enableWarble: false bypasses the codec (filters/engine remain)    [true]
    *   gate:         Steam sender voice gate; null = profile default     [null]
    *   gateThresholdDb: gate opening level, frame RMS in dBFS [profile/-39.5]
@@ -724,7 +719,7 @@
     const lp           = clamp(finiteOr(opts.lp, codecRate / 2), 100, codecRate / 2);
     const bits         = clamp(finiteOr(opts.bits, 16), 2, 32);
     const lossPct      = clamp(finiteOr(opts.lossPct, 0), 0, 100);
-    const jitterPct    = clamp(finiteOr(opts.jitterPct, 0), 0, 100);
+    const jitterMs     = clamp(finiteOr(opts.jitterMs, 0), 0, 500);
     const enableCodec  = opts.enableWarble !== false;
     const autoGain     = opts.agc !== false;
     const captureChannel = ['left', 'right', 'mix'].includes(opts.captureChannel) ? opts.captureChannel : 'left';
@@ -773,7 +768,7 @@
       const result = await opus.roundTrip(samples, codecRate, bitrate, {
         application: codec.application, signal: codec.signal,
         gate: gateOn ? { thresholdDb: gateDb, holdFrames: Math.round(gateSpec.holdMs / frameMs) } : null,
-        makeLossMask: count => buildLossMask(count, framesPerPacket, lossPct, rand),
+        makeLossMask: count => buildLossMask(count, framesPerPacket, lossPct, rand, jitterMs),
         yieldControl: microYield,
         onProgress: f => report(0.2 + 0.5 * f)
       });
@@ -781,9 +776,6 @@
       codecInfo = { ...result.info, framesPerPacket };
       const eq = profileEq(codec);
       if (eq) samples = applyFirZeroPhase(samples, eq);
-    }
-    if (jitterPct > 0) {
-      samples = applyJitterCrackle(samples, codecRate, codecRate / 50 * framesPerPacket, jitterPct, rand);
     }
     report(0.72);
     await microYield();
@@ -886,7 +878,6 @@
     mulberry32,
     buildLossMask,
     runDspChain,
-    applyJitterCrackle,
     realOpusRoundTrip
   };
 
