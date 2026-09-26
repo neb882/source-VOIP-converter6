@@ -106,7 +106,7 @@ The paired tool locates each source in a recording, corrects clock drift and fra
 pnpm compare:reference "path/to/loopback.mp3" "path/to/source-one.mp3" "path/to/source-two.mp3"
 ```
 
-None of the recordings or music files is distributed here. The synthetic test signal is: `python3 tests/testsignal/make_testsignal.py` (needs numpy and scipy) rebuilds it bit for bit, with a segment map. The recording steps are in [tests/REFERENCE_2026.md](tests/REFERENCE_2026.md#reproduce).
+None of the recordings or music files is distributed here. The synthetic test signals are: [tests/testsignal/](tests/testsignal/) rebuilds them bit for bit (numpy and scipy), with segment maps and recording steps. `make_testsignal.py` covers the receiver, and `make_nettest.py` is a one-minute signal for packet-loss and jitter takes.
 
 ## Tests
 

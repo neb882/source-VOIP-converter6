@@ -183,7 +183,7 @@ Set B is lossless and matches the model's clip statistics directly. The previous
 - **Stereo capture.** Finding 6 is one capture chain (a stereo virtual cable). A physical microphone is mono either way.
 - **Output stage.** The small post-clip roll-off may come from the recording chain rather than the game.
 - **Legacy profiles and rooms.** Speex and CELT stand-ins, and room presets, are not validated against recordings.
-- **Network loss.** Real network loss was not recorded.
+- **Network loss.** Real network loss was not recorded. The one-minute signal in [`tests/testsignal/`](testsignal/README.md#network-takes-tf2_voice_nettest_v1) is set up for loss and jitter takes.
 
 ## Reproduce
 
