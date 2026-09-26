@@ -40,7 +40,7 @@ The test signal (`tf2_voice_testsignal_v1.wav`, 142.9 s, SHA-256 `efd1c0bc…75e
 - quiet noise
 - sync beeps
 
-Every segment's exact position is in [`tf2_voice_testsignal_v1.json`](testsignal/tf2_voice_testsignal_v1.json). The owner's console showed `volume 0.15`, `voice_maxgain 10` and `voice_scale 1`. They recorded the game output with OBS and exported lossless FLAC (48 kHz, 24-bit).
+Every segment's exact position is in [`tf2_voice_testsignal_v1.json`](testsignal/tf2_voice_testsignal_v1.json). The owner's console showed `volume 0.15`, `voice_maxgain 10` and `voice_scale 1`. After a fresh game start it also reported `voice_avggain 0.5`. They recorded the game output with OBS and exported lossless FLAC (48 kHz, 24-bit).
 
 | Take | Setting changed from default | Duration | SHA-256 (FLAC) |
 | --- | --- | --- | --- |
@@ -91,7 +91,7 @@ The engine's voice-channel auto-gain (`voice.cpp`, not in the public Source SDK 
 T = min(voice_maxgain, 32767 / (mean|x| + voice_avggain * (peak|x| - mean|x|)))
 ```
 
-`voice_avggain` 0 would drive the block mean to full scale, and 1 the block peak. The takes pin the law down in three ways:
+`voice_avggain` 0 would drive the block mean to full scale, and 1 the block peak. The game's default is 0.5: the console reports it, and the default take fits it. The takes pin the law down in three ways:
 - **Sine overdrive.** A steady sine has mean/peak = 2/π, so the default blend overdrives it by 1/(2/π + 0.5 (1 − 2/π)) = 1.22×. Every sine from −18 to −1 dBFS came out identical: −2.1 dB RMS with 42% of samples at the clamp. The law predicts 41.7%. At `voice_avggain 0.25` the overdrive is 1.37×: predicted and measured 50%.
 - **Noise level.** Pink noise has a much lower mean/peak ratio, so it comes out lower (−5.3 dB, 10% clipped) with no separate noise parameter.
 - **The cap.** A −24 dBFS sine gets exactly 20 dB (`voice_maxgain 10`), where the law would ask for more.
@@ -180,7 +180,6 @@ Set B is lossless and matches the model's clip statistics directly. The previous
 - **Steady tones.** The real gate also closes on steady tones after a while. A −36 dBFS sine closes after 0.4 s, −30 dBFS after about 1.1 s, and −24 dBFS near 2 s. Noise and sweeps at similar levels stay open. The modeled gate has no such adaptation; a floor-tracking version fitted the tones but closed wrongly on steady noise.
 - **Talk-spurt timing.** The receiver's per-spurt delay changes (±100 ms) are not modeled. Renders keep the source timeline.
 - **High-band pure tones and the sweep's top octave.** The real encoder attenuates them more than libopus 1.6.1 (finding 2). This is attributed to a different libopus build in Steam, which is not confirmed.
-- **Default `voice_avggain`.** The default take fits 0.5, the value from the leaked engine source. The owner should confirm what the console reports.
 - **Stereo capture.** Finding 6 is one capture chain (a stereo virtual cable). A physical microphone is mono either way.
 - **Output stage.** The small post-clip roll-off may come from the recording chain rather than the game.
 - **Legacy profiles and rooms.** Speex and CELT stand-ins, and room presets, are not validated against recordings.
