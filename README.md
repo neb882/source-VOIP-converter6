@@ -142,7 +142,7 @@ A Δ row gives wet minus dry. Values are measured as one channel; played as dual
 
 **Shortcuts:** Space plays and pauses, B switches A/B.
 
-The meter shows a real codec property. When DTX replaces a steady tone below about 60 Hz, libopus 1.1.x's comfort noise is nearly DC. See finding 18 in [REFERENCE_2026.md](tests/REFERENCE_2026.md).
+The meter shows a real codec property. When DTX replaces a steady tone below about 60 Hz, libopus 1.1.x's comfort noise is nearly DC, and TF2 plays it as is. See finding 18 in [REFERENCE_2026.md](tests/REFERENCE_2026.md).
 
 ## Reference recordings
 

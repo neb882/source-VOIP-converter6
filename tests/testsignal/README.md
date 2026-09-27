@@ -85,3 +85,5 @@ Extra care, because this test is about the lowest frequencies and the mean level
 - Pick a quiet spot on the map, as before. Game sounds barely affect a mean level, but less is better.
 
 If the game keeps the offset, the default take's steady 50 Hz tones look visibly lifted off the centre line in an editor, and the louder 30 Hz tones visibly lowered. If it removes the offset, every segment stays centred.
+
+The takes in Set F of [REFERENCE_2026.md](../REFERENCE_2026.md) answered it: TF2 keeps the offset (finding 18). The model predicts when it starts and how often it changes. The sign of each stretch is random.
