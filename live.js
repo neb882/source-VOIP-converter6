@@ -10,7 +10,7 @@
  * applies inside). Low latency drops the gate's 120 ms pre-roll. Record keeps
  * the microphone and the voice and loads them into the app as a dry/wet
  * pair (mountLiveTake).
- * Needs script.js (state, els, renderOptions, logLine, mountLiveTake).
+ * Needs the app/ page scripts (state, els, renderOptions, logLine, mountLiveTake).
  */
 (function () {
   'use strict';

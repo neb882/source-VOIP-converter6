@@ -370,17 +370,17 @@ Music with held sub-bass is where it would show. The app's meter reports it.
 
 ### 19. The receiver starts some talk spurts early, closing the silence before them
 
-The accuracy suite ([`tests/accuracy.mjs`](accuracy.mjs)) lines every take up with the app's render talk spurt by talk spurt and records each spurt's delay. Over the 13 takes without simulated loss there are 149 transitions from one spurt to the next:
+The accuracy suite ([`tests/accuracy.mjs`](accuracy.mjs)) lines every take up with the app's render talk spurt by talk spurt and records each spurt's delay. Over the 13 takes without simulated loss there are 146 transitions from one spurt to the next:
 
-- **Most keep the delay.** 96 (64%) change it by less than 40 ms (median 10 ms).
-- **Early starts.** 26 spurts start 80–350 ms early, most by 280–350 ms.
-  - 22 of them follow a silence of at most 0.45 s in the gate model.
-  - The early start takes up most of that silence: 0–130 ms of it is left in 21 of the 26.
-  - The next spurt goes back to the usual delay in 19 of the 26.
-- **Rate.** After a silence of at most 0.45 s, not directly after an early start, 21 of 50 spurts (42%) start early. It varies from take to take (1 of 9 for listener B, 4 of 4 in two takes), and the same test signal gets different spurts moved in different takes. Which spurt moves is not predictable from the signal.
-- **Inside a spurt**, the delay steps by a few milliseconds (57 steps of 4–20 ms, a few up to 68 ms, over 25 minutes of talk spurts). These include the 5.8 ms latency trims of finding 10.
+- **Most keep the delay.** 94 (64%) change it by less than 40 ms (median 9 ms).
+- **Early starts.** 25 spurts start 80–350 ms early, most by 280–350 ms.
+  - 23 of them follow a silence of at most 0.45 s in the gate model.
+  - The early start takes up most of that silence: 0–130 ms of it is left in 21 of the 25.
+  - The next spurt goes back to the usual delay in 19 of the 25.
+- **Rate.** After a silence of at most 0.45 s, not directly after an early start, 21 of 51 spurts (41%) start early. It varies from take to take (1 of 9 for listener B, 4 of 4 in two takes), and the same test signal gets different spurts moved in different takes. Which spurt moves is not predictable from the signal.
+- **Inside a spurt**, the delay steps by a few milliseconds (57 steps of 4–20 ms, a few up to 68 ms, over 24 minutes of talk spurts). These include the 5.8 ms latency trims of finding 10.
 
-The render keeps the source's timeline by default, so the dry/wet A/B and the real-take check line up. **Talk-spurt timing → TF2 re-timing** (`voice_retime 1`) applies this finding: after a silence of up to 0.45 s, a spurt starts early with probability 0.42, by the silence less a random 0–130 ms (at most 350 ms), and the spurt after it keeps its time. It is seeded like the loss model.
+The render keeps the source's timeline by default, so the dry/wet A/B and the real-take check line up. **Talk-spurt timing → TF2 re-timing** (`voice_retime 1`) applies this finding: after a silence of up to 0.45 s, a spurt starts early with probability 0.41, by the silence less a random 0–130 ms (at most 350 ms), and the spurt after it keeps its time. It is seeded like the loss model.
 
 ### 20. The Steam render's low frequencies lead the source by Opus's own phase
 
@@ -452,6 +452,30 @@ A pure sine's codec noise moves by about 2 dB with where the 20 ms frames fall o
   - From 12 to 16 kHz: 0.8–1.0 dB low. From 16 to 19 kHz: within 2.5 dB.
 - **Clip statistics:** higher than the MP3 shows (16–19% against 13%), as finding 7 predicts.
 - **Receiver auto-gain off:** misses by 3–4 dB in level tracking and 20–60 dB above 12 kHz.
+
+**Every take (accuracy suite).** `pnpm accuracy --takes <folder>` renders each source with the take's settings (`tests/accuracy.takes.json`), lines the take up talk spurt by talk spurt against the render and compares them where they overlap. Level is the RMS difference of 0.5 s blocks more than 10 dB above the take's ambience, after removing their median offset; the band column is the largest level-matched difference from 80 Hz to 12 kHz.
+
+| Take | Settings | Level, dB rms (r) | Largest band difference | Samples at the clamp, take / render |
+| --- | --- | ---: | --- | ---: |
+| Set B default | `volume 0.15` | 1.45 (0.95) | +2.6 dB at 10–11 kHz | 9.4 / 9.6% |
+| Set B `voice_scale 0.5` | | 0.27 (0.99) | +1.0 dB at 11–12 kHz | 0.6 / 0.6% |
+| Set B `voice_maxgain 1` | | 0.15 (1.00) | −1.9 dB at 80–120 Hz | 0.6 / 0.5% |
+| Set B `voice_avggain 0.25` | | 1.07 (0.97) | +1.0 dB at 11–12 kHz | 11.1 / 11.5% |
+| Set B speech | | 0.96 (0.99) | −0.2 dB at 10–11 kHz | 7.0 / 7.4% |
+| Set C baseline | | 0.39 (1.00) | −0.2 dB at 80–120 Hz | 1.1 / 2.3% |
+| Set D sender A | | 0.15 (1.00) | +2.3 dB at 11–12 kHz | 7.6 / 9.6% |
+| Set D listener B | `volume 0.077` | 0.87 (0.84) | +3.3 dB at 11–12 kHz | 1.2 / 9.6% |
+| Set E River clip | `volume 0.15` | 0.21 (0.98) | +0.2 dB at 80–120 Hz | 12.9 / 15.0% |
+| Set F low tones, default | | 3.54 (0.82) | −1.3 dB at 0.5–1 kHz | 14.1 / 14.3% |
+| Set F low tones, `voice_maxgain 1` | | 3.89 (0.56) | −15 dB at 11–12 kHz | 0.7 / 0.6% |
+| Set A River | | 0.10 (0.99) | −0.3 dB at 10–11 kHz | 13.7 / 16.2% (MP3) |
+| Set A Take It Off | | 0.07 (1.00) | −0.2 dB at 10–11 kHz | 12.6 / 18.1% (MP3) |
+
+- **Residuals.** The largest block differences in the default and `voice_avggain 0.25` takes are the ones findings 13 and 14 describe: the −36 dBFS sine near the game's ambience, hold tails, and the 10–12 kHz tones Steam puts into DTX more often.
+- **Low tones.** The Set F takes differ block by block because their comfort-noise plateaus are random in both (finding 18); the 11–12 kHz band of the `voice_maxgain 1` take is ambience against near silence.
+- **Listener B.** Its levels match at `volume 0.077`, but its peaks reach −19.7 dBFS, 2.5 dB above the model's clamp for that volume, and only 1.2% of samples sit at them. The second PC's output path differs somewhere after the voice clamp; it is not explained yet.
+- **Set C with loss and jitter** is compared by its statistics above (Set C), not block by block: TF2's and the app's lost frames are different random frames.
+- **Clock.** Every take runs about 400 ppm slow against the source (the recorder's clock against the game's; 505 ppm for one take).
 
 ## What remains unverified
 

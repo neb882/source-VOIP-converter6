@@ -297,7 +297,7 @@ These tests establish implementation behavior; the accuracy claims rest on the p
 | `audio-worker.js` | cancellable background rendering, format conversion and metering |
 | `mic-capture.js` | PCM recording |
 | `constants.js` | presets, codec profiles, receiver model, room data |
-| `script.js` | interface, visualizer, meter and console |
+| `app/` | the interface, in load order: `core.js` (elements, state, event feed), `console.js`, `source.js` (file, video and microphone), `render.js` (rendering, downloads, A/B), `meter.js`, `realtake.js`, `visualizer.js`, `netgraph.js`, `boot.js` |
 | `batch.js` | batch queue, drag and drop, ZIP downloads |
 | `formats.js`, `flac.js`, `zip.js` | download formats: WAV reader, FLAC encoder, stored ZIP |
 | `meter.js` | loudness and level measurement |

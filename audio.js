@@ -375,11 +375,11 @@
   /* ------------------------------------------------------------------ */
 
   // TF2's receiver re-timing of talk spurts (tests/REFERENCE_2026.md,
-  // finding 19): after a silence of up to 0.45 s, 42% of spurts play early,
+  // finding 19): after a silence of up to 0.45 s, 41% of spurts play early,
   // by the silence less 0-130 ms (at most 350 ms); the spurt after keeps its
   // time. Moves the decoded audio (codec rate) and the frame log in place;
   // returns the moves as { time, shiftMs }.
-  const RETIME = { maxGap: 0.45, chance: 0.42, leftMax: 0.13, maxShift: 0.35 };
+  const RETIME = { maxGap: 0.45, chance: 0.41, leftMax: 0.13, maxShift: 0.35 };
   function retimeSpurts(samples, info, rate, rand) {
     const log = info.frameLog, size = info.frameSamples, lookahead = info.lookahead || 0;
     if (!log || !size) return [];

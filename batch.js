@@ -10,7 +10,7 @@
  * from it when saved. A render made with settings that have since changed is
  * marked, and "Render" redoes it.
  *
- * Depends on script.js: els, state, LS, renderOptions, captureSource,
+ * Depends on the app/ page scripts: els, state, LS, renderOptions, captureSource,
  * startWorkerJob, canUseWorker, exportWav, cachedExport, currentFormat,
  * outputName, saveBlob, loadSourceFile, logLine, MAX_FILE_BYTES,
  * MAX_AUDIO_SECONDS; and on TF2Audio, TF2Formats, TF2Zip.
