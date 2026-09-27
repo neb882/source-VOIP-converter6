@@ -455,18 +455,35 @@ async function verifyLiveMonitor(page) {
   await page.waitForTimeout(3000);
   await page.locator('#live-record').click();
   await page.waitForFunction(() => state.sourceName && state.sourceName.startsWith('live-') && state.processedBuffer, null, { timeout: 20000 });
+  // The live chain and a render of the same microphone audio cut it into
+  // frames at different points, and the fake microphone beeps about as often
+  // as the gate's hold, so they can differ on whether two beeps are one talk
+  // spurt; their correlation varies from run to run (0.5-0.85). Timing does
+  // not: the cross-correlation peaks within 0.1 ms of zero lag (1-2 samples
+  // at 44.1 kHz; a recording 1 ms off peaks at 45).
   const take = await page.evaluate(async () => {
     const dry = state.decodedSource.getChannelData(0), wet = state.processedBuffer, rate = state.processedRate;
     const render = (await TF2Audio.process(state.decodedSource, renderOptions())).samples;
-    let dot = 0, ea = 0, eb = 0;
-    for (let i = Math.round(rate * .4); i < Math.min(wet.length, render.length) - rate * .2; i++) { dot += render[i] * wet[i]; ea += render[i] ** 2; eb += wet[i] ** 2; }
-    return { seconds: dry.length / rate, same: dry.length === wet.length, r: ea > 0 && eb > 0 ? dot / Math.sqrt(ea * eb) : 0,
+    const from = Math.round(rate * .4), to = Math.min(wet.length, render.length) - Math.round(rate * .2);
+    let size = 1;
+    while (size < 2 * (to - from)) size *= 2;
+    const ar = new Float64Array(size), ai = new Float64Array(size), br = new Float64Array(size), bi = new Float64Array(size);
+    let ea = 0, eb = 0;
+    for (let i = from; i < to; i++) { ar[i - from] = render[i]; br[i - from] = wet[i]; ea += render[i] ** 2; eb += wet[i] ** 2; }
+    TF2Reference.fft(ar, ai); TF2Reference.fft(br, bi);
+    for (let k = 0; k < size; k++) { const re = br[k] * ar[k] + bi[k] * ai[k], im = bi[k] * ar[k] - br[k] * ai[k]; br[k] = re; bi[k] = im; }
+    TF2Reference.fft(br, bi, true);
+    // Wet lagging the render by `lag` samples, within 300 ms either way.
+    let lag = 0;
+    for (let d = -Math.round(rate * .3); d <= Math.round(rate * .3); d++) if (br[(d + size) % size] > br[(lag + size) % size]) lag = d;
+    return { seconds: dry.length / rate, same: dry.length === wet.length, lag, rate, r: ea > 0 && eb > 0 ? br[(lag + size) % size] / Math.sqrt(ea * eb) : 0,
       lane: !!(state.lastCodecInfo && state.lastCodecInfo.frameLog && state.lastCodecInfo.frameLog.some(c => c > 0)),
       ab: !els.abToggle.disabled };
   });
   check(take.seconds > 2 && take.same && take.ab && take.lane,
     'Record loads the live session into the app as a dry/wet pair with its codec lane', `${take.seconds.toFixed(1)} s`);
-  check(take.r > 0.8, 'the recorded voice lines up with an offline render of the recorded microphone', `r ${take.r.toFixed(3)}`);
+  check(Math.abs(take.lag) <= take.rate * 1e-4 && take.r > 0.3, 'the recorded voice lines up with an offline render of the recorded microphone',
+    `peak at ${take.lag} samples, r ${take.r.toFixed(3)}`);
   await page.locator('#live-toggle').click();
   await page.waitForFunction(() => !TF2Live.running);
   check(await page.locator('#live-toggle').getAttribute('aria-pressed') === 'false', 'the live monitor stops');
