@@ -63,11 +63,12 @@ function encoderSettings(sampleRate, bitrate, options) {
 export async function createVoiceStream(sampleRate, bitrate, options = {}) {
   const encoderOptions = encoderSettings(sampleRate, bitrate, options);
   const { frameSize } = encoderOptions;
-  const { createEncoder, createDecoder } = await runtime(options.runtime ?? '1.6.1');
+  const { createEncoder, createDecoder, loadLibopus } = await runtime(options.runtime ?? '1.6.1');
   let encoder = await createEncoder(encoderOptions);
   let decoder = await createDecoder({ sampleRate, channels: 1 });
   return {
     frameSize,
+    version: (await loadLibopus()).version,
     lookahead: encoder.getLookahead(),
     async restart() {
       encoder.free(); decoder.free();

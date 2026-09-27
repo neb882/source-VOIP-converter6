@@ -1445,7 +1445,10 @@ function presentRender({ samples, sampleRate, blob, realOpus, codecInfo, stats }
   // A re-render of the same source keeps the view, band and selection.
   refreshVisualizer();
   updateMeter();
-  updateReferenceReport();
+  // A loaded take lines up better against the render than against the
+  // source (comfort noise, low tones); re-align it when the render allows.
+  if (referenceDecoded && renderGuide()) alignReferenceTake();
+  else updateReferenceReport();
   const method = realOpus ? `Real Opus · ${codecInfo.bitrate / 1000} kbps` : 'Codec bypassed';
   setStatus(`Ready · ${method} · ${(took / 1000).toFixed(1)}s render · ${sampleRate.toLocaleString()} Hz`, 'success');
   logLine(`ChangeLevel: rendered ${samples.length} samples @ ${sampleRate}Hz in ${took}ms`, 'sys');
@@ -1825,10 +1828,10 @@ function takeChannel(decoded, channel) {
   return decoded.getChannelData(channel === 'right' ? 1 : 0).slice();
 }
 
-// Where the gate model puts talk spurts, for track(): the current profile
-// and settings, as the render would use them.
-function takeTrackOptions() {
-  const o = renderOptions(), profile = CODEC_PROFILES[o.codec] || CODEC_PROFILES.steam;
+// Where the gate model puts talk spurts, for track(): the profile and
+// settings the render uses (the current ones by default).
+function takeTrackOptions(o = renderOptions()) {
+  const profile = CODEC_PROFILES[o.codec] || CODEC_PROFILES.steam;
   const on = o.enableWarble !== false && (o.gate == null ? !!profile.senderGate : o.gate);
   if (!on) return {};
   const spec = profile.senderGate || { thresholdDb: -39.5, prerollMs: 120, holdMs: 440 };
@@ -1836,12 +1839,24 @@ function takeTrackOptions() {
     prerollMs: spec.prerollMs, holdMs: spec.holdMs }, micGain: o.micGain };
 }
 
+// The render the take is lined up against (track()'s options.reference):
+// the current one, unless it has random loss or jitter, whose concealment
+// the take does not share.
+function renderGuide() {
+  const info = state.lastCodecInfo;
+  if (!state.processedBuffer || !info || info.lostFrames || info.underrunFrames) return null;
+  return { samples: state.processedBuffer, rate: state.processedRate, frames: info.frameLog || null };
+}
+
 // The search and the warp, in a worker when there is one. The aligned take
 // keeps the take's sample rate and runs the length of the source.
 function locateTake(take, takeRate, source, sourceRate, onProgress) {
   const length = Math.round(source.length / sourceRate * takeRate), options = takeTrackOptions();
+  const guide = renderGuide();
+  if (guide) options.reference = guide;
   if (canUseWorker()) {
     const t = take.slice(), s = source.slice();
+    if (guide) options.reference = { ...guide, samples: guide.samples.slice() };
     return startWorker({ type: 'locate', take: t.buffer, takeRate, source: s.buffer, sourceRate, length, options }, [t.buffer, s.buffer], onProgress)
       .promise.then(reply => ({ timeline: reply.timeline, aligned: new Float32Array(reply.aligned) }));
   }
@@ -1881,7 +1896,8 @@ async function alignReferenceTake(job = ++referenceJob) {
   if (!referenceDecoded || !state.decodedSource) return;
   const { decoded, name } = referenceDecoded;
   const take = takeChannel(decoded, els.referenceChannel ? els.referenceChannel.value : 'mix'), rate = decoded.sampleRate;
-  const source = state.decodedSource.getChannelData(0), sourceRate = state.decodedSource.sampleRate;
+  // The source as the game's microphone got it (the gate model needs that).
+  const source = captureSource(state.decodedSource, renderOptions().captureChannel).getChannelData(0), sourceRate = state.decodedSource.sampleRate;
   setReferenceStatus(`Finding the source in ${name}…`);
   try {
     const { timeline, aligned } = await locateTake(take, rate, source, sourceRate,
@@ -1927,7 +1943,8 @@ function describeTiming(timeline) {
   let text = segs.length === 1 ? `delay ${fmt(delays[0])} (take minus source)`
     : `${spurts} talk spurt${spurts === 1 ? '' : 's'} in ${segs.length} segments, delay ${fmt(Math.min(...delays))} to ${fmt(Math.max(...delays))}`
       + ` (take minus source; ${trims} 5.8 ms latency trim${trims === 1 ? '' : 's'}, ${steps.length - trims} other re-timing${steps.length - trims === 1 ? '' : 's'})`;
-  text += `, clock ${clock >= 0 ? '+' : '−'}${Math.abs(clock).toFixed(0)} ppm, correlation ${timeline.correlation.toFixed(2)}${timeline.polarity < 0 ? ', polarity inverted' : ''}.`;
+  text += `, clock ${clock >= 0 ? '+' : '−'}${Math.abs(clock).toFixed(0)} ppm, correlation ${timeline.correlation.toFixed(2)}${timeline.polarity < 0 ? ', polarity inverted' : ''}`
+    + `${timeline.guided ? ', lined up against the render' : ''}.`;
   return text;
 }
 
