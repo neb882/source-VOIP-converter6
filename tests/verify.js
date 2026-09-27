@@ -307,15 +307,17 @@ async function main() {
   console.log('\n[5] Real codec modes per profile');
   {
     const src = musicLike(1, SR, 3);
-    const expect = { steam: ['hybrid', 32000], steam_48: ['hybrid', 64000], celt_22: ['celt', 22000], celt_44: ['celt', 44000], speex: ['silk', 8000] };
+    const expect = { steam: ['hybrid', 32000], steam_48: ['hybrid', 64000], celt_22: ['celt', 22050], celt_44: ['celt', 165375], speex: ['silk', 8000] };
     for (const [codec, [mode, bitrate]] of Object.entries(expect)) {
       const r = await TF2Audio.process(mkBuffer(src, SR), { codec });
       const m = r.codecInfo.modes;
       const total = m.silk + m.hybrid + m.celt;
-      check(`${codec}: libopus runs in ${mode} mode at ${bitrate / 1000} kbps`,
-        r.codecInfo.backend === 'libopus' && r.codecInfo.bitrate === bitrate && m[mode] / total > 0.8, JSON.stringify(m));
-      // The Steam profiles run the libopus release Steam's packets match; the stand-ins keep 1.6.1.
-      const release = codec.startsWith('steam') ? 'libopus 1.1.5' : 'libopus 1.6.1';
+      // The engine CELT profiles run CELT 0.11 itself, in fixed-size packets.
+      const celt = codec.startsWith('celt');
+      check(`${codec}: ${celt ? 'CELT 0.11' : `libopus runs in ${mode} mode`} at ${bitrate / 1000} kbps`,
+        r.codecInfo.backend === (celt ? 'celt' : 'libopus') && r.codecInfo.bitrate === bitrate && m[mode] / total > 0.8, JSON.stringify(m));
+      // The Steam profiles run the libopus release Steam's packets match; speex keeps 1.6.1.
+      const release = celt ? 'CELT 0.11 (celt-0.11.0)' : codec.startsWith('steam') ? 'libopus 1.1.5' : 'libopus 1.6.1';
       check(`${codec}: encodes and decodes with ${release}`, r.codecInfo.version === release, r.codecInfo.version);
       check(`${codec}: finite output`, !hasBadValues(r.samples) && r.samples.length === Math.round(src.length * r.sampleRate / SR));
     }
