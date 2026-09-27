@@ -12,8 +12,8 @@
  *
  * Depends on the app/ page scripts: els, state, LS, renderOptions, captureSource,
  * startWorkerJob, canUseWorker, exportWav, cachedExport, currentFormat,
- * outputName, saveBlob, loadSourceFile, logLine, MAX_FILE_BYTES,
- * MAX_AUDIO_SECONDS; and on TF2Audio, TF2Formats, TF2Zip.
+ * outputName, saveBlob, loadSourceFile, isVideoFile, logLine, MAX_FILE_BYTES,
+ * MAX_VIDEO_BYTES, MAX_AUDIO_SECONDS; and on TF2Audio, TF2Formats, TF2Zip.
  * =========================================================================
  */
 (function () {
@@ -42,7 +42,8 @@
     preview: null, note: '', noteTimer: 0, dragDepth: 0
   };
 
-  const isAudio = (file) => !file.name.startsWith('.') && (/^audio\//.test(file.type) || AUDIO_EXT.test(file.name));
+  // Audio, or a video whose audio track is rendered (isVideoFile, app/source.js).
+  const isAudio = (file) => !file.name.startsWith('.') && (/^audio\//.test(file.type) || AUDIO_EXT.test(file.name) || isVideoFile(file));
   const byPath = (a, b) => a.path.localeCompare(b.path, undefined, { numeric: true, sensitivity: 'base' });
   const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
   const clock = (seconds) => { const t = Math.round(seconds); return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`; };
@@ -215,7 +216,7 @@
       renderRow(item);
       added++;
     }
-    setNote(skipped ? `skipped ${plural(skipped, 'file')} that ${skipped === 1 ? 'is' : 'are'} not audio` : '');
+    setNote(skipped ? `skipped ${plural(skipped, 'file')} that ${skipped === 1 ? 'is' : 'are'} not audio or video` : '');
     if (added) logLine(`FS_MountFile: ${plural(added, 'file')} added to the batch.`, 'sys');
     refresh();
     if (reveal) ui.panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -240,7 +241,8 @@
     renderRow(item); refresh();
     const started = performance.now();
     try {
-      if (item.file.size > MAX_FILE_BYTES) throw new Error(`the file is over the ${MAX_FILE_BYTES / 1048576} MB limit`);
+      const limit = isVideoFile(item.file) ? MAX_VIDEO_BYTES : MAX_FILE_BYTES;
+      if (item.file.size > limit) throw new Error(`the file is over the ${limit / 1048576} MB limit`);
       const decoded = await decodeFile(item.file);
       if (!decoded.length) throw new Error('no decodable audio');
       if (decoded.duration > MAX_AUDIO_SECONDS) throw new Error('longer than the 10 minute limit');
@@ -529,7 +531,7 @@
     // One file dropped outside the batch panel loads as the source, like step 1.
     if (!onBatch && !folder && files.length === 1) {
       if (audio.length) loadSourceFile(audio[0].file);
-      else setStatus(`${files[0].file.name} is not an audio file.`, 'error');
+      else setStatus(`${files[0].file.name} is not an audio or video file.`, 'error');
       return;
     }
     if (files.length) add(files, { reveal: !onBatch });

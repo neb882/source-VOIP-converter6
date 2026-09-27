@@ -19,7 +19,7 @@ For GitHub Pages, enable Pages from the root of your publishing branch; no build
 
 Use HTTPS or localhost. Opening `index.html` as a local file does not reliably support codec modules or microphone capture. After the app and its service worker load, conversion works offline. Background cache updates never reload the page or discard loaded audio; refresh when you are ready to use updated page code.
 
-Choose a file or record, pick a preset, process, and download. Microphone capture uses uncompressed PCM, so the only lossy pass is the emulated codec. Limits: 100 MB (1 GB for video) and 10 minutes per file, 5 minutes for recording. Supported upload formats depend on the browser.
+Choose an audio or video file (or drop one on the page) or record, pick a preset, process, and download. Microphone capture uses uncompressed PCM, so the only lossy pass is the emulated codec. Limits: 100 MB (1 GB for video) and 10 minutes per file, 5 minutes for recording. Supported upload formats depend on the browser.
 
 ## Downloads and batches
 

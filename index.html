@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>TF2 Voice Emulator</title>
-  <meta name="description" content="Make any audio sound like Team Fortress 2 voice chat: real Opus, the in-game receiver auto-gain and clipping measured from a TF2 recording, and Source room DSP. Runs locally in your browser.">
+  <meta name="description" content="Make any audio or video sound like Team Fortress 2 voice chat: real Opus, the in-game receiver auto-gain and clipping measured from a TF2 recording, and Source room DSP. Runs locally in your browser.">
   <meta name="theme-color" content="#171a21">
   <link rel="icon" href="favicon.ico" type="image/x-icon">
   <link rel="manifest" href="manifest.webmanifest">
@@ -16,11 +16,12 @@
 
     <header class="app-header">
       <h1>TF2 Voice Emulator</h1>
-      <p class="tagline">Make any audio sound like it came through Team Fortress 2 voice chat.</p>
+      <p class="tagline">Make any audio or video sound like it came through Team Fortress 2 voice chat.</p>
       <ul class="facts" aria-label="What the emulator models">
         <li><b>Real Opus</b> 24 kHz · VBR + DTX · SILK/CELT hybrid</li>
         <li><b>Receiver auto-gain</b> with the in-game int16 clip</li>
         <li><b>Measured</b> against real TF2 recordings</li>
+        <li><b>Video in, video out</b> MP4 · MOV, picture untouched</li>
         <li><b>Local</b> — nothing is uploaded</li>
       </ul>
     </header>
@@ -31,7 +32,7 @@
         <input id="file" type="file" accept="audio/*,video/*,.mkv" multiple aria-label="Audio or video file to process (choose several to batch them)">
         <button id="mic" type="button" title="Record from microphone (+voicerecord)">🎤 Record</button>
         <button id="live-toggle" type="button" aria-pressed="false" title="Live monitor: hear your microphone through the TF2 voice chain in real time, with the current settings (use headphones)">🎧 Live</button>
-        <div id="source-status" class="source-status" role="status" aria-live="polite">Choose or drop an audio file, or record from the microphone. Several files at once go to the batch (step 4).</div>
+        <div id="source-status" class="source-status" role="status" aria-live="polite">Choose or drop an audio or video file, or record from the microphone. An MP4 or MOV comes back as video with the new voice. Several files at once go to the batch (step 4).</div>
       </div>
       <div id="live-panel" class="live-panel" hidden>
         <div class="live-devices">
@@ -383,9 +384,9 @@
 
     <section class="panel" id="batch-panel" aria-labelledby="step-batch">
       <h2 id="step-batch"><span class="step" aria-hidden="true">4</span> Batch</h2>
-      <p class="panel-hint">Render many files with the settings above, then save them one by one or as a ZIP in the format chosen in step 3. Add files here, choose several in step 1, or drop files or folders anywhere on the page.</p>
+      <p class="panel-hint">Render many files with the settings above, then save them one by one or as a ZIP in the format chosen in step 3. Add files here, choose several in step 1, or drop files or folders anywhere on the page. A video in the batch gives its voice as audio; for the video itself, load it in step 1.</p>
       <div class="action-row">
-        <input id="batch-files" type="file" accept="audio/*" multiple aria-label="Audio files to add to the batch">
+        <input id="batch-files" type="file" accept="audio/*,video/*,.mkv" multiple aria-label="Audio or video files to add to the batch">
         <button id="batch-run" type="button" disabled>Render all</button>
         <button id="batch-cancel" class="button-secondary" type="button" hidden>Cancel</button>
         <button id="batch-zip" type="button" disabled>Save as WAV (.zip)</button>
