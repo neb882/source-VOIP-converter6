@@ -316,14 +316,29 @@ Spectral flatness from 70 to 700 Hz measures it (0 = tonal, 1 = noise):
 
 The artifact is the codec's own DTX (finding 13) acting on music, and the model reproduces it. It is part of the sound and stays in the model.
 
-### 18. libopus 1.1.x adds a DC offset to strong content below ~60 Hz
+### 18. Comfort noise for a steady tone below ~60 Hz is nearly DC
 
-With Steam's settings in hybrid mode, libopus 1.1.5 decodes a sustained 50 Hz sine at 0.3 with a mean of 0.213. A native gcc build and the app's WebAssembly build agree (0.2128 and 0.2127). Other cases:
-- A mix of 50 Hz, a gated 80 Hz and a melody decodes with a mean of 0.013.
-- libopus 1.6.1 at the same settings gives 0.0001.
-- 1.1.5 in CELT-only mode gives −0.0002.
+libopus 1.1.x puts a steady tone into DTX (finding 13), low tones included. Its comfort noise then imitates the tone's spectrum, and for a tone below about 60 Hz that imitation is a slowly wandering, nearly constant offset.
 
-In a render the receiver auto-gain scales this up. A 50/80 Hz test mix comes out with a DC offset of about 4–5% of full scale, and the app's meter shows it. The recordings so far contain no sustained tones below 60 Hz, so they cannot show whether TF2's output keeps this offset (see [What remains unverified](#what-remains-unverified)).
+With Steam's settings in hybrid mode, libopus 1.1.5 decodes a steady 50 Hz sine at 0.3 with a mean of 0.213. A native gcc build and the app's WebAssembly build agree (0.2128 and 0.2127). DTX is what does it:
+
+| libopus 1.1.5, native | DTX frames | Mean | RMS |
+| --- | ---: | ---: | ---: |
+| 50 Hz at 0.3, DTX on | 362 of 400 | +0.235 | 0.249 |
+| 50 Hz at 0.3, DTX off | 0 | 0.000 | 0.107 |
+| 30 Hz at −12 dBFS, DTX on | 373 of 400 | −0.032 | 0.050 |
+| 30 Hz at −12 dBFS, DTX off | 0 | 0.000 | 0.042 |
+
+libopus 1.6.1 at the same settings does not put the tone into DTX and gives a mean of 0.0001.
+
+In a render the receiver auto-gain scales the offset up. The model gives:
+- 26–40% of full scale on steady 50 Hz tones at default settings
+- a few percent on tones that change level every 0.5 s, which keep the voice detector active
+- nothing on a moving bass line under a melody
+
+Music with held sub-bass is where it would show. The app's meter reports it.
+
+The recordings so far contain no steady tones below 60 Hz, so they cannot show whether TF2's output keeps this offset. [`tests/testsignal/make_lowtone.py`](testsignal/make_lowtone.py) makes a signal to find out (see [What remains unverified](#what-remains-unverified)).
 
 ## Model
 
@@ -402,7 +417,7 @@ A pure sine's codec noise moves by about 2 dB with where the 20 ms frames fall o
   They occur with a remote listener on a dedicated server too (Set D).
 - **Steam's libopus build.** Finding 16 identifies libopus 1.1.x, most likely 1.1.2 or later, which give identical packets here. Steam's compiler and math library could still change packets in their last bits. Steam's capture resampler is modeled by its measured roll-off, not reproduced. Pure tones at 11.5–12 kHz fall into DTX in Steam's encoder more often than in the model.
 - **Stereo capture.** Finding 6 is one capture chain (a stereo virtual cable). A physical microphone is mono either way.
-- **DC from sub-60 Hz content.** libopus 1.1.x adds a DC offset to strong, sustained content below about 60 Hz (finding 18). The model keeps it. Whether TF2's output passes it on needs a take with sustained 30–60 Hz tones.
+- **DC from sub-60 Hz comfort noise.** Comfort noise for a steady tone below about 60 Hz is nearly DC (finding 18). The model keeps it. Whether TF2's output passes it on needs a take of `tf2_voice_lowtone_v1` (see [`tests/testsignal/`](testsignal/)).
 - **Output stage.** The small post-clip roll-off may come from the recording chain rather than the game.
 - **Legacy profiles and rooms.** Speex and CELT stand-ins, and room presets, are not validated against recordings.
 - **Network settings.** Set C used simulated loss on a listen server, where `net_fakeloss` hits both directions. How a given real-world or one-way loss rate maps to lost frames is not measured, so the app's control is the share of frames lost. The jitter rate is calibrated at one setting (`net_fakejitter 50` with `net_fakelag 100`) and scaled linearly. Set D ran on a LAN with no loss. Real internet loss was not recorded.

@@ -1,0 +1,232 @@
+{
+ "version": 1,
+ "sample_rate": 48000,
+ "seed": 20260927,
+ "duration_s": 147.5,
+ "segments": [
+  {
+   "name": "sync_start",
+   "start_s": 0.0,
+   "dur_s": 1.5,
+   "note": "3 x 1 kHz beeps at -12 dBFS"
+  },
+  {
+   "name": "gap",
+   "start_s": 1.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "tone_30Hz_-24dB",
+   "start_s": 3.5,
+   "dur_s": 6.0,
+   "freq_hz": 30,
+   "level_dbfs_peak": -24
+  },
+  {
+   "name": "gap",
+   "start_s": 9.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "tone_30Hz_-12dB",
+   "start_s": 11.5,
+   "dur_s": 6.0,
+   "freq_hz": 30,
+   "level_dbfs_peak": -12
+  },
+  {
+   "name": "gap",
+   "start_s": 17.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "tone_30Hz_-6dB",
+   "start_s": 19.5,
+   "dur_s": 6.0,
+   "freq_hz": 30,
+   "level_dbfs_peak": -6
+  },
+  {
+   "name": "gap",
+   "start_s": 25.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "tone_40Hz_-24dB",
+   "start_s": 27.5,
+   "dur_s": 6.0,
+   "freq_hz": 40,
+   "level_dbfs_peak": -24
+  },
+  {
+   "name": "gap",
+   "start_s": 33.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "tone_40Hz_-12dB",
+   "start_s": 35.5,
+   "dur_s": 6.0,
+   "freq_hz": 40,
+   "level_dbfs_peak": -12
+  },
+  {
+   "name": "gap",
+   "start_s": 41.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "tone_40Hz_-6dB",
+   "start_s": 43.5,
+   "dur_s": 6.0,
+   "freq_hz": 40,
+   "level_dbfs_peak": -6
+  },
+  {
+   "name": "gap",
+   "start_s": 49.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "tone_50Hz_-24dB",
+   "start_s": 51.5,
+   "dur_s": 6.0,
+   "freq_hz": 50,
+   "level_dbfs_peak": -24
+  },
+  {
+   "name": "gap",
+   "start_s": 57.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "tone_50Hz_-12dB",
+   "start_s": 59.5,
+   "dur_s": 6.0,
+   "freq_hz": 50,
+   "level_dbfs_peak": -12
+  },
+  {
+   "name": "gap",
+   "start_s": 65.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "tone_50Hz_-6dB",
+   "start_s": 67.5,
+   "dur_s": 6.0,
+   "freq_hz": 50,
+   "level_dbfs_peak": -6
+  },
+  {
+   "name": "gap",
+   "start_s": 73.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "tone_60Hz_-12dB",
+   "start_s": 75.5,
+   "dur_s": 6.0,
+   "freq_hz": 60,
+   "level_dbfs_peak": -12,
+   "note": "control"
+  },
+  {
+   "name": "gap",
+   "start_s": 81.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "tone_80Hz_-12dB",
+   "start_s": 83.5,
+   "dur_s": 6.0,
+   "freq_hz": 80,
+   "level_dbfs_peak": -12,
+   "note": "control"
+  },
+  {
+   "name": "gap",
+   "start_s": 89.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "tone_100Hz_-12dB",
+   "start_s": 91.5,
+   "dur_s": 6.0,
+   "freq_hz": 100,
+   "level_dbfs_peak": -12,
+   "note": "control"
+  },
+  {
+   "name": "gap",
+   "start_s": 97.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "tone_1000Hz_-12dB",
+   "start_s": 99.5,
+   "dur_s": 6.0,
+   "freq_hz": 1000,
+   "level_dbfs_peak": -12,
+   "note": "control"
+  },
+  {
+   "name": "gap",
+   "start_s": 105.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "stepped_30Hz_-18_-6dB",
+   "start_s": 107.5,
+   "dur_s": 6.5,
+   "freq_hz": 30,
+   "note": "level alternates -18 / -6 dBFS every 0.5 s; keeps the Opus voice detector active"
+  },
+  {
+   "name": "gap",
+   "start_s": 114.0,
+   "dur_s": 2.0
+  },
+  {
+   "name": "stepped_40Hz_-18_-6dB",
+   "start_s": 116.0,
+   "dur_s": 6.5,
+   "freq_hz": 40,
+   "note": "level alternates -18 / -6 dBFS every 0.5 s; keeps the Opus voice detector active"
+  },
+  {
+   "name": "gap",
+   "start_s": 122.5,
+   "dur_s": 2.0
+  },
+  {
+   "name": "stepped_50Hz_-18_-6dB",
+   "start_s": 124.5,
+   "dur_s": 6.5,
+   "freq_hz": 50,
+   "note": "level alternates -18 / -6 dBFS every 0.5 s; keeps the Opus voice detector active"
+  },
+  {
+   "name": "gap",
+   "start_s": 131.0,
+   "dur_s": 2.0
+  },
+  {
+   "name": "bassline_melody",
+   "start_s": 133.0,
+   "dur_s": 10.0,
+   "note": "E1 G1 A1 F1 sub-bass at -12 dBFS, 0.5 s each, under a -18 dBFS melody"
+  },
+  {
+   "name": "gap",
+   "start_s": 143.0,
+   "dur_s": 3.0
+  },
+  {
+   "name": "sync_end",
+   "start_s": 146.0,
+   "dur_s": 1.5,
+   "note": "end marker for clock-drift measurement"
+  }
+ ]
+}
