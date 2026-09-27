@@ -120,6 +120,19 @@ check('Invalid PCM is rejected before encoding', true);
   const withDtx = await opus.roundTrip(steadyTone, rate, 32000, { complexity: 6, vbr: true, dtx: true });
   const noDtx = await opus.roundTrip(steadyTone, rate, 32000);
   check('DTX is opt-in and its comfort-noise frames are counted', withDtx.info.dtx && withDtx.info.dtxFrames > 20 && noDtx.info.dtxFrames === 0 && withDtx.info.encodedBytes < noDtx.info.encodedBytes / 2);
+  // The per-frame log behind the visualizer's codec lane agrees with the counters.
+  const { FRAME } = opus;
+  const count = (info, code) => info.frameLog.reduce((n, c) => n + (c === code), 0);
+  const sum = (a) => a.reduce((s, v) => s + v, 0);
+  check('Frame log: one entry per frame; gate, late and lost frames logged as such', info.frameLog.length === info.frames
+    && count(info, FRAME.gated) === info.gatedFrames && count(late.info, FRAME.late) === 1 && count(late.info, FRAME.lost) === 1
+    && late.info.frameLog[5] === FRAME.late && late.info.frameLog[7] === FRAME.lost);
+  check('Frame log: coded frames by mode, DTX frames as DTX', count(withDtx.info, FRAME.dtx) === withDtx.info.dtxFrames
+    && count(info, FRAME.silk) + count(info, FRAME.hybrid) + count(info, FRAME.celt) === info.frames - info.gatedFrames
+    && count(info, FRAME.celt) === info.modes.celt && count(info, FRAME.hybrid) === info.modes.hybrid);
+  check('Frame log: packet sizes add up to the encoded bytes; gated frames send none',
+    sum(info.frameBytes) === info.encodedBytes && info.frameBytes.every((b, f) => (info.frameLog[f] === FRAME.gated) === (b === 0))
+    && sum(withDtx.info.frameBytes) === withDtx.info.encodedBytes);
 }
 {
   // The Steam profile's libopus 1.1.5 build: the release Steam's voice packets match.

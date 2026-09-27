@@ -225,18 +225,21 @@ body.dragging::after {
 }
 
 .viz-container {
-  position: relative; width: 100%; height: 180px; min-height: 140px; max-height: 85vh;
+  position: relative; width: 100%; height: 280px; min-height: 180px; max-height: 85vh;
+  display: flex; flex-direction: column;
   background: #000; border-radius: 6px; border: 1px solid #444;
   overflow: hidden; margin-top: 14px; resize: vertical;
   box-shadow: inset 0 0 20px rgba(0,0,0,0.8);
 }
+.viz-stage { position: relative; flex: 1 1 auto; min-height: 0; }
 canvas { width: 100%; height: 100%; display: block; }
 
-/* Visualizer mode switch (segmented control, active side lit) */
+/* Visualizer toolbar: a strip above the view (segmented controls, active side lit) */
 .viz-toolbar {
-  position: absolute; top: 6px; right: 6px; z-index: 3;
-  display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; max-width: calc(100% - 12px);
+  flex: 0 0 auto; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px;
+  padding: 4px 6px; background: #0b0e12; border-bottom: 1px solid #2c333b;
 }
+.viz-toolbar > .viz-modes:first-child { margin-right: auto; }
 .viz-modes {
   display: flex; border: 1px solid var(--border); border-radius: 4px;
   overflow: hidden; background: rgba(14, 18, 24, 0.85);
@@ -249,8 +252,31 @@ canvas { width: 100%; height: 100%; display: block; }
 .viz-mode + .viz-mode { border-left: 1px solid var(--border); }
 .viz-mode:hover:not(.active) { color: #fff; background: rgba(62, 76, 92, 0.5); }
 .viz-mode.active { background: linear-gradient(to bottom, var(--lime) 5%, #536904 95%); color: #fff; cursor: default; }
-#viz-log.active, #viz-tall[aria-pressed="true"] { cursor: pointer; }
+/* On/off switches: lit text rather than the mode switch's fill */
+.viz-toggle[aria-pressed="true"] { color: #d9f27a; background: rgba(164, 208, 7, 0.16); }
 .viz-mode:disabled { background: transparent; color: #4a535d; box-shadow: none; }
+.viz-select {
+  width: auto; min-height: 0; margin: 0; padding: 2px 4px; border: none; border-left: 1px solid var(--border); border-radius: 0;
+  background: transparent; color: var(--muted); font-size: 10px; font-weight: bold; letter-spacing: 0.5px; cursor: pointer;
+}
+.viz-select:hover { color: #fff; }
+.viz-select option { background: #151a20; color: #dfe7ee; }
+.viz-mode[hidden], .viz-select[hidden] { display: none; }
+
+/* Legend for the codec and loudness lanes */
+.viz-legend {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-top: 6px;
+  font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums;
+}
+.viz-legend b { color: var(--accent); font-size: 10px; letter-spacing: 0.5px; text-transform: uppercase; cursor: help; }
+.viz-legend .lg-item { display: inline-flex; align-items: center; gap: 5px; cursor: help; }
+.lg-box { display: inline-block; width: 10px; height: 10px; border-radius: 2px; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12); }
+.lg-line { display: inline-block; width: 16px; height: 0; }
+
+/* The selection the meter is showing */
+.meter-sel { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-bottom: 6px; font-size: 12px; color: #c9d6e2; font-variant-numeric: tabular-nums; }
+.meter-sel[hidden] { display: none; }
+.meter-sel .preset-btn { flex: 0 0 auto; padding: 3px 10px; font-size: 11px; }
 #visualizer { touch-action: pan-y; cursor: crosshair; }
 #visualizer:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
@@ -381,11 +407,14 @@ footer a { color: #7d8b98; }
   .signal-chain { grid-template-columns: 1fr; gap: 4px; }
   .signal-chain li + li::before { display: none; }
   .viz-mode { min-height: 40px; min-width: 44px; padding: 4px 8px; }
-  /* The toolbar gets its own strip above the view instead of covering it. */
-  .viz-container { display: flex; flex-direction: column; height: 250px; }
-  .viz-toolbar { position: static; order: -1; flex: 0 0 auto; max-width: none; justify-content: space-between;
-    gap: 4px; padding: 4px; background: #0b0e12; border-bottom: 1px solid #2c333b; }
-  #visualizer { flex: 1 1 auto; min-height: 0; height: auto; }
+  .viz-container { height: 400px; }
+  .viz-toolbar { justify-content: space-between; gap: 4px; padding: 4px; }
+  .viz-toolbar > .viz-modes:first-child { margin-right: 0; }
+  /* Mode switch and FIT share the first row; scale and lanes wrap below. */
+  .viz-toolbar > .viz-modes:nth-child(3) { order: -1; }
+  .viz-toolbar > .viz-modes:first-child { order: -2; }
+  /* 16px: iOS Safari zooms the page into smaller controls on focus */
+  .viz-select { min-height: 40px; font-size: 16px; font-weight: normal; }
   /* Pinch zooms on touch screens; the step buttons would crowd the view. */
   .viz-zoom-step { display: none; }
   audio { height: 36px; }

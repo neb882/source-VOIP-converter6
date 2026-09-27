@@ -76,4 +76,20 @@ console.log('\n[Meter 4] Peaks, RMS, DC');
   check('DC offset', near(dc.dc, 0.05, 1e-6));
 }
 
+console.log('\n[Meter 5] Loudness history');
+{
+  // 5 s at -20 LUFS then 5 s at -30 LUFS: 100 ms steps; momentary value k
+  // covers k * 0.1 .. k * 0.1 + 0.4 s, short-term k * 0.1 .. k * 0.1 + 3 s.
+  const level = (lufs) => Math.pow(10, (lufs + 3.01) / 20);
+  const x = concat(sine(1000, level(-20), 5, 48000), sine(1000, level(-30), 5, 48000));
+  const { history } = TF2Meter.analyze(x, 48000);
+  check('one momentary value per 100 ms from 0.4 s, one short-term value from 3 s',
+    history.hop === 0.1 && history.momentary.length === 97 && history.shortTerm.length === 71, `${history.momentary.length} / ${history.shortTerm.length}`);
+  check('momentary loudness follows the level step', near(history.momentary[20], -20, 0.1) && near(history.momentary[70], -30, 0.1)
+    && history.momentary[48] < -20.5 && history.momentary[48] > -29.5, `${history.momentary[20].toFixed(2)} / ${history.momentary[48].toFixed(2)} / ${history.momentary[70].toFixed(2)}`);
+  check('short-term loudness settles 3 s after the step', near(history.shortTerm[10], -20, 0.1) && near(history.shortTerm[60], -30, 0.1)
+    && history.shortTerm[35] < -20.5 && history.shortTerm[35] > -29.5);
+  check('silence reads −∞ in the history', TF2Meter.analyze(new Float32Array(48000), 48000).history.momentary.every(v => v === -Infinity));
+}
+
 console.log(`\n${passed} passed, 0 failed`);
