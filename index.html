@@ -47,6 +47,12 @@
           <span class="live-meter" title="Input peak"><span class="live-meter-label">in</span><span class="live-meter-bar"><span id="live-in"></span></span></span>
           <span class="live-meter" title="Output peak"><span class="live-meter-label">out</span><span class="live-meter-bar"><span id="live-out"></span></span></span>
         </div>
+        <div class="live-controls">
+          <button id="live-record" type="button" disabled title="Record the live session: the microphone and the TF2 voice, loaded into the app as a dry/wet pair (A/B, views, meter, download)">⏺ Record</button>
+          <label title="Send only while V (TF2's +voicerecord key) or the Talk button is held, as with push-to-talk in the game. The voice gate still applies while you hold it."><input id="live-ptt" type="checkbox"> Push-to-talk (hold <kbd>V</kbd>)</label>
+          <button id="live-talk" type="button" hidden title="Hold to talk">🎙 Hold to talk</button>
+          <label title="Skip the voice gate's 120 ms pre-roll, so the gate opens on the loud frame itself. Not how TF2 sounds: onsets lose their first 120 ms."><input id="live-lowlat" type="checkbox"> Low latency (no pre-roll)</label>
+        </div>
         <p id="live-note" class="live-note"></p>
       </div>
     </section>
@@ -72,8 +78,8 @@
           <select id="codec">
             <option value="steam" selected>Steam voice (Opus 24 kHz VBR, 32 kbps)</option>
             <option value="steam_48">Fullband Opus (48 kHz / 64 kbps, experimental)</option>
-            <option value="celt_22">CELT era (Opus CELT layer, 22 kbps)</option>
-            <option value="celt_44">CELT high (Opus CELT layer, 44 kbps)</option>
+            <option value="celt_22">vaudio_celt (CELT 0.11, 22 kHz, 22 kbps)</option>
+            <option value="celt_44">vaudio_celt_high (CELT 0.11, 44 kHz, unconfirmed)</option>
             <option value="speex">Narrowband (Opus SILK, 8 kbps)</option>
           </select>
         </div>

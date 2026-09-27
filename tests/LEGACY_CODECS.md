@@ -1,15 +1,15 @@
 # Legacy voice codecs: what is known
 
-The `celt_22`, `celt_44` and `speex` profiles are stand-ins: they run the modern Opus codec at settings meant to resemble Source's older engine codecs (`sv_voicecodec vaudio_celt`, `vaudio_celt_high` and `vaudio_speex`). None has been measured against a TF2 recording. This file collects what public sources say about the real codecs, so the profiles can be checked or replaced.
+Source's older engine codecs are `sv_voicecodec vaudio_celt`, `vaudio_celt_high` and `vaudio_speex`. The `celt_22` and `celt_44` profiles now run the real codec, CELT 0.11 ([`vendor/celt-0.11`](../vendor/celt-0.11/README.md)), at the settings below. The `speex` profile is still a stand-in: it runs Opus SILK. None of the three has been measured against a TF2 recording, and their receiver side (gate, auto-gain rate) is assumed. This file collects what public sources say about the real codecs.
 
 Leaked engine source was deliberately not used. Valve's public Source SDK 2013 has no voice-codec code: the codecs live in the engine's `vaudio_*` libraries.
 
 ## Summary
 
-| `sv_voicecodec` | Real codec (public evidence) | App stand-in | Evidence |
+| `sv_voicecodec` | Real codec (public evidence) | App profile | Evidence |
 |---|---|---|---|
-| `vaudio_celt` | **CELT 0.11** custom mode, mono. **22050 Hz**, **512-sample frames** (23.2 ms), **64-byte constant-size packets** = 22.05 kbps. Encoder complexity 10. | Opus CELT layer (libopus 1.6.1), 24 kHz, 20 ms frames, 22 kbps; decoded voice at 22.05 kHz | Strong: three independent decoders and two encoders agree |
-| `vaudio_celt_high` | CELT 0.11, **44100 Hz**, **256-sample frames** (5.8 ms), **120-byte packets** = 165.4 kbps | Opus CELT layer, 48 kHz, **44 kbps** | Weak: one reimplementation. The "44 kbps" on Valve's wiki does not match it and may mean 44 kHz. |
+| `vaudio_celt` | **CELT 0.11** custom mode, mono. **22050 Hz**, **512-sample frames** (23.2 ms), **64-byte constant-size packets** = 22.05 kbps. Encoder complexity 10. | `celt_22`: CELT 0.11 with exactly these settings; decoded voice at 22.05 kHz | Strong: three independent decoders and two encoders agree |
+| `vaudio_celt_high` | CELT 0.11, **44100 Hz**, **256-sample frames** (5.8 ms), **120-byte packets** = 165.4 kbps | `celt_44`: CELT 0.11 with these settings | Weak: one reimplementation. The "44 kbps" on Valve's wiki does not match it and may mean 44 kHz. |
 | `vaudio_speex` | Speex, 8 kHz narrowband per one reimplementation. Source's quality setting is not public. | Opus SILK, 8 kHz, 8 kbps; decoded voice at 11.025 kHz | Weak. It currently fails to load in TF2 ([Source-1-Games#7551](https://github.com/ValveSoftware/source-1-games/issues/7551)), so it cannot be recorded today. |
 
 ## vaudio_celt
@@ -23,7 +23,7 @@ Leaked engine source was deliberately not used. Valve's public Source SDK 2013 h
   - [Dolly132/sm-ext-voice](https://github.com/Dolly132/sm-ext-voice). It notes: "2009 Games with 22050 samplerate and 512 frames per packet -> 23.22ms per packet". TF2 was on the Source 2009 branch.
 - **Rate control.** A fixed packet size of 64 bytes makes CELT constant-rate, whatever the `CELT_SET_BITRATE` ceiling (64 kbps in both encoders).
 
-**Differences from the stand-in.** The real codec is not Opus's CELT layer: Opus changed the bitstream and the psychoacoustics after 0.11. The real frames are also 23.2 ms rather than 20 ms, so loss and jitter act on 23.2 ms units.
+**In the app.** Until this release the profile ran Opus's CELT layer, which is not the same codec: Opus changed the bitstream and the psychoacoustics after 0.11. It now runs CELT 0.11 itself, built from the tree the CS:GO decoders use, with 512-sample frames and 64-byte packets. Loss and jitter act on 23.2 ms frames. The codec's delay (64 samples, its MDCT overlap) is trimmed, so renders keep the source timeline.
 
 ## vaudio_celt_high
 
@@ -57,6 +57,6 @@ The test signal's segments answer the open questions:
 - the sweeps show band edges and frame sizes
 - the level steps show the receiver gain
 
-## Next step without takes
+## Done without takes
 
-Build CELT 0.11.0 to WebAssembly, the same way `tests/libopus11/` builds libopus 1.1.5, and run `vaudio_celt` as the real codec at 22050 Hz, 512 samples and 64 bytes. That removes the stand-in for the one legacy codec whose settings are well established. `vaudio_celt_high` could use the same build once a take confirms its packet size. Speex can follow if its quality setting turns up.
+CELT 0.11 is built to WebAssembly by [`tests/celt011/build.mjs`](celt011/build.mjs), the same way `tests/libopus11/` builds libopus 1.1.5, and both CELT profiles run it. `vaudio_celt_high` uses the one public source's 120-byte packets until a take confirms or corrects them. Speex can follow if its quality setting turns up.

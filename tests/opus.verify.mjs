@@ -77,6 +77,22 @@ check('Encoder mode per packet is reported from the TOC byte',
   check(`The CELT band is on time (${celt.toFixed(1)} us); the SILK band leads by Opus's own phase (${silk.toFixed(0)} us)`,
     Math.abs(celt) < 3 && silk < -20 && silk > -120);
 }
+// vaudio_celt: the real CELT 0.11 in Source's custom mode.
+{
+  const r22 = 22050, n = r22 * 2, center = Math.round(n / 2) + 77;
+  const pulse = Float32Array.from({ length: n }, (_, i) => .3 * Math.exp(-.5 * ((i - center) / 6) ** 2));
+  const { samples, info } = await opus.celtRoundTrip(pulse, r22, { frameSize: 512, packetBytes: 64, complexity: 10 });
+  check('vaudio_celt is CELT 0.11 at 22050 Hz, 512-sample frames and 64-byte packets (22.05 kbps)',
+    info.backend === 'celt' && /CELT 0\.11/.test(info.version) && info.frameSamples === 512 && info.packetBytes === 64
+    && info.bitrate === 22050 && info.encodedBytes === info.frames * 64 && Math.abs(info.frameMs - 23.22) < .01);
+  check('CELT output keeps the source timeline (codec delay trimmed)', Math.abs(peak(samples) - center) <= 1 && samples.length === n);
+  const tone = Float32Array.from({ length: n }, (_, i) => .2 * Math.sin(2 * Math.PI * 440 * i / r22));
+  const lossy = await opus.celtRoundTrip(tone, r22, { frameSize: 512, packetBytes: 64, makeLossMask: count => Uint8Array.from({ length: count }, (_, f) => f % 5 === 2 ? 1 : 0) });
+  check('CELT conceals lost frames with its own PLC', lossy.info.lostFrames > 5 && lossy.info.plc === 'celt'
+    && energy(lossy.samples) > energy(tone) * .5 && lossy.samples.every(Number.isFinite));
+  const app = await A.process(buffer(x, rate), { ...base, codec: 'celt_22' });
+  check('The celt_22 profile renders through CELT 0.11', app.realOpus && app.codecInfo.backend === 'celt' && app.codecInfo.frames > 0);
+}
 const lost = await A.process(buffer(x, rate), { ...base, lossPct: 100 });
 check('100% loss reaches native decoder PLC', lost.codecInfo.plc === 'opus' && lost.codecInfo.lostFrames === lost.codecInfo.frames);
 check('No voice leaks through 100% loss from stream start', energy(lost.samples) < 1e-12);

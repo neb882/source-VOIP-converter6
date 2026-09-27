@@ -769,15 +769,21 @@
     if (enableCodec) {
       const opus = await loadOpusModule();
       const bitrate = Math.max(6000, Math.round(codec.bitrate * bits / 16));
-      const result = await opus.roundTrip(samples, codecRate, bitrate, {
-        application: codec.application, signal: codec.signal,
-        runtime: codec.encoder?.runtime, complexity: codec.encoder?.complexity, vbr: codec.encoder?.vbr, dtx: codec.encoder?.dtx,
-        gate: gateOn ? { thresholdDb: gateDb, prerollFrames: Math.round(gateSpec.prerollMs / frameMs),
-          holdFrames: Math.round(gateSpec.holdMs / frameMs) } : null,
+      // The codec's own frame length: 20 ms for Opus, frameSize for CELT.
+      const codecFrameMs = codec.frameSize ? 1000 * codec.frameSize / codecRate : frameMs;
+      const common = {
+        gate: gateOn ? { thresholdDb: gateDb, prerollFrames: Math.round(gateSpec.prerollMs / codecFrameMs),
+          holdFrames: Math.round(gateSpec.holdMs / codecFrameMs) } : null,
         makeLossMask: count => buildLossMask(count, framesPerPacket, lossPct, rand, jitterMs),
         yieldControl: microYield,
         onProgress: f => report(0.2 + 0.5 * f)
-      });
+      };
+      const result = codec.engine === 'celt011'
+        ? await opus.celtRoundTrip(samples, codecRate, { ...common, frameSize: codec.frameSize, complexity: codec.complexity,
+          packetBytes: Math.max(8, Math.round(codec.packetBytes * bits / 16)) })
+        : await opus.roundTrip(samples, codecRate, bitrate, { ...common,
+          application: codec.application, signal: codec.signal,
+          runtime: codec.encoder?.runtime, complexity: codec.encoder?.complexity, vbr: codec.encoder?.vbr, dtx: codec.encoder?.dtx });
       samples = result.samples;
       codecInfo = { ...result.info, framesPerPacket };
       const eq = profileEq(codec);
@@ -1074,15 +1080,19 @@
     if (enableCodec) {
       const opus = await loadOpusModule();
       if (typeof opus.createVoiceStream !== 'function') throw new Error('This Opus build has no frame-by-frame interface.');
-      voice = await opus.createVoiceStream(codecRate, Math.max(6000, Math.round(codec.bitrate * bits / 16)), {
-        application: codec.application, signal: codec.signal,
-        runtime: codec.encoder?.runtime, complexity: codec.encoder?.complexity, vbr: codec.encoder?.vbr, dtx: codec.encoder?.dtx });
+      voice = codec.engine === 'celt011'
+        ? await opus.createCeltStream(codecRate, { frameSize: codec.frameSize, complexity: codec.complexity,
+          packetBytes: Math.max(8, Math.round(codec.packetBytes * bits / 16)) })
+        : await opus.createVoiceStream(codecRate, Math.max(6000, Math.round(codec.bitrate * bits / 16)), {
+          application: codec.application, signal: codec.signal,
+          runtime: codec.encoder?.runtime, complexity: codec.encoder?.complexity, vbr: codec.encoder?.vbr, dtx: codec.encoder?.dtx });
     }
-    const frameSize = codecRate / 50;
+    // 20 ms for Opus; CELT profiles have their own frame (23.2 ms for vaudio_celt).
+    const frameSize = codec.frameSize || codecRate / 50, frameSeconds = frameSize / codecRate;
     const threshold = 10 ** (gateDb / 20);
     // opts.lowLatency (live only, not how TF2 behaves): no pre-roll, so the
     // gate opens on the loud frame itself and 120 ms sooner.
-    const preroll = gateOn && !opts.lowLatency ? Math.round(gateSpec.prerollMs / 20) : 0, hold = Math.round(gateSpec.holdMs / 20);
+    const preroll = gateOn && !opts.lowLatency ? Math.round(gateSpec.prerollMs / 1000 / frameSeconds) : 0, hold = Math.round(gateSpec.holdMs / 1000 / frameSeconds);
     const lossMask = streamLossMask(framesPerPacket, lossPct, rand, jitterMs);
     let pending = new Float32Array(0);
     const queue = [];   // frames waiting out the gate's pre-roll: { samples, sent, talk }
@@ -1097,7 +1107,7 @@
     const contentDelay = Math.round(((captureEq ? (captureEq.length - 1) / 2 : 0) + (voice ? voice.lookahead : 0)) / codecRate * ioRate);
     const stats = { codec: codecKey, frames: 0, sent: 0, modes: { silk: 0, hybrid: 0, celt: 0 }, dtx: 0, lost: 0, late: 0,
       bytes: 0, gateOpen: false, lastMode: null, inputPeak: 0, outputPeak: 0, spurts: 0, talking,
-      latencyMs: 1000 * (preroll * 0.02 + (captureEq ? (captureEq.length - 1) / 2 / codecRate : 0) + (voice ? voice.lookahead / codecRate : 0)) };
+      latencyMs: 1000 * (preroll * frameSeconds + (captureEq ? (captureEq.length - 1) / 2 / codecRate : 0) + (voice ? voice.lookahead / codecRate : 0)) };
 
     async function codecFrame(frame, sent) {
       stats.frames++;
@@ -1169,7 +1179,7 @@
       return y;
     }
 
-    return { process, stats, contentDelay, codecRate, version: voice ? voice.version : null,
+    return { process, stats, contentDelay, codecRate, frameSize, frameSeconds, version: voice ? voice.version : null,
       bitrate: Math.max(6000, Math.round(codec.bitrate * bits / 16)), vbr: !!codec.encoder?.vbr, dtx: !!codec.encoder?.dtx,
       gateDb: gateOn ? gateDb : null, autoGain, voiceRate: codec.voiceRate, realOpus: !!voice,
       setTalking(on) { talking = !!on; stats.talking = talking; },

@@ -209,6 +209,12 @@ select { cursor: pointer; }
 .live-meter-bar span { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--accent); transition: width 80ms linear; }
 .live-meter-bar span.live-hot { background: #ff4040; }
 .live-note { margin: 8px 0 0; font-size: 11.5px; color: var(--muted); line-height: 1.45; }
+.live-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-top: 10px; font-size: 12.5px; }
+.live-controls label { display: inline-flex; align-items: center; gap: 6px; margin: 0; cursor: pointer; }
+.live-controls kbd { padding: 0 4px; border: 1px solid #3a434d; border-radius: 3px; font-size: 11px; background: #1a2027; }
+#live-record.live-recording { background: #7a1f1f; border-color: #c03a3a; }
+#live-talk { touch-action: none; user-select: none; -webkit-user-select: none; }
+#live-talk.live-held { background: var(--lime); color: #111; }
 #live-toggle[aria-pressed="true"] { background: linear-gradient(to bottom, #a4d007 5%, #536904 95%); color: #fff; }
 
 /* Real take comparison */

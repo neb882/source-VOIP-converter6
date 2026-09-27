@@ -382,6 +382,47 @@ async function verifyLiveMonitor(page) {
     'the live monitor runs the microphone through the Steam chain in real time', `${live.stats.sent} of ${live.stats.frames} frames sent, ${live.tx}`);
   const ms = Number(/^(\d+) ms/.exec(live.latency)?.[1]);
   check(ms >= 130 && ms < 600, 'the live monitor reports its latency, gate pre-roll included', live.latency);
+
+  // Low latency drops the 120 ms pre-roll from the chain.
+  await page.locator('#live-lowlat').check();
+  await page.waitForFunction(() => TF2Live.stats && TF2Live.stats.latencyMs < 20, null, { timeout: 15000 });
+  const lowMs = await page.evaluate(() => TF2Live.stats.latencyMs);
+  await page.locator('#live-lowlat').uncheck();
+  await page.waitForFunction(() => TF2Live.stats && TF2Live.stats.latencyMs > 120, null, { timeout: 15000 });
+  check(lowMs < 20, 'low-latency mode drops the gate pre-roll from the live chain', `${lowMs.toFixed(1)} ms chain delay`);
+
+  // Push-to-talk: nothing is sent until the key or the button is held.
+  await page.locator('#live-ptt').check();
+  await page.waitForFunction(() => TF2Live.stats && TF2Live.stats.talking === false, null, { timeout: 15000 });
+  await page.waitForTimeout(400);
+  const idle0 = await page.evaluate(() => TF2Live.stats.sent);
+  await page.waitForTimeout(800);
+  const idle1 = await page.evaluate(() => ({ sent: TF2Live.stats.sent, tx: document.getElementById('live-tx').textContent,
+    button: !document.getElementById('live-talk').hidden }));
+  await page.keyboard.down('v');
+  await page.waitForFunction((n) => TF2Live.stats.sent > n + 10, idle1.sent, { timeout: 15000 });
+  await page.keyboard.up('v');
+  check(idle1.sent === idle0 && idle1.button && /push-to-talk/.test(idle1.tx),
+    'push-to-talk sends nothing until V is held, then sends', `${idle1.sent - idle0} frames sent while released; ${idle1.tx}`);
+  await page.locator('#live-ptt').uncheck();
+
+  // Record: the microphone and the voice come into the app lined up.
+  await page.locator('#live-record').click();
+  await page.waitForTimeout(3000);
+  await page.locator('#live-record').click();
+  await page.waitForFunction(() => state.sourceName && state.sourceName.startsWith('live-') && state.processedBuffer, null, { timeout: 20000 });
+  const take = await page.evaluate(async () => {
+    const dry = state.decodedSource.getChannelData(0), wet = state.processedBuffer, rate = state.processedRate;
+    const render = (await TF2Audio.process(state.decodedSource, renderOptions())).samples;
+    let dot = 0, ea = 0, eb = 0;
+    for (let i = Math.round(rate * .4); i < Math.min(wet.length, render.length) - rate * .2; i++) { dot += render[i] * wet[i]; ea += render[i] ** 2; eb += wet[i] ** 2; }
+    return { seconds: dry.length / rate, same: dry.length === wet.length, r: ea > 0 && eb > 0 ? dot / Math.sqrt(ea * eb) : 0,
+      lane: !!(state.lastCodecInfo && state.lastCodecInfo.frameLog && state.lastCodecInfo.frameLog.some(c => c > 0)),
+      ab: !els.abToggle.disabled };
+  });
+  check(take.seconds > 2 && take.same && take.ab && take.lane,
+    'Record loads the live session into the app as a dry/wet pair with its codec lane', `${take.seconds.toFixed(1)} s`);
+  check(take.r > 0.8, 'the recorded voice lines up with an offline render of the recorded microphone', `r ${take.r.toFixed(3)}`);
   await page.locator('#live-toggle').click();
   await page.waitForFunction(() => !TF2Live.running);
   check(await page.locator('#live-toggle').getAttribute('aria-pressed') === 'false', 'the live monitor stops');

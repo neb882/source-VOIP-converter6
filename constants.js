@@ -220,11 +220,14 @@ const PRESETS = {
 };
 
 /* -------------------------------------------------------------------------
- * Codec profiles. Every profile runs the bundled libopus; only `steam` is
- * calibrated against a real TF2 recording.
+ * Codec profiles. `steam` and `speex` run the bundled libopus, the CELT
+ * profiles the real CELT 0.11; only `steam` is calibrated against a real TF2
+ * recording.
  *
- *   codecRate   : Opus sample rate (8/12/16/24/48 kHz)
- *   bitrate     : bits per second at snd_bits 16 (20 ms frames)
+ *   engine      : 'celt011' for CELT 0.11 (frameSize samples per packetBytes
+ *                 packet, scaled by snd_bits / 16); otherwise Opus
+ *   codecRate   : codec sample rate (Opus: 8/12/16/24/48 kHz)
+ *   bitrate     : bits per second at snd_bits 16 (Opus: 20 ms frames)
  *   application : 'voip' (SILK/hybrid capable) or 'lowdelay' (CELT only)
  *   signal      : Opus signal hint; 'voice' keeps music in hybrid mode,
  *                 matching the SILK/CELT crossover seen in the recording
@@ -272,18 +275,22 @@ const CODEC_PROFILES = {
   // vaudio_celt is CELT 0.11 at 22050 Hz: 512-sample frames (23.2 ms) in
   // 64-byte packets, 22.05 kbps. Opus's CELT layer is its descendant; this is
   // a stand-in, not the 0.11 bitstream. See tests/LEGACY_CODECS.md.
+  // vaudio_celt: the real codec, CELT 0.11 (vendor/celt-0.11), in the custom
+  // mode three public decoders and two encoders agree on: 22050 Hz,
+  // 512-sample frames (23.2 ms), 64-byte packets (22.05 kbps), complexity 10
+  // (tests/LEGACY_CODECS.md). The receiver side is modeled, not measured.
   celt_22: {
-    displayName: 'CELT era (Opus CELT layer, 22 kbps)',
-    codecRate: 24000, bitrate: 22000, application: 'lowdelay', signal: 'auto',
-    voiceRate: 22050, mixer: 'linear', status: 'modeled'
+    displayName: 'vaudio_celt (CELT 0.11, 22 kHz, 64-byte frames)',
+    engine: 'celt011', codecRate: 22050, frameSize: 512, packetBytes: 64, complexity: 10,
+    bitrate: 22050, voiceRate: 22050, mixer: 'linear', status: 'modeled'
   },
-  // vaudio_celt_high: one public source gives 44100 Hz, 256-sample frames
-  // and 120-byte packets (165 kbps), at odds with the "44 kbps" usually
-  // quoted; unconfirmed until a take (tests/LEGACY_CODECS.md).
+  // vaudio_celt_high: the same CELT 0.11 at the one public source's settings,
+  // 44100 Hz, 256-sample frames and 120-byte packets (165 kbps). That is at
+  // odds with the "44 kbps" usually quoted; unconfirmed until a take.
   celt_44: {
-    displayName: 'CELT high (Opus CELT layer, 44 kbps)',
-    codecRate: 48000, bitrate: 44000, application: 'lowdelay', signal: 'auto',
-    voiceRate: 44100, mixer: 'sinc', status: 'modeled'
+    displayName: 'vaudio_celt_high (CELT 0.11, 44 kHz, 120-byte frames)',
+    engine: 'celt011', codecRate: 44100, frameSize: 256, packetBytes: 120, complexity: 10,
+    bitrate: 165375, voiceRate: 44100, mixer: 'sinc', status: 'modeled'
   },
   // vaudio_speex was 8 kHz narrowband CELP. SILK is a different LPC codec
   // with a similar narrowband character; this is a stand-in. Source's Speex

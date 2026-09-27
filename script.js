@@ -1401,7 +1401,8 @@ function presentRender({ samples, sampleRate, blob, realOpus, codecInfo, stats }
   // Report the actual processing path: codec version, bitrate and the
   // Opus modes the encoder really chose.
   logLine(realOpus
-    ? `S_Voice: ${codecInfo.version}, ${codecInfo.bitrate / 1000} kbps ${codecInfo.vbr ? 'VBR' : 'CBR'}${codecInfo.dtx ? ' + DTX' : ''}, 20 ms frames, native PLC (${describeModes(codecInfo.modes)})`
+    ? `S_Voice: ${codecInfo.version}, ${codecInfo.bitrate / 1000} kbps ${codecInfo.vbr ? 'VBR' : 'CBR'}${codecInfo.dtx ? ' + DTX' : ''}, `
+      + `${codecInfo.packetBytes ? `${codecInfo.packetBytes}-byte packets of ` : ''}${+(codecInfo.frameMs || 20).toFixed(1)} ms, native PLC (${describeModes(codecInfo.modes)})`
     : 'S_Voice: codec bypassed', 'sys');
   if (realOpus && codecInfo.gate != null) {
     const held = codecInfo.frames ? Math.round(100 * codecInfo.gatedFrames / codecInfo.frames) : 0;
@@ -1453,6 +1454,24 @@ function presentRender({ samples, sampleRate, blob, realOpus, codecInfo, stats }
   setStatus(`Ready · ${method} · ${(took / 1000).toFixed(1)}s render · ${sampleRate.toLocaleString()} Hz`, 'success');
   logLine(`ChangeLevel: rendered ${samples.length} samples @ ${sampleRate}Hz in ${took}ms`, 'sys');
   logLine(`Net_SendPacket: reliable stream ready.`);
+}
+
+// A recorded live-monitor session (live.js): the microphone becomes the
+// source and the voice the render, already lined up by the live worker, so
+// A/B, the views, the meter and downloads work as after a render. Rendering
+// again replaces the voice with an offline render of the same microphone.
+function mountLiveTake({ dry, wet, rate, frameLog, counts, info }) {
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  mountSource(dry, rate, `live-${stamp}`);
+  const codecRate = (CODEC_PROFILES[info.codec] || CODEC_PROFILES.steam).codecRate, frameSamples = info.frameSamples || codecRate / 50;
+  const codecInfo = { backend: info.realOpus ? 'libopus' : 'bypass', version: info.version || 'bypass', bitrate: info.bitrate,
+    vbr: info.vbr, dtx: info.dtx, modes: counts.modes, gate: info.gate, spurts: counts.spurts, gatedFrames: counts.gated,
+    frames: counts.frames, dtxFrames: counts.dtx, lostFrames: counts.lost, underrunFrames: counts.late,
+    autoGain: info.autoGain, voiceRate: info.voiceRate, codec: info.codec, live: true,
+    // One code per codec frame of the recording, from its start.
+    frameLog, frameSamples, sampleRate: codecRate, lookahead: 0, frameMs: 1000 * frameSamples / codecRate, framesPerPacket: 1 };
+  logLine(`voice_record: live take of ${(dry.length / rate).toFixed(1)} s loaded (${counts.spurts} talk spurt${counts.spurts === 1 ? '' : 's'}).`, 'sys');
+  presentRender({ samples: wet, sampleRate: rate, blob: TF2Audio.encodeWav(wet, rate), realOpus: !!info.realOpus, codecInfo }, 0, info.codec || 'steam');
 }
 
 if (els.cancel) els.cancel.addEventListener('click', () => {

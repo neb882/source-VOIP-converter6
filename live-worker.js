@@ -49,8 +49,8 @@ async function processBlock(block) {
     recording.dry.push(block);
     // Output sample j of this chain is its input sample j - contentDelay.
     if (out.length) recording.wet.push({ at: c.startTotal + c.outTotal - c.contentDelay - recording.start, samples: out.slice() });
-    // Codec frame k of this chain covers its input from k * 20 ms.
-    codes.forEach((code, k) => recording.frames.push({ at: c.startTotal / rate + (c.frameTotal + k) * .02 - recording.start / rate, code }));
+    // Codec frame k of this chain covers its input from k frame lengths on.
+    codes.forEach((code, k) => recording.frames.push({ at: c.startTotal / rate + (c.frameTotal + k) * c.frameSeconds - recording.start / rate, code }));
     recording.chain = c;
   }
   c.outTotal += out.length;
@@ -72,10 +72,12 @@ function finishRecording() {
       if (j >= 0 && j < length) wet[j] = piece.samples[i];
     }
   }
-  const frameLog = new Uint8Array(Math.ceil(length / rate * 50));
+  const c = rec.chain || chain;
+  const frameSeconds = c ? c.frameSeconds : .02;
+  const frameLog = new Uint8Array(Math.ceil(length / rate / frameSeconds));
   const counts = { frames: frameLog.length, gated: 0, dtx: 0, lost: 0, late: 0, modes: { silk: 0, hybrid: 0, celt: 0 } };
   for (const { at, code } of rec.frames) {
-    const f = Math.round(at * 50);
+    const f = Math.round(at / frameSeconds);
     if (f >= 0 && f < frameLog.length) frameLog[f] = code;
   }
   let spurts = 0;
@@ -89,8 +91,7 @@ function finishRecording() {
     if (code === 5) counts.lost++;
     if (code === 6) counts.late++;
   });
-  const c = rec.chain || chain;
-  const info = c ? { version: c.version, bitrate: c.bitrate, vbr: c.vbr, dtx: c.dtx, gate: c.gateDb, autoGain: c.autoGain,
+  const info = c ? { frameSamples: c.frameSize, version: c.version, bitrate: c.bitrate, vbr: c.vbr, dtx: c.dtx, gate: c.gateDb, autoGain: c.autoGain,
     voiceRate: c.voiceRate, codec: c.stats.codec, realOpus: c.realOpus } : {};
   self.postMessage({ type: 'recording', dry: dry.buffer, wet: wet.buffer, rate, frameLog: frameLog.buffer, counts: { ...counts, spurts }, info },
     [dry.buffer, wet.buffer, frameLog.buffer]);
