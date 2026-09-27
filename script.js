@@ -1615,8 +1615,8 @@ function meterCell(key, value) {
 }
 
 // Values worth a second look: peaks that clip on 16-bit export or lossy
-// encoding, and a DC offset (libopus 1.1.x SILK can add one to strong
-// content below ~60 Hz; see README).
+// encoding, and a DC offset (libopus 1.1.x comfort noise for a steady tone
+// below ~60 Hz is nearly DC; see README).
 function meterWarning(key, value) {
   if (value === null || value === undefined || !Number.isFinite(value)) return null;
   if (key === 'truePeak' && value > 0) return { level: 'meter-bad', text: 'Inter-sample peaks above 0 dBTP clip after MP3 decoding or resampling' };
