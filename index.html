@@ -250,37 +250,61 @@
         <progress id="process-progress" max="100" value="0" hidden aria-label="Audio processing progress"></progress>
       </div>
 
-      <div class="viz-container">
-        <div class="scanlines"></div>
-        <canvas id="visualizer" tabindex="0" aria-label="Audio visualizer. In WAVE and SPEC: Ctrl or Command plus wheel, or pinch, zooms in time; drag or Shift plus wheel pans; click seeks. Keys: plus and minus zoom, arrows pan, 0 shows the whole file."></canvas>
+      <div class="viz-container" id="viz-container">
         <div class="viz-toolbar">
-          <div class="viz-modes" role="group" aria-label="Zoom and scale">
-            <button id="viz-log" class="viz-mode" type="button" aria-pressed="false" title="Spectrogram frequency axis: log from 20 Hz, with ~3 Hz resolution below 400 Hz">LOG</button>
-            <button id="viz-zoom-out" class="viz-mode viz-zoom-step" type="button" title="Zoom out (−). Ctrl/⌘ + wheel or pinch zooms around the pointer" aria-label="Zoom out">−</button>
-            <button id="viz-zoom-in" class="viz-mode viz-zoom-step" type="button" title="Zoom in (+). Drag or Shift + wheel pans; click seeks" aria-label="Zoom in">+</button>
-            <button id="viz-fit" class="viz-mode" type="button" title="Show the whole file (0)">FIT</button>
-            <button id="viz-range" class="viz-mode" type="button" hidden title="Displayed dynamic range: how far below the loudest level the colours (or the dB waveform) reach">72 dB</button>
-            <button id="viz-tall" class="viz-mode" type="button" aria-pressed="false" title="Taller view (or drag the bottom-right corner)">TALL</button>
-          </div>
           <div class="viz-modes" role="group" aria-label="Visualizer mode">
             <button id="viz-wave" class="viz-mode active" type="button" aria-pressed="true" title="Waveform: peak and RMS envelope; single samples when zoomed in">WAVE</button>
             <button id="viz-bars" class="viz-mode" type="button" aria-pressed="false" title="Log-frequency spectrum in dBFS">BARS</button>
-            <button id="viz-spec" class="viz-mode" type="button" aria-pressed="false" title="Spectrogram; LOG for detail below 100 Hz">SPEC</button>
+            <button id="viz-spec" class="viz-mode" type="button" aria-pressed="false" title="Spectrogram. Zoom the frequency axis with the wheel over its ruler (or Alt + wheel), drag the ruler to move the band">SPEC</button>
+          </div>
+          <div class="viz-modes" role="group" aria-label="Scale and resolution">
+            <button id="viz-log" class="viz-mode viz-toggle" type="button" aria-pressed="false" title="Spectrogram frequency axis: log from 20 Hz">LOG</button>
+            <select id="viz-res" class="viz-select" hidden aria-label="Spectrogram resolution" title="Spectrogram FFT size. AUTO follows the zoom: shorter windows when zoomed in on time, longer when zoomed in on frequency and for the low octaves. A fixed size is in samples at the file's rate">
+              <option value="auto">RES AUTO</option>
+              <option value="256">256</option>
+              <option value="512">512</option>
+              <option value="1024">1024</option>
+              <option value="2048">2048</option>
+              <option value="4096">4096</option>
+              <option value="8192">8192</option>
+              <option value="16384">16384</option>
+            </select>
+            <button id="viz-range" class="viz-mode" type="button" hidden title="Displayed dynamic range: how far below the loudest level the colours (or the dB waveform) reach">72 dB</button>
+          </div>
+          <div class="viz-modes" role="group" aria-label="Zoom">
+            <button id="viz-zoom-out" class="viz-mode viz-zoom-step" type="button" title="Zoom out (−). Ctrl/⌘ + wheel or pinch zooms around the pointer" aria-label="Zoom out">−</button>
+            <button id="viz-zoom-in" class="viz-mode viz-zoom-step" type="button" title="Zoom in (+). Drag or Shift + wheel pans; click seeks" aria-label="Zoom in">+</button>
+            <button id="viz-fit" class="viz-mode" type="button" title="Show the whole file and the whole band (0)">FIT</button>
+          </div>
+          <div class="viz-modes" role="group" aria-label="Lanes and playback">
+            <button id="viz-lufs" class="viz-mode viz-toggle" type="button" aria-pressed="false" title="Loudness lane: momentary and short-term loudness (LUFS) of the render and the source over time">LUFS</button>
+            <button id="viz-loop" class="viz-mode viz-toggle" type="button" aria-pressed="false" disabled title="Loop the whole file (L); Shift + drag or drag the time ruler to select a range">LOOP</button>
+            <button id="viz-tall" class="viz-mode viz-toggle" type="button" aria-pressed="false" title="Taller view (or drag the bottom-right corner)">TALL</button>
           </div>
         </div>
-        <!-- Source-style net_graph HUD: voice numbers come from the last render -->
-        <div id="net-graph" class="ng-level-0" aria-hidden="true">
-          <div class="ng-row-basic">fps: <span class="ng-fps" id="ng-fps">0</span> <span class="ng-row-graph"><span class="ng-bar"><span class="ng-bar-fill" id="ng-fill"></span></span></span></div>
-          <div class="ng-row-basic">ping: <span class="ng-ping" id="ng-ping">5</span> ms</div>
-          <div class="ng-row-advanced">in : <span id="ng-in">0 0.00</span> k/s</div>
-          <div class="ng-row-advanced">out: <span id="ng-out">0 0.00</span> k/s</div>
-          <div class="ng-row-advanced">lerp: <span class="ng-lerp" id="ng-lerp">100.0</span> ms</div>
-          <div class="ng-row-basic">loss: <span class="ng-loss" id="ng-loss-val">0</span> choke: 0</div>
-          <div class="ng-row-sv">sv: 3.4 +- 0.2 ms</div>
+        <div class="viz-stage">
+          <div class="scanlines"></div>
+          <canvas id="visualizer" tabindex="0" aria-label="Audio visualizer. In WAVE and SPEC: Ctrl or Command plus wheel, or pinch, zooms in time; drag or Shift plus wheel pans; click seeks. Shift plus drag, or a drag along the time ruler, selects a range: Z zooms to it, Escape clears it, L loops. In SPEC the wheel over the frequency ruler, Alt plus wheel, or the up and down arrows zoom the frequency axis. Keys: plus and minus zoom, arrows pan, 0 shows the whole file."></canvas>
+          <!-- Source-style net_graph HUD: voice numbers come from the last render -->
+          <div id="net-graph" class="ng-level-0" aria-hidden="true">
+            <div class="ng-row-basic">fps: <span class="ng-fps" id="ng-fps">0</span> <span class="ng-row-graph"><span class="ng-bar"><span class="ng-bar-fill" id="ng-fill"></span></span></span></div>
+            <div class="ng-row-basic">ping: <span class="ng-ping" id="ng-ping">5</span> ms</div>
+            <div class="ng-row-advanced">in : <span id="ng-in">0 0.00</span> k/s</div>
+            <div class="ng-row-advanced">out: <span id="ng-out">0 0.00</span> k/s</div>
+            <div class="ng-row-advanced">lerp: <span class="ng-lerp" id="ng-lerp">100.0</span> ms</div>
+            <div class="ng-row-basic">loss: <span class="ng-loss" id="ng-loss-val">0</span> choke: 0</div>
+            <div class="ng-row-sv">sv: 3.4 +- 0.2 ms</div>
+          </div>
         </div>
       </div>
+      <div id="viz-legend" class="viz-legend" hidden></div>
 
       <div id="meter" class="meter" hidden>
+        <div id="meter-sel" class="meter-sel" hidden>
+          <span id="meter-sel-text"></span>
+          <button id="meter-sel-zoom" class="preset-btn" type="button" title="Zoom the view to the selection (Z)">Zoom to selection</button>
+          <button id="meter-sel-clear" class="preset-btn" type="button" title="Clear the selection (Esc); the meter shows the whole file again">Clear</button>
+        </div>
         <table>
           <caption>Loudness and levels · ITU-R BS.1770-4 / EBU R128, measured as one channel</caption>
           <thead>

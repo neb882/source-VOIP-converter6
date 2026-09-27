@@ -13,6 +13,9 @@
  *
  * TF2Meter.analyze(samples, sampleRate) -> stats; levels in dB, -Infinity for
  * silence, null where the file is too short (under 0.4 s, or 3 s for LRA).
+ * stats.history holds momentary and short-term loudness every 100 ms
+ * (Float32Array, LUFS); value k covers the window ending at (k + 4) * 0.1 s
+ * (momentary) or (k + 30) * 0.1 s (short-term).
  */
 (function () {
   'use strict';
@@ -136,6 +139,11 @@
     }
     const max = (values) => (values.length ? loudness(Math.max(...values)) : null);
     const tp = n ? truePeak(samples, peak) : 0;
+    const history = {
+      hop: 0.1,
+      momentary: Float32Array.from(momentary, loudness),
+      shortTerm: Float32Array.from(shortTerm, loudness)
+    };
     const rms = n ? Math.sqrt(sumSq / n) : 0;
     const db = (v) => (v > 0 ? 20 * Math.log10(v) : -Infinity);
     return {
@@ -149,7 +157,8 @@
       rms: db(rms),
       crest: peak > 0 && rms > 0 ? db(peak) - db(rms) : null,
       plr: integrated !== null && Number.isFinite(integrated) && tp > 0 ? db(tp) - integrated : null,
-      dc: n ? sum / n : 0
+      dc: n ? sum / n : 0,
+      history
     };
   }
 

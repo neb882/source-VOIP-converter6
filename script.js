@@ -1439,7 +1439,7 @@ function presentRender({ samples, sampleRate, blob, realOpus, codecInfo, stats }
 
   state.renderId++;
   state.lastCodecInfo = codecInfo;
-  resetVizView();
+  // A re-render of the same source keeps the view, band and selection.
   refreshVisualizer();
   updateMeter();
   const method = realOpus ? `Real Opus · ${codecInfo.bitrate / 1000} kbps` : 'Codec bypassed';
@@ -1567,33 +1567,56 @@ els.audio.addEventListener('ratechange', () => { if (els.audioDry) els.audioDry.
 /* Meter and loudness-matched A/B (meter.js)                          */
 /*                                                                    */
 /* The meter lists loudness and levels of the wet render and the dry  */
-/* source. Matching plays the louder of the two quieter by their      */
-/* difference in integrated loudness, so an A/B compares sound rather */
-/* than level.                                                        */
+/* source, or of the time range selected in the visualizer. Matching  */
+/* plays the louder of the two quieter by their difference in         */
+/* integrated loudness over the whole file, so an A/B compares sound  */
+/* rather than level.                                                 */
 /* ------------------------------------------------------------------ */
 
 els.meter = document.getElementById('meter');
 els.meterRows = document.getElementById('meter-rows');
+els.meterSel = document.getElementById('meter-sel');
+els.meterSelText = document.getElementById('meter-sel-text');
+els.meterSelZoom = document.getElementById('meter-sel-zoom');
+els.meterSelClear = document.getElementById('meter-sel-clear');
 els.abMatch = document.getElementById('ab-match');
 state.abMatch = LS.get('tf2ve_ab_match', false) === true;
 state.abOffsetDb = 0;         // gain applied to the louder version, dB (<= 0)
 state.abLouder = null;        // 'WET' or 'DRY'
 
+// TF2Meter.analyze on a copy of `samples`, in a worker when there is one.
+function analyzeCopy(samples, rate) {
+  const copy = samples.slice();
+  if (canUseWorker()) {
+    return startWorker({ type: 'analyze', samples: copy.buffer, sampleRate: rate }, [copy.buffer]).promise.then(reply => reply.stats);
+  }
+  return new Promise(resolve => setTimeout(() => resolve(TF2Meter.analyze(copy, rate)), 0));
+}
+
 const meterResults = new Map();   // buffer id -> Promise<stats>
 function measure(samples, rate) {
   const id = bufferId(samples);
   if (!meterResults.has(id)) {
-    let job;
-    if (canUseWorker()) {
-      const copy = samples.slice();
-      job = startWorker({ type: 'analyze', samples: copy.buffer, sampleRate: rate }, [copy.buffer]).promise.then(reply => reply.stats);
-    } else {
-      job = new Promise(resolve => setTimeout(() => resolve(TF2Meter.analyze(samples, rate)), 0));
-    }
+    const job = analyzeCopy(samples, rate);
     job.catch(() => meterResults.delete(id));
     meterResults.set(id, job);
   }
   return meterResults.get(id);
+}
+
+// Statistics of the samples between t0 and t1 s, for a selection; the last
+// few ranges are kept.
+const rangeResults = new Map();   // "id:from:to" -> Promise<stats>
+function measureRange(samples, rate, t0, t1) {
+  const from = Math.max(0, Math.floor(t0 * rate)), to = Math.min(samples.length, Math.max(from + 1, Math.ceil(t1 * rate)));
+  const key = `${bufferId(samples)}:${from}:${to}`;
+  if (!rangeResults.has(key)) {
+    if (rangeResults.size >= 24) rangeResults.delete(rangeResults.keys().next().value);
+    const job = analyzeCopy(samples.subarray(from, to), rate);
+    job.catch(() => rangeResults.delete(key));
+    rangeResults.set(key, job);
+  }
+  return rangeResults.get(key);
 }
 
 function meterSources() {
@@ -1626,13 +1649,26 @@ function meterWarning(key, value) {
   return null;
 }
 
-let meterGeneration = 0;
+let meterGeneration = 0, meterSourcesKey = '';
 async function updateMeter() {
   const sources = meterSources();
   const generation = ++meterGeneration;
+  const selection = vizSel;
   if (els.meter) els.meter.hidden = !sources.length;
-  state.meterStats = null;
-  applyAbMatch();
+  // Whole-file statistics drive the A/B matching and the loudness lane; they
+  // only change with the audio, not with the selection.
+  const sourcesKey = sources.map(src => bufferId(src.samples)).join(':');
+  if (sourcesKey !== meterSourcesKey) {
+    meterSourcesKey = sourcesKey;
+    state.meterStats = null;
+    applyAbMatch();
+  }
+  if (els.meterSel) {
+    els.meterSel.hidden = !selection || !sources.length;
+    if (selection) {
+      els.meterSelText.textContent = `Selection ${formatTime(selection.t0, 3)} – ${formatTime(selection.t1, 3)} · ${(selection.t1 - selection.t0).toFixed(3)} s`;
+    }
+  }
   if (!sources.length || !els.meterRows) return;
   const row = (label, cells, cls = '', stats = null) => {
     const tr = document.createElement('tr');
@@ -1651,7 +1687,17 @@ async function updateMeter() {
     return tr;
   };
   els.meterRows.replaceChildren(...sources.map(src => row(src.label, METER_COLUMNS.map(() => '…'))));
-  const results = await Promise.all(sources.map(src => measure(src.samples, src.rate).catch(() => null)));
+  const whole = await Promise.all(sources.map(src => measure(src.samples, src.rate).catch(() => null)));
+  if (generation !== meterGeneration) return;
+  const hadStats = !!state.meterStats;
+  state.meterStats = { wet: whole[0] && sources[0].label === 'WET' ? whole[0] : null,
+    dry: whole[sources.length - 1] && sources[sources.length - 1].label === 'DRY' ? whole[sources.length - 1] : null };
+  applyAbMatch();
+  // The loudness lane draws from these.
+  if (!hadStats && state.showLufs) refreshVisualizer();
+  const results = selection
+    ? await Promise.all(sources.map(src => measureRange(src.samples, src.rate, selection.t0, selection.t1).catch(() => null)))
+    : whole;
   if (generation !== meterGeneration) return;
   const rows = sources.map((src, i) => row(src.label, METER_COLUMNS.map(([key]) => (results[i] ? meterCell(key, results[i][key]) : 'error')), '', results[i]));
   if (results.length === 2 && results[0] && results[1]) {
@@ -1665,10 +1711,9 @@ async function updateMeter() {
     }), 'meter-delta'));
   }
   els.meterRows.replaceChildren(...rows);
-  state.meterStats = { wet: results[0] && sources[0].label === 'WET' ? results[0] : null,
-    dry: results[sources.length - 1] && sources[sources.length - 1].label === 'DRY' ? results[sources.length - 1] : null };
-  applyAbMatch();
 }
+if (els.meterSelZoom) els.meterSelZoom.addEventListener('click', () => zoomToSelection());
+if (els.meterSelClear) els.meterSelClear.addEventListener('click', () => { setSelection(null); refreshVisualizer(); });
 
 // A/B gain (dB) for 'WET' or 'DRY'; 0 unless matching is on.
 function abGainDb(label) {
@@ -1701,7 +1746,8 @@ if (els.abMatch) els.abMatch.addEventListener('click', () => {
   refreshVisualizer();
 });
 
-// Space plays and pauses the preview, B switches A/B, outside text fields and buttons.
+// Space plays and pauses the preview, B switches A/B and L loops, outside
+// text fields and buttons.
 document.addEventListener('keydown', (event) => {
   if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || event.repeat) return;
   const target = event.target;
@@ -1712,6 +1758,9 @@ document.addEventListener('keydown', (event) => {
   } else if ((event.key === 'b' || event.key === 'B') && !els.abToggle.disabled) {
     event.preventDefault();
     els.abToggle.click();
+  } else if ((event.key === 'l' || event.key === 'L') && els.vizLoop && !els.vizLoop.disabled) {
+    event.preventDefault();
+    toggleLoop();
   }
 });
 
@@ -1723,15 +1772,22 @@ document.addEventListener('keydown', (event) => {
 /* BARS: log-frequency spectrum in dBFS. Live from the AnalyserNode   */
 /*       while playing; computed from the rendered buffer at the      */
 /*       playhead when paused, with the analyser's own window/scale.  */
-/* SPEC: spectrogram with a linear frequency axis (codec band edges   */
-/*       read as lines) or a log axis from 20 Hz. On the log axis the */
-/*       band below 400 Hz comes from the signal decimated 16x and a  */
-/*       1024-point FFT: about 3 Hz resolution, with a longer window. */
+/* SPEC: spectrogram, linear or log frequency. The visible band is    */
+/*       analysed in up to three tiers, each from a signal decimated  */
+/*       to suit its top frequency. The FFT size follows the zoom so  */
+/*       one window spans about as many pixels in time as one bin in  */
+/*       frequency (like iZotope RX's auto-adjust), or is set by hand.*/
 /*                                                                    */
-/* WAVE and SPEC zoom in time: Ctrl/⌘ + wheel or a pinch zooms, a     */
-/* drag or Shift + wheel pans, a click seeks, and the − + FIT buttons */
-/* and the + − 0 ← → keys do the same. Only the visible range is      */
-/* rendered, at the canvas's device-pixel size.                       */
+/* Under WAVE and SPEC: an optional loudness lane (momentary and      */
+/* short-term LUFS, wet and dry), the codec lane (what the voice path */
+/* did with each 20 ms frame) and the time ruler.                     */
+/*                                                                    */
+/* Time: Ctrl/⌘ + wheel or a pinch zooms, a drag or Shift + wheel     */
+/* pans, a click seeks, the − + FIT buttons and + − 0 ← → keys too.   */
+/* Frequency (SPEC): the wheel over the left ruler, Alt or            */
+/* Ctrl/⌘ + Shift + wheel over the view, ↑ ↓ keys; drag the ruler to  */
+/* pan, double-click it to reset. Shift + drag selects a range for    */
+/* the meter and the loop; Z zooms to it, Esc clears it, L loops.     */
 /* ------------------------------------------------------------------ */
 
 const ctx = els.canvas.getContext('2d', { alpha: false });
@@ -1741,25 +1797,36 @@ const VIZ = {
   fftSize: 8192,             // BARS: 5.4-5.9 Hz bins, 170-186 ms window
   ranges: [48, 72, 96, 120], // selectable displayed dynamic range (SPEC, WAVE in dB)
   bandEdgeHz: 12000,         // Opus super-wideband edge used by the Steam profile
-  specFft: 2048,             // spectrogram FFT at the file's rate
   logMinHz: 20,              // floor of the log spectrogram
-  lowSplitHz: 400,           // log spectrogram: rows below this use the decimated signal
-  lowFactor: 16,
-  lowFft: 1024,
+  minFreqSpanHz: 40,         // deepest frequency zoom, linear axis
+  minFreqRatio: 1.3,         // deepest frequency zoom, log axis (top / bottom)
+  fftMin: 64, fftMax: 16384, // FFT sizes, in samples of the analysed (decimated) signal
+  maxWindowSec: 1.4,         // longest AUTO analysis window
+  maxDecimation: 64,
   maxColumns: 1600,          // spectrogram columns per image (stretched to the canvas)
-  minSpanSamples: 48,        // deepest zoom: this many samples across the view
-  tallHeight: 400            // px, the TALL view
+  minSpanSamples: 48,        // deepest time zoom: this many samples across the view
+  rulerH: 16, laneH: 12,     // px: time ruler and codec lane under WAVE / SPEC
+  lufsFrac: 0.26, lufsMinH: 48, lufsTop: 0, lufsFloor: -48,
+  freqRulerW: 36,            // px: the SPEC frequency ruler along the left edge
+  tallHeight: 520            // px, the TALL view
 };
-els.vizContainer = els.canvas.parentElement;
+els.vizContainer = document.getElementById('viz-container');
 els.vizLog = document.getElementById('viz-log');
 els.vizZoomIn = document.getElementById('viz-zoom-in');
 els.vizZoomOut = document.getElementById('viz-zoom-out');
 els.vizFit = document.getElementById('viz-fit');
 els.vizTall = document.getElementById('viz-tall');
 els.vizRange = document.getElementById('viz-range');
+els.vizRes = document.getElementById('viz-res');
+els.vizLufs = document.getElementById('viz-lufs');
+els.vizLoop = document.getElementById('viz-loop');
+els.vizLegend = document.getElementById('viz-legend');
 state.vizScale = LS.get('tf2ve_viz_scale', 'lin') === 'log' ? 'log' : 'lin';
 state.waveScale = LS.get('tf2ve_wave_scale', 'lin') === 'db' ? 'db' : 'lin';
 state.vizRange = VIZ.ranges.includes(Number(LS.get('tf2ve_viz_range', 72))) ? Number(LS.get('tf2ve_viz_range', 72)) : 72;
+state.specRes = (() => { const v = LS.get('tf2ve_spec_res', 'auto'); return v === 'auto' || [256, 512, 1024, 2048, 4096, 8192, 16384].includes(Number(v)) ? v : 'auto'; })();
+state.showLufs = LS.get('tf2ve_lufs_lane', false) === true;
+state.loop = false;
 let vizPeaks = null, vizPeakTime = 0;
 
 function resizeCanvas() {
@@ -1896,13 +1963,16 @@ function playheadFraction() {
   return Number.isFinite(d) && d > 0 ? Math.min(1, Math.max(0, els.audio.currentTime / d)) : 0;
 }
 
-/* ---------------- time view (zoom and pan) ---------------- */
+/* ---------------- time view (zoom and pan) and selection ---------------- */
 
 // Visible time range in seconds; t1 = Infinity runs to the end of the file.
 const vizView = { t0: 0, t1: Infinity };
+let vizSel = null;   // selected time range { t0, t1 } in seconds, or null
 function resetVizView() {
   vizView.t0 = 0;
   vizView.t1 = Infinity;
+  resetFreqView();
+  setSelection(null);
 }
 
 function visibleRange(buffer) {
@@ -1942,10 +2012,120 @@ function panViz(fraction) {
   setVizView(r.t0 + fraction * (r.t1 - r.t0), r.t1 - r.t0, r.duration);
 }
 
+let selectionTimer = 0;
+function setSelection(range) {
+  const next = range && range.t1 - range.t0 > 1e-4 ? { t0: Math.max(0, range.t0), t1: range.t1 } : null;
+  const changed = JSON.stringify(next) !== JSON.stringify(vizSel);
+  vizSel = next;
+  if (!changed) return;
+  applyLoop();
+  // The meter follows the selection once it settles.
+  clearTimeout(selectionTimer);
+  selectionTimer = setTimeout(() => { if (typeof updateMeter === 'function') updateMeter(); }, 150);
+}
+
+function zoomToSelection() {
+  const buffer = audibleBuffer();
+  if (!buffer || !vizSel || state.vizMode === 'bars') return;
+  const r = visibleRange(buffer), span = vizSel.t1 - vizSel.t0;
+  // A little room either side, as editors do.
+  setVizView(vizSel.t0 - span * 0.05, Math.max(r.minSpan, span * 1.1), r.duration);
+}
+
+/* ---------------- frequency view (SPEC) ---------------- */
+
+// Visible band in Hz; null ends run to the full band.
+const vizFreq = { lo: null, hi: null };
+function specTop(rate) { return Math.min(VIZ.maxHz, rate / 2); }
+
+function freqRange(rate, scale = state.vizScale) {
+  const top = specTop(rate), floor = scale === 'log' ? VIZ.logMinHz : 0;
+  let lo = Math.max(floor, Math.min(vizFreq.lo ?? floor, top));
+  let hi = Math.min(top, Math.max(vizFreq.hi ?? top, lo));
+  if (scale === 'log') {
+    if (hi / lo < VIZ.minFreqRatio) { hi = Math.min(top, lo * VIZ.minFreqRatio); lo = hi / VIZ.minFreqRatio; }
+  } else if (hi - lo < VIZ.minFreqSpanHz) {
+    hi = Math.min(top, lo + VIZ.minFreqSpanHz); lo = Math.max(floor, hi - VIZ.minFreqSpanHz);
+  }
+  return { lo, hi, top, floor, scale, zoomed: lo > floor * 1.0001 + 1e-6 || hi < top * 0.9999 };
+}
+// The axis is linear in Hz or in log Hz; d() maps a frequency onto it.
+const freqDomain = (scale) => (scale === 'log' ? Math.log : (f) => f);
+const freqUndomain = (scale) => (scale === 'log' ? Math.exp : (d) => d);
+
+// Frequency at height fraction u (0 = bottom, 1 = top) of the visible band.
+function specHz(u, rate, scale = state.vizScale) {
+  const r = freqRange(rate, scale), d = freqDomain(scale), inv = freqUndomain(scale);
+  return inv(d(r.lo) + u * (d(r.hi) - d(r.lo)));
+}
+function hzToU(hz, rate, scale = state.vizScale) {
+  const r = freqRange(rate, scale), d = freqDomain(scale);
+  return (d(Math.max(hz, 1e-9)) - d(r.lo)) / (d(r.hi) - d(r.lo));
+}
+
+function setFreqView(lo, hi, rate) {
+  const full = freqRange(rate, state.vizScale);
+  const floor = full.floor, top = full.top;
+  if (lo <= floor * 1.0001 + 1e-6 && hi >= top * 0.9999) { vizFreq.lo = null; vizFreq.hi = null; }
+  else { vizFreq.lo = Math.max(floor, lo); vizFreq.hi = Math.min(top, hi); }
+  refreshVisualizer();
+}
+
+// Zoom the frequency axis by `factor` (< 1 zooms in) around height fraction `anchor`.
+function zoomFreq(factor, anchor = 0.5) {
+  const buffer = audibleBuffer();
+  if (!buffer || state.vizMode !== 'spec') return;
+  const scale = state.vizScale, r = freqRange(buffer.rate, scale), d = freqDomain(scale), inv = freqUndomain(scale);
+  const d0 = d(r.lo), d1 = d(r.hi), dFloor = d(r.floor), dTop = d(r.top);
+  const minSpan = scale === 'log' ? Math.log(VIZ.minFreqRatio) : VIZ.minFreqSpanHz;
+  const span = Math.min(dTop - dFloor, Math.max(minSpan, (d1 - d0) * factor));
+  const at = d0 + anchor * (d1 - d0);
+  const start = Math.min(Math.max(dFloor, at - anchor * span), dTop - span);
+  setFreqView(inv(start), inv(start + span), buffer.rate);
+}
+
+function panFreq(fraction) {
+  const buffer = audibleBuffer();
+  if (!buffer || state.vizMode !== 'spec') return;
+  const scale = state.vizScale, r = freqRange(buffer.rate, scale), d = freqDomain(scale), inv = freqUndomain(scale);
+  const d0 = d(r.lo), d1 = d(r.hi), span = d1 - d0, dFloor = d(r.floor), dTop = d(r.top);
+  const start = Math.min(Math.max(dFloor, d0 + fraction * span), dTop - span);
+  setFreqView(inv(start), inv(start + span), buffer.rate);
+}
+
+function resetFreqView() { vizFreq.lo = null; vizFreq.hi = null; }
+
+/* ---------------- layout ---------------- */
+
+// The per-frame log of the last render, if its codec ran.
+function codecFrames() {
+  const info = state.lastCodecInfo;
+  return info && info.frameLog && state.processedBuffer ? info : null;
+}
+
+// WAVE and SPEC: the image on top, then the loudness lane (if on), the
+// codec lane (after a render with the codec) and the time ruler.
+function vizLayout(w, h) {
+  const time = state.vizMode !== 'bars';
+  const rulerH = time ? VIZ.rulerH : 0;
+  const laneH = time && codecFrames() ? VIZ.laneH : 0;
+  let lufsH = time && state.showLufs ? Math.max(VIZ.lufsMinH, Math.round(h * VIZ.lufsFrac)) : 0;
+  if (h - rulerH - laneH - lufsH < 40) lufsH = 0;
+  const mainH = Math.max(20, h - rulerH - laneH - lufsH);
+  return { w, h, mainH, lufsY: mainH, lufsH, laneY: mainH + lufsH, laneH, rulerY: mainH + lufsH + laneH, rulerH };
+}
+
+function regionAt(layout, y) {
+  if (y < layout.mainH) return 'main';
+  if (y < layout.laneY) return 'lufs';
+  if (y < layout.rulerY) return 'lane';
+  return 'ruler';
+}
+
 /* ---------------- drawing helpers ---------------- */
 
-function drawBackdrop(w, h) {
-  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, w, h);
+function drawBackdrop(w, h, y = 0) {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, y, w, h);
 }
 
 function drawLabel(text, x, y, color = 'rgba(200, 210, 220, 0.75)', align = 'left') {
@@ -1958,9 +2138,16 @@ function drawTag(text, x, y, w, color = 'rgba(230, 238, 245, 0.95)') {
   ctx.font = '10px Verdana, sans-serif';
   const width = ctx.measureText(text).width + 8;
   const left = Math.max(0, Math.min(w - width, x));
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.72)'; ctx.fillRect(left, y, width, 14);
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.78)'; ctx.fillRect(left, y, width, 14);
   ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.fillStyle = color;
   ctx.fillText(text, left + 4, y + 2);
+}
+
+// A small label on a translucent plate, for text over the images.
+function drawPlate(text, x, y) {
+  ctx.font = '9px Verdana, sans-serif';
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.62)'; ctx.fillRect(x - 2, y - 1, ctx.measureText(text).width + 6, 12);
+  drawLabel(text, x + 1, y + 1, 'rgba(210, 220, 230, 0.9)');
 }
 
 function formatTime(t, decimals = 0) {
@@ -1968,6 +2155,14 @@ function formatTime(t, decimals = 0) {
   return `${minutes}:${seconds.toFixed(decimals).padStart(decimals ? decimals + 3 : 2, '0')}`;
 }
 const formatHz = (hz) => (hz >= 1000 ? `${(hz / 1000).toFixed(hz >= 10000 ? 1 : 2)} kHz` : `${hz.toFixed(hz < 100 ? 1 : 0)} Hz`);
+// Nearest equal-tempered note (A4 = 440 Hz) and its offset in cents.
+function noteName(hz) {
+  if (!(hz >= 16 && hz <= 20000)) return '';
+  const n = Math.round(12 * Math.log2(hz / 440)), cents = Math.round(1200 * Math.log2(hz / 440) - 100 * n);
+  const names = ['A', 'A#', 'B', 'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#'];
+  const name = names[((n % 12) + 12) % 12], octave = 4 + Math.floor((n + 9) / 12);
+  return `${name}${octave}${cents ? ` ${cents > 0 ? '+' : '−'}${Math.abs(cents)}¢` : ''}`;
+}
 
 function drawFrequencyGrid(w, h, top, labels) {
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)'; ctx.lineWidth = 1;
@@ -2022,8 +2217,9 @@ function drawPlayhead(w, h, range) {
   ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
 }
 
-// Time ticks along the bottom edge, spaced at least ~70 px apart.
-function drawTimeRuler(w, h, range) {
+// The time ruler: its own strip under the lanes, ticks at least ~70 px apart.
+function drawTimeRuler(w, y, hR, range) {
+  ctx.fillStyle = '#0b0e12'; ctx.fillRect(0, y, w, hR);
   const span = range.t1 - range.t0;
   const steps = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
   const step = steps.find(s => s / span * w >= 70) || 600;
@@ -2031,52 +2227,73 @@ function drawTimeRuler(w, h, range) {
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)'; ctx.lineWidth = 1;
   for (let k = Math.ceil(range.t0 / step - 1e-9); k * step <= range.t1 + 1e-9; k++) {
     const x = Math.round((k * step - range.t0) / span * w) + 0.5;
-    ctx.beginPath(); ctx.moveTo(x, h - 4); ctx.lineTo(x, h); ctx.stroke();
-    // Clear of the frequency labels on the left and the edge on the right.
-    if (x + 44 < w && x > (state.vizMode === 'spec' ? 34 : 0)) {
-      const text = formatTime(k * step, decimals);
-      ctx.font = '9px Verdana, sans-serif';
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.6)'; ctx.fillRect(x + 1, h - 13, ctx.measureText(text).width + 5, 11);
-      drawLabel(text, x + 3, h - 12, 'rgba(210, 220, 230, 0.85)');
-    }
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y + 4); ctx.stroke();
+    if (x + 44 < w) drawLabel(formatTime(k * step, decimals), x + 3, y + 4, 'rgba(210, 220, 230, 0.85)');
   }
 }
 
-function specTop(rate) { return Math.min(VIZ.maxHz, rate / 2); }
-// Frequency at height fraction u (0 = bottom, 1 = top) of the spectrogram.
-function specHz(u, rate, scale) {
-  const top = specTop(rate);
-  return scale === 'log' ? VIZ.logMinHz * Math.pow(top / VIZ.logMinHz, u) : top * u;
+// "Nice" frequency ticks for the visible band, at least `minGap` px apart:
+// on the log axis the densest of 1-2-...-9, 1-2-5 and 1 per decade that
+// fits (a linear series on a very deep zoom), on the linear axis a 1-2-5
+// step.
+function freqTicks(r, height, minGap = 22) {
+  const d = freqDomain(r.scale), span = d(r.hi) - d(r.lo);
+  const px = (hz) => (d(hz) - d(r.lo)) / span * height;
+  let out = [];
+  if (r.scale === 'log') {
+    const series = (mantissas) => {
+      const list = [];
+      for (let e = Math.floor(Math.log10(Math.max(r.lo, 1))); e <= Math.ceil(Math.log10(r.hi)); e++) {
+        for (const m of mantissas) { const hz = m * 10 ** e; if (hz >= r.lo && hz <= r.hi) list.push(hz); }
+      }
+      return list;
+    };
+    const spaced = (list) => list.every((hz, i) => !i || px(hz) - px(list[i - 1]) >= minGap);
+    out = [[1, 2, 3, 4, 5, 6, 7, 8, 9], [1, 2, 5], [1]].map(series).find(spaced) || series([1]);
+    if (out.length < 3) return freqTicks({ ...r, scale: 'lin' }, height, minGap);
+  } else {
+    const target = Math.max(2, height / (minGap * 1.8));
+    const raw = (r.hi - r.lo) / target, p = 10 ** Math.floor(Math.log10(raw));
+    const step = [1, 2, 5, 10].map(m => m * p).find(s => s >= raw) || 10 * p;
+    for (let hz = Math.ceil(r.lo / step) * step; hz <= r.hi + 1e-9; hz += step) out.push(+hz.toFixed(6));
+  }
+  // Thin to the minimum spacing, keeping the band edge when it is in view.
+  const kept = [];
+  for (const hz of out) if (!kept.length || Math.abs(px(hz) - px(kept[kept.length - 1])) >= minGap) kept.push(hz);
+  if (VIZ.bandEdgeHz > r.lo && VIZ.bandEdgeHz < r.hi && !kept.includes(VIZ.bandEdgeHz)) kept.push(VIZ.bandEdgeHz);
+  return kept;
 }
+const tickLabel = (hz) => (hz >= 1000 ? `${+(hz / 1000).toFixed(hz % 1000 ? 2 : 0)}k` : `${+hz.toFixed(hz < 10 ? 1 : 0)}`);
 
-function drawFrequencyAxisLabels(w, h, rate, scale) {
-  const top = specTop(rate);
-  const marks = scale === 'log' ? [20, 50, 100, 200, 500, 1000, 2000, 5000, VIZ.bandEdgeHz] : [4000, 8000, VIZ.bandEdgeHz, 16000];
-  for (const hz of marks) {
-    if (hz >= top || hz < (scale === 'log' ? VIZ.logMinHz : 1)) continue;
-    const u = scale === 'log' ? Math.log(hz / VIZ.logMinHz) / Math.log(top / VIZ.logMinHz) : hz / top;
-    const y = h - h * u;
+// The frequency ruler on the left of SPEC: interactive (wheel zooms, drag pans).
+function drawFrequencyAxisLabels(w, h, rate) {
+  const r = freqRange(rate);
+  ctx.fillStyle = r.zoomed ? 'rgba(102, 192, 244, 0.10)' : 'rgba(0, 0, 0, 0.35)';
+  ctx.fillRect(0, 0, VIZ.freqRulerW - 8, h);
+  for (const hz of freqTicks(r, h)) {
+    const y = h - h * hzToU(hz, rate);
+    if (y < 1 || y > h - 1) continue;
     const edge = hz === VIZ.bandEdgeHz;
-    const text = hz >= 1000 ? `${hz / 1000}k` : String(hz);
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)'; ctx.fillRect(2, Math.max(0, y - 10), 24, 10);
-    drawLabel(text, 4, Math.max(0, y - 10), edge ? 'rgba(255, 184, 34, 0.9)' : 'rgba(220, 230, 240, 0.85)');
-    ctx.strokeStyle = edge ? 'rgba(255, 184, 34, 0.25)' : 'rgba(255, 255, 255, 0.08)';
-    ctx.beginPath(); ctx.moveTo(26, Math.round(y) + 0.5); ctx.lineTo(34, Math.round(y) + 0.5); ctx.stroke();
+    ctx.strokeStyle = edge ? 'rgba(255, 184, 34, 0.45)' : 'rgba(255, 255, 255, 0.35)';
+    ctx.beginPath(); ctx.moveTo(VIZ.freqRulerW - 12, Math.round(y) + 0.5); ctx.lineTo(VIZ.freqRulerW - 4, Math.round(y) + 0.5); ctx.stroke();
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)'; ctx.fillRect(1, Math.max(0, y - 10), VIZ.freqRulerW - 12, 10);
+    drawLabel(tickLabel(hz), 3, Math.max(0, y - 10), edge ? 'rgba(255, 184, 34, 0.95)' : 'rgba(220, 230, 240, 0.9)');
   }
 }
 
 /* ---------------- static images of the visible range ---------------- */
 
 // The last WAVE or SPEC image: { base, key, canvas, t0, t1, ... }. `base`
-// names what it shows apart from the time range; while a new range is
-// computed, the last image with the same base is drawn stretched to it.
+// names what it shows apart from the time and frequency range; while a new
+// range is computed, the last image with the same base is drawn stretched
+// to it.
 let vizImage = null;
 let vizPending = null, specJob = 0, specTimer = 0;
 const yieldToUi = () => new Promise(resolve => setTimeout(resolve, 0));
 
-function imageBase(buffer, H) {
+function imageBase(buffer) {
   const scale = state.vizMode === 'spec' ? state.vizScale : state.waveScale === 'db' ? `db${state.vizRange}` : 'lin';
-  return `${state.vizMode}:${scale}:${bufferId(buffer.samples)}:${buffer.rate}:${H}`;
+  return `${state.vizMode}:${scale}:${bufferId(buffer.samples)}:${buffer.rate}`;
 }
 
 // Height fraction (0..1 from the centre line) of a sample value on the
@@ -2156,67 +2373,113 @@ function renderWaveImage(buffer, W, H, range) {
   return { canvas: image, t0: range.t0, t1: range.t1 };
 }
 
-// The signal decimated by VIZ.lowFactor for the low band of the log
-// spectrogram, made in slices so the page stays responsive. Sample i of the
-// result is sample lowFactor * i of the input.
-const lowSignals = new WeakMap();
-function decimatedSignal(samples) {
-  if (!lowSignals.has(samples)) lowSignals.set(samples, (async () => {
-    const factor = VIZ.lowFactor, out = new Float32Array(Math.max(1, Math.round(samples.length / factor)));
-    // resampleSinc reads 16 * factor inputs either side of each output.
-    const margin = 32 * factor, block = factor * 16384;
-    for (let s = 0; s < samples.length; s += block) {
-      const from = Math.max(0, s - margin), to = Math.min(samples.length, s + block + margin);
-      const part = TF2Audio.resampleSinc(samples.subarray(from, to), factor, 1);
-      const offset = (s - from) / factor, count = Math.min(block / factor, out.length - s / factor);
-      out.set(part.subarray(offset, offset + count), s / factor);
-      await yieldToUi();
-    }
-    return out;
-  })());
-  return lowSignals.get(samples);
+// The signal decimated by 2, 4, ... VIZ.maxDecimation for the lower bands of
+// the spectrogram. Each level halves the one above with the renderer's
+// Kaiser-windowed sinc (flat to 0.83 of the new Nyquist, 86 dB stopband),
+// in slices so the page stays responsive. Sample i of the level for factor
+// D is sample D * i of the input; the spectrogram reads each level only up
+// to 0.4 of its rate.
+const decimations = new WeakMap();
+function decimated(samples, factor) {
+  let levels = decimations.get(samples);
+  if (!levels) decimations.set(samples, levels = new Map([[1, Promise.resolve(samples)]]));
+  if (!levels.has(factor)) {
+    const level = decimated(samples, factor / 2).then(halve);
+    level.catch(() => levels.delete(factor));
+    levels.set(factor, level);
+  }
+  return levels.get(factor);
+}
+async function halve(x) {
+  const out = new Float32Array(Math.max(1, Math.round(x.length / 2)));
+  // resampleSinc reads 32 inputs either side of each output.
+  const margin = 64, block = 1 << 17;
+  for (let s = 0; s < x.length; s += block) {
+    const from = Math.max(0, s - margin), to = Math.min(x.length, s + block + margin);
+    const part = TF2Audio.resampleSinc(x.subarray(from, to), 2, 1);
+    const offset = (s - from) / 2, count = Math.min(block / 2, out.length - s / 2);
+    out.set(part.subarray(offset, offset + count), s / 2);
+    await yieldToUi();
+  }
+  return out;
 }
 
-// Spectrogram of the visible range, computed a few columns at a time.
-// Linear: one 2048-point FFT per column (up to three, max-held, when a
-// column spans more). Log: the same above 400 Hz; below, the decimated
-// signal. On the log axis levels are per Hz, so noise stays continuous
-// across the two resolutions.
-async function renderSpectrogram(job, buffer, W, H, range, base, key) {
-  const log = state.vizScale === 'log';
+// How the spectrogram analyses the visible band. The rows are split into
+// tiers, each read from the signal decimated as far as its top frequency
+// allows: one tier on the linear axis, one per octave-ish band on the log
+// axis. The FFT size of a tier is fixed (RES) or, on AUTO, sized to the
+// view: a Blackman window of T seconds smears about 0.4 T in time and
+// 2.35 / T in frequency (its -6 dB widths), so T = 2.4 * sqrt(column
+// seconds / row Hz) would blur as many pixels one way as the other. AUTO
+// uses 3.4 instead of 2.4, blurring about twice as many pixels in time as
+// in frequency: tones, harmonics and hum stay sharp and onsets soften a
+// little. Zooming in time shortens the window; zooming in frequency, or
+// going lower on the log axis, lengthens it.
+function specPlan(rate, H, colSec) {
+  const r = freqRange(rate), log = r.scale === 'log';
+  const fixed = state.specRes === 'auto' ? 0 : Number(state.specRes);
+  // A fixed size keeps at least VIZ.fftMin points after decimation.
+  const maxD = fixed ? Math.max(1, Math.min(VIZ.maxDecimation, fixed / VIZ.fftMin)) : VIZ.maxDecimation;
+  const decimationFor = (hz) => { let D = 1; while (D < maxD && hz <= 0.4 * rate / (D * 2)) D *= 2; return D; };
+  const edges = Float64Array.from({ length: H + 1 }, (_, i) => specHz(i / H, rate));
+  const tiers = new Map(), rowTier = new Uint8Array(H);
+  const linearD = decimationFor(r.hi);
+  for (let row = 0; row < H; row++) {
+    const D = log ? decimationFor(edges[row + 1]) : linearD;
+    if (!tiers.has(D)) tiers.set(D, { D, rows: [] });
+    tiers.get(D).rows.push(row);
+  }
+  const list = [...tiers.values()].sort((a, b) => b.D - a.D);
+  const perRow = (freqDomain(r.scale)(r.hi) - freqDomain(r.scale)(r.lo)) / H;
+  list.forEach((tier, index) => {
+    tier.rate = rate / tier.D;
+    let N;
+    if (fixed) N = fixed / tier.D;
+    else {
+      // Row height in Hz at the tier's centre (on the log axis df = f d(ln f)).
+      const first = edges[tier.rows[0]], last = edges[tier.rows[tier.rows.length - 1] + 1];
+      const rowHz = log ? Math.sqrt(first * last) * perRow : perRow;
+      const T = Math.min(VIZ.maxWindowSec, 3.4 * Math.sqrt(colSec / rowHz));
+      N = 2 ** Math.round(Math.log2(Math.max(1, T * tier.rate)));
+    }
+    tier.fft = Math.min(VIZ.fftMax, Math.max(VIZ.fftMin, N));
+    tier.windowSec = tier.fft / tier.rate;
+    tier.binHz = tier.rate / tier.fft;
+    for (const row of tier.rows) rowTier[row] = index;
+  });
+  return { tiers: list, edges, rowTier, fixed };
+}
+
+// Spectrogram of the visible range, computed a few columns at a time. When a
+// column spans more than half a window, up to four windows are max-held so
+// short events are not missed. Levels are dB (a full-scale sine reads about
+// -13.6, as in BARS) on the linear axis; on the log axis, where tiers differ
+// in resolution, they are per Hz so noise stays continuous across them.
+async function renderSpectrogram(job, buffer, W, H, range, fr, base, key) {
   const { samples, rate } = buffer;
+  const log = fr.scale === 'log';
   const cols = Math.min(W, VIZ.maxColumns);
-  const tiers = [];
-  if (log) {
-    const low = await decimatedSignal(samples);
-    if (job !== specJob) return;
-    tiers.push({ data: low, rate: rate / VIZ.lowFactor, fft: VIZ.lowFft, below: VIZ.lowSplitHz });
-  }
-  tiers.push({ data: samples, rate, fft: VIZ.specFft, below: Infinity });
-  for (const tier of tiers) {
-    Object.assign(tier, { rows: [], bands: [], plan: fftPlan(tier.fft), spectrum: new Float32Array(tier.fft / 2),
-      norm: log ? -10 * Math.log10(tier.rate / tier.fft) : 0 });
-  }
-  for (let r = 0; r < H; r++) {
-    const lo = specHz(r / H, rate, state.vizScale), hi = specHz((r + 1) / H, rate, state.vizScale);
-    const tier = tiers.find(t => hi <= t.below);
-    const binHz = tier.rate / tier.fft;
-    tier.rows.push(r);
-    tier.bands.push([lo / binHz, hi / binHz]);
-  }
-  for (const tier of tiers) tier.level = new Float32Array(tier.rows.length);
-  const grid = new Float32Array(cols * H);
   const step = (range.t1 - range.t0) * rate / cols;
+  const plan = specPlan(rate, H, step / rate);
+  for (const tier of plan.tiers) {
+    tier.data = await decimated(samples, tier.D);
+    if (job !== specJob) return;
+    tier.bands = tier.rows.map(row => [plan.edges[row] / tier.binHz, plan.edges[row + 1] / tier.binHz]);
+    tier.plan = fftPlan(tier.fft);
+    tier.spectrum = new Float32Array(tier.fft / 2);
+    tier.level = new Float32Array(tier.rows.length);
+    tier.norm = log ? -10 * Math.log10(tier.binHz) : 0;
+    tier.hops = Math.max(1, Math.min(4, Math.round(step / tier.D / (tier.fft / 2))));
+  }
+  const grid = new Float32Array(cols * H);
   let yieldAt = performance.now() + 12;
   for (let x = 0; x < cols; x++) {
     const column = grid.subarray(x * H, (x + 1) * H);
     column.fill(-400);
     const start = range.t0 * rate + x * step;
-    for (const tier of tiers) {
-      const scale = tier.rate / rate;
-      const hops = Math.max(1, Math.min(3, Math.floor(step * scale / tier.fft)));
-      for (let hop = 0; hop < hops; hop++) {
-        windowedFft(tier.plan, tier.data, (start + (hop + 0.5) * step / hops) * scale);
+    for (const tier of plan.tiers) {
+      for (let hop = 0; hop < tier.hops; hop++) {
+        windowedFft(tier.plan, tier.data, (start + (hop + 0.5) * step / tier.hops) / tier.D);
         const { re, im, n } = tier.plan;
         for (let k = 0; k < n / 2; k++) tier.spectrum[k] = 10 * Math.log10((re[k] * re[k] + im[k] * im[k]) / (n * n) + 1e-24) + tier.norm;
         bandLevels(tier.spectrum, tier.bands, tier.level);
@@ -2234,7 +2497,9 @@ async function renderSpectrogram(job, buffer, W, H, range, base, key) {
   // 99th-percentile level.
   const sorted = grid.filter((_, i) => i % 7 === 0).sort();
   const topDb = sorted[Math.floor(sorted.length * 0.99)] ?? VIZ.maxDb;
-  vizImage = { base, key, canvas: document.createElement('canvas'), t0: range.t0, t1: range.t1, grid, cols, rows: H, log, topDb };
+  const tiers = plan.tiers.map(({ D, fft, rate: tierRate, windowSec, binHz }) => ({ D, fft, rate: tierRate, windowSec, binHz }));
+  vizImage = { base, key, canvas: document.createElement('canvas'), t0: range.t0, t1: range.t1, lo: fr.lo, hi: fr.hi, scale: fr.scale,
+    grid, cols, rows: H, log, topDb, tiers, rowTier: plan.rowTier, fixed: plan.fixed };
   paintSpectrogram(vizImage);
   vizPending = null;
   refreshVisualizer();
@@ -2258,11 +2523,22 @@ function paintSpectrogram(image) {
   image.range = span;
 }
 
+// The analysis resolution of a spectrogram image, for the corner label.
+function describeResolution(img) {
+  if (!img || !img.tiers) return '';
+  const ms = (s) => (s < 0.1 ? (s * 1000).toFixed(1) : (s * 1000).toFixed(0));
+  const windows = img.tiers.map(t => t.windowSec);
+  const lo = Math.min(...windows), hi = Math.max(...windows);
+  const mode = img.fixed ? `FFT ${img.fixed}` : 'AUTO';
+  if (img.tiers.length === 1) return `${mode} · ${ms(lo)} ms · ${formatHz(img.tiers[0].binHz)} bins`;
+  return `${mode} · ${ms(lo)}–${ms(hi)} ms windows`;
+}
+
 // Colour scale at the right edge of the spectrogram.
 function drawColorbar(w, h) {
   const img = vizImage;
   if (!img || !img.grid) return;
-  const x = w - 12, top = 40, bottom = h - 20, height = bottom - top;
+  const x = w - 12, top = 8, bottom = h - 8, height = bottom - top;
   if (height < 40) return;
   for (let y = 0; y < height; y++) {
     const c = Math.round((1 - y / height) * 255) * 3;
@@ -2280,7 +2556,7 @@ function drawColorbar(w, h) {
   }
 }
 
-function requestSpectrogram(buffer, W, H, range, base, key) {
+function requestSpectrogram(buffer, W, H, range, fr, base, key) {
   if (vizPending === key) return;
   vizPending = key;
   clearTimeout(specTimer);
@@ -2289,73 +2565,271 @@ function requestSpectrogram(buffer, W, H, range, base, key) {
   // pan gesture settles, showing the stretched last image meanwhile.
   const delay = vizImage && vizImage.base === base ? 90 : 0;
   specTimer = setTimeout(() => {
-    renderSpectrogram(job, buffer, W, H, range, base, key).catch((error) => {
+    renderSpectrogram(job, buffer, W, H, range, fr, base, key).catch((error) => {
       if (job === specJob) { vizPending = null; logLine(`spectrogram failed: ${error.message}`, 'err'); }
     });
   }, delay);
 }
 
-// WAVE or SPEC for the visible range. Returns the range drawn.
+// Draw the part of `img` that overlaps the view, stretched to it. SPEC images
+// also map their frequency band onto the visible one.
+function drawImageInView(img, range, fr, w, h) {
+  const iw = img.canvas.width, ih = img.canvas.height, span = img.t1 - img.t0;
+  const sx = (range.t0 - img.t0) / span * iw, sw = (range.t1 - range.t0) / span * iw;
+  const x0 = Math.max(0, sx), x1 = Math.min(iw, sx + sw);
+  if (x1 <= x0) return;
+  let sy0 = 0, sy1 = ih, dy0 = 0, dy1 = h;
+  if (fr && img.lo !== undefined) {
+    const d = freqDomain(fr.scale), a0 = d(img.lo), a1 = d(img.hi), b0 = d(fr.lo), b1 = d(fr.hi);
+    const top = Math.min(a1, b1), bottom = Math.max(a0, b0);
+    if (top <= bottom) return;
+    sy0 = (a1 - top) / (a1 - a0) * ih; sy1 = (a1 - bottom) / (a1 - a0) * ih;
+    dy0 = (b1 - top) / (b1 - b0) * h; dy1 = (b1 - bottom) / (b1 - b0) * h;
+  }
+  ctx.drawImage(img.canvas, x0, sy0, x1 - x0, sy1 - sy0, (x0 - sx) / sw * w, dy0, (x1 - x0) / sw * w, dy1 - dy0);
+}
+
+// WAVE or SPEC for the visible range, in the top `h` pixels. Returns the range drawn.
 function drawTimeView(buffer, w, h, dpr) {
   const W = Math.max(1, Math.round(w * dpr)), H = Math.max(1, Math.round(h * dpr));
   const range = visibleRange(buffer);
-  const base = imageBase(buffer, H);
-  const key = `${base}:${W}:${range.t0}:${range.t1}`;
+  const spec = state.vizMode === 'spec';
+  const fr = spec ? freqRange(buffer.rate) : null;
+  const base = imageBase(buffer);
+  const key = `${base}:${W}x${H}:${range.t0}:${range.t1}${spec ? `:${fr.lo}:${fr.hi}:${state.specRes}` : ''}`;
   if (vizImage && vizImage.key === key && vizImage.grid && vizImage.range !== state.vizRange) paintSpectrogram(vizImage);
   if (!vizImage || vizImage.key !== key) {
-    if (state.vizMode === 'wave') {
-      vizImage = { base, key, ...renderWaveImage(buffer, W, H, range) };
-    } else {
-      requestSpectrogram(buffer, W, H, range, base, key);
-    }
+    if (spec) requestSpectrogram(buffer, W, H, range, fr, base, key);
+    else vizImage = { base, key, ...renderWaveImage(buffer, W, H, range) };
   }
   drawBackdrop(w, h);
   const ready = vizImage && vizImage.key === key;
-  if (vizImage && vizImage.base === base) {
-    const span = vizImage.t1 - vizImage.t0, iw = vizImage.canvas.width;
-    const sx = (range.t0 - vizImage.t0) / span * iw, sw = (range.t1 - range.t0) / span * iw;
-    // Draw the part of the image that overlaps the view.
-    const from = Math.max(0, sx), to = Math.min(iw, sx + sw);
-    if (to > from) {
-      ctx.drawImage(vizImage.canvas, from, 0, to - from, vizImage.canvas.height,
-        (from - sx) / sw * w, 0, (to - from) / sw * w, h);
+  if (vizImage && vizImage.base === base) drawImageInView(vizImage, range, fr, w, h);
+  if (!ready) drawLabel('Analyzing…', w - 24, h - 14, 'rgba(255, 184, 34, 0.9)', 'right');
+  // Read by the browser tests: mode, scale, band (SPEC) and time range of a finished image.
+  els.canvas.dataset.view = ready
+    ? `${state.vizMode}:${spec ? `${state.vizScale}:f${fr.lo.toFixed(1)}-${fr.hi.toFixed(1)}` : ''}:${range.t0.toFixed(4)}-${range.t1.toFixed(4)}`
+    : '';
+  return range;
+}
+
+/* ---------------- lanes under WAVE and SPEC ---------------- */
+
+// Codec lane: what the voice path did with each 20 ms frame, in playback
+// time (frame f plays from (f * frame - lookahead) / rate). Colours by code
+// in opus-codec.mjs FRAME. A pixel covering several frames shows the most
+// common of them, with a strip along the top whose strength is the share
+// of frames lost (red) or late (orange) there.
+const FRAME_STYLE = [
+  { name: 'not sent', color: '#1c232b', text: 'not sent: the voice gate was closed, the listener hears silence' },
+  { name: 'SILK', color: '#3d7fc4', text: 'SILK: speech coding, up to 8 kHz' },
+  { name: 'Hybrid', color: '#2fa58a', text: 'Hybrid: SILK below 8 kHz, CELT above' },
+  { name: 'CELT', color: '#9a6ad6', text: 'CELT: transform coding, full band' },
+  { name: 'DTX', color: '#9a7414', text: 'DTX: no speech detected; the decoder plays comfort noise' },
+  { name: 'lost', color: '#ff4040', text: 'lost: the decoder conceals the gap (PLC)' },
+  { name: 'late', color: '#ff9d2e', text: 'late: arrived after its playout time, played as silence' }
+];
+const FRAME_LOST = 5, FRAME_LATE = 6;
+
+function frameAt(info, t) {
+  const f = Math.floor((t * info.sampleRate + info.lookahead) / info.frameSamples);
+  return f >= 0 && f < info.frames ? f : -1;
+}
+const frameStart = (info, f) => (f * info.frameSamples - info.lookahead) / info.sampleRate;
+
+function drawCodecLane(L, range) {
+  const info = codecFrames();
+  if (!info || !L.laneH) return;
+  const { w } = L, y = L.laneY + 1, hL = L.laneH - 2, span = range.t1 - range.t0;
+  ctx.fillStyle = '#07090c'; ctx.fillRect(0, L.laneY, w, L.laneH);
+  const log = info.frameLog, frameSec = info.frameSamples / info.sampleRate;
+  const perPixel = span / w / frameSec;
+  if (perPixel < 0.5) {
+    // Frames several pixels wide: one block each, with a hairline between.
+    const f0 = Math.max(0, frameAt(info, Math.max(range.t0, 0))), f1 = frameAt(info, range.t1);
+    for (let f = f0; f <= (f1 < 0 ? info.frames - 1 : f1); f++) {
+      const x0 = (frameStart(info, f) - range.t0) / span * w, x1 = x0 + frameSec / span * w;
+      ctx.fillStyle = FRAME_STYLE[log[f]].color;
+      ctx.fillRect(x0, y, Math.max(1, x1 - x0 - (x1 - x0 > 4 ? 1 : 0)), hL);
+    }
+    return;
+  }
+  const counts = new Uint16Array(FRAME_STYLE.length);
+  for (let x = 0; x < w; x++) {
+    const a = range.t0 + x / w * span, b = range.t0 + (x + 1) / w * span;
+    let f0 = Math.floor((a * info.sampleRate + info.lookahead) / info.frameSamples);
+    let f1 = Math.floor((b * info.sampleRate + info.lookahead) / info.frameSamples);
+    f0 = Math.max(0, f0); f1 = Math.min(info.frames - 1, Math.max(f0, f1));
+    if (f0 >= info.frames) break;
+    counts.fill(0);
+    for (let f = f0; f <= f1; f++) counts[log[f]]++;
+    let code = 0;
+    for (let c = 1; c < FRAME_STYLE.length; c++) if (counts[c] > counts[code]) code = c;
+    ctx.fillStyle = FRAME_STYLE[code].color;
+    ctx.fillRect(x, y, 1, hL);
+    const missed = counts[FRAME_LOST] + counts[FRAME_LATE];
+    if (missed && code !== FRAME_LOST && code !== FRAME_LATE) {
+      const share = missed / (f1 - f0 + 1);
+      ctx.fillStyle = counts[FRAME_LOST] >= counts[FRAME_LATE] ? `rgba(255, 64, 64, ${0.35 + 0.65 * Math.min(1, share * 2.5)})`
+        : `rgba(255, 157, 46, ${0.35 + 0.65 * Math.min(1, share * 2.5)})`;
+      ctx.fillRect(x, y, 1, 3);
     }
   }
-  if (!ready) drawLabel('Analyzing…', w - 8, h - 24, 'rgba(255, 184, 34, 0.9)', 'right');
-  els.canvas.dataset.view = ready ? `${state.vizMode}:${state.vizMode === 'spec' ? state.vizScale : ''}:${range.t0.toFixed(4)}-${range.t1.toFixed(4)}` : '';
-  return range;
+}
+
+// Loudness lane: momentary (400 ms, thin) and short-term (3 s, bold) loudness
+// of the wet render and the dry source, each value drawn at the centre of its
+// window, with dashed lines at their integrated loudness.
+const LUFS_STYLE = { WET: '102, 192, 244', DRY: '235, 235, 235' };
+function drawLufsLane(L, range) {
+  if (!L.lufsH) return;
+  const { w } = L, y0 = L.lufsY, hL = L.lufsH, span = range.t1 - range.t0;
+  ctx.fillStyle = '#05080b'; ctx.fillRect(0, y0, w, hL);
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.14)'; ctx.fillRect(0, y0, w, 1);
+  const toY = (lufs) => y0 + 3 + (VIZ.lufsTop - Math.max(VIZ.lufsFloor, Math.min(VIZ.lufsTop, lufs))) / (VIZ.lufsTop - VIZ.lufsFloor) * (hL - 6);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (const level of [-12, -24, -36]) { const y = Math.round(toY(level)) + 0.5; ctx.moveTo(0, y); ctx.lineTo(w, y); }
+  ctx.stroke();
+  const stats = state.meterStats;
+  const series = stats ? [['DRY', stats.dry], ['WET', stats.wet]].filter(([, s]) => s && s.history) : [];
+  for (const [label, s] of series) {
+    const rgb = LUFS_STYLE[label], hop = s.history.hop;
+    for (const [values, windowHops, width, alpha] of [[s.history.momentary, 4, 1, 0.45], [s.history.shortTerm, 30, 1.6, 0.95]]) {
+      if (!values.length) continue;
+      const off = windowHops / 2;
+      const k0 = Math.max(0, Math.floor(range.t0 / hop - off) - 1), k1 = Math.min(values.length - 1, Math.ceil(range.t1 / hop - off) + 1);
+      ctx.strokeStyle = `rgba(${rgb}, ${alpha})`; ctx.lineWidth = width;
+      ctx.beginPath();
+      for (let k = k0; k <= k1; k++) {
+        const x = ((k + off) * hop - range.t0) / span * w, y = toY(values[k]);
+        if (k === k0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+    if (Number.isFinite(s.integrated)) {
+      ctx.save(); ctx.setLineDash([4, 4]); ctx.strokeStyle = `rgba(${rgb}, 0.6)`; ctx.lineWidth = 1;
+      const y = Math.round(toY(s.integrated)) + 0.5;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); ctx.restore();
+    }
+  }
+  for (const level of [-12, -24, -36]) {
+    const y = toY(level);
+    if (y - 5 < y0 + 2 || y + 5 > y0 + hL) continue;
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)'; ctx.fillRect(2, y - 5, 22, 10);
+    drawLabel(String(level).replace('-', '−'), 4, y - 5, 'rgba(200, 210, 220, 0.7)');
+  }
+  drawLabel(series.length ? 'LUFS' : 'LUFS · measuring…', w - 6, y0 + 3, 'rgba(200, 210, 220, 0.6)', 'right');
+}
+
+// Loudness values at time t, for the lane's hover readout.
+function lufsAt(s, t) {
+  const read = (values, windowHops) => {
+    const k = Math.round(t / s.history.hop - windowHops / 2);
+    return k >= 0 && k < values.length ? values[k] : null;
+  };
+  return { m: read(s.history.momentary, 4), s: read(s.history.shortTerm, 30) };
+}
+
+/* ---------------- selection and loop ---------------- */
+
+function drawSelection(L, range) {
+  if (!vizSel) return;
+  const span = range.t1 - range.t0;
+  const x0 = (vizSel.t0 - range.t0) / span * L.w, x1 = (vizSel.t1 - range.t0) / span * L.w;
+  if (x1 < 0 || x0 > L.w) return;
+  const a = Math.max(0, x0), b = Math.min(L.w, x1);
+  ctx.fillStyle = 'rgba(102, 192, 244, 0.16)'; ctx.fillRect(a, 0, b - a, L.rulerY);
+  ctx.fillStyle = state.loop ? 'rgba(164, 208, 7, 0.85)' : 'rgba(102, 192, 244, 0.85)';
+  ctx.fillRect(a, L.rulerY, b - a, 3);
+  ctx.strokeStyle = state.loop ? 'rgba(164, 208, 7, 0.8)' : 'rgba(102, 192, 244, 0.75)'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (const x of [x0, x1]) if (x >= 0 && x <= L.w) { ctx.moveTo(Math.round(x) + 0.5, 0); ctx.lineTo(Math.round(x) + 0.5, L.h); }
+  ctx.stroke();
+}
+
+// Looping: the whole file loops through the element itself; a selection
+// loops by seeking back to its start when playback crosses its end.
+let loopLastTime = 0;
+function applyLoop() {
+  els.audio.loop = state.loop && !vizSel;
+  if (els.vizLoop) {
+    els.vizLoop.setAttribute('aria-pressed', String(state.loop));
+    els.vizLoop.title = vizSel ? 'Loop the selection (L)' : 'Loop the whole file (L); Shift + drag or drag the time ruler to select a range';
+  }
+}
+function checkLoop() {
+  const t = els.audio.currentTime;
+  if (state.loop && vizSel && !els.audio.paused && loopLastTime < vizSel.t1 && t >= vizSel.t1) {
+    els.audio.currentTime = vizSel.t0;
+    loopLastTime = vizSel.t0;
+    return;
+  }
+  loopLastTime = t;
+}
+function toggleLoop() {
+  state.loop = !state.loop;
+  applyLoop();
+  // Starting a selection loop from outside it jumps in.
+  if (state.loop && vizSel && els.audio.src && (els.audio.currentTime < vizSel.t0 || els.audio.currentTime >= vizSel.t1)) {
+    els.audio.currentTime = vizSel.t0;
+  }
+  refreshVisualizer();
 }
 
 /* ---------------- hover readout ---------------- */
 
 let vizHover = null;   // pointer position over the canvas, CSS pixels
-function drawHover(w, h, buffer, range) {
+function drawHover(L, buffer, range) {
   if (!vizHover) return;
-  const { x, y } = vizHover;
+  const { x, y } = vizHover, { w } = L;
+  const region = regionAt(L, y);
   const span = range.t1 - range.t0, t = range.t0 + x / w * span;
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(Math.round(x) + 0.5, 0); ctx.lineTo(Math.round(x) + 0.5, h);
-  let text;
-  if (state.vizMode === 'spec') {
+  ctx.beginPath(); ctx.moveTo(Math.round(x) + 0.5, 0); ctx.lineTo(Math.round(x) + 0.5, L.rulerY);
+  let text = formatTime(t, 3);
+  if (region === 'main' && state.vizMode === 'spec') {
     ctx.moveTo(0, Math.round(y) + 0.5); ctx.lineTo(w, Math.round(y) + 0.5);
-    const hz = specHz(1 - y / h, buffer.rate, state.vizScale);
-    text = `${formatTime(t, 3)} · ${formatHz(hz)}`;
+    const hz = specHz(1 - y / L.mainH, buffer.rate);
+    const note = noteName(hz);
+    text += ` · ${formatHz(hz)}${note ? ` (${note})` : ''}`;
     const img = vizImage;
-    if (img && img.grid && img.base === imageBase(buffer, img.rows) && t >= img.t0 && t <= img.t1) {
+    if (img && img.grid && img.base === imageBase(buffer) && t >= img.t0 && t <= img.t1 && hz >= img.lo && hz <= img.hi) {
+      const d = freqDomain(img.scale);
       const col = Math.min(img.cols - 1, Math.floor((t - img.t0) / (img.t1 - img.t0) * img.cols));
-      const row = Math.min(img.rows - 1, Math.max(0, Math.floor((1 - y / h) * img.rows)));
+      const row = Math.min(img.rows - 1, Math.max(0, Math.floor((d(hz) - d(img.lo)) / (d(img.hi) - d(img.lo)) * img.rows)));
       const db = img.grid[col * img.rows + row];
       if (db > -300) text += ` · ${db.toFixed(0)} dB${img.log ? '/Hz' : ''}`;
+      const tier = img.tiers[img.rowTier[row]];
+      if (tier) text += ` · ${(tier.windowSec * 1000).toFixed(tier.windowSec < 0.1 ? 1 : 0)} ms / ${formatHz(tier.binHz)}`;
     }
-  } else {
+  } else if (region === 'main' && state.vizMode === 'wave') {
     const perPixel = Math.max(1, span * buffer.rate / w);
     const from = Math.max(0, Math.floor(t * buffer.rate)), to = Math.min(buffer.samples.length, from + Math.ceil(perPixel));
     let peak = 0;
     for (let i = from; i < to; i++) peak = Math.max(peak, Math.abs(buffer.samples[i]));
-    text = `${formatTime(t, 3)} · ${peak > 0 ? (20 * Math.log10(peak)).toFixed(1) : '-inf'} dBFS`;
+    text += ` · ${peak > 0 ? (20 * Math.log10(peak)).toFixed(1) : '−∞'} dBFS`;
+  } else if (region === 'lufs') {
+    const stats = state.meterStats || {};
+    const fmt = (v) => (v === null ? '—' : Number.isFinite(v) ? v.toFixed(1) : '−∞');
+    for (const [label, s] of [['wet', stats.wet], ['dry', stats.dry]]) {
+      if (!s || !s.history) continue;
+      const v = lufsAt(s, t);
+      text += ` · ${label} M ${fmt(v.m)} S ${fmt(v.s)}`;
+    }
+    text += ' LUFS';
+  } else if (region === 'lane') {
+    const info = codecFrames(), f = info ? frameAt(info, t) : -1;
+    if (f >= 0) {
+      const code = info.frameLog[f], bytes = info.frameBytes ? info.frameBytes[f] : 0;
+      const perPacket = info.framesPerPacket || 1;
+      text = `frame ${f}${perPacket > 1 ? ` (packet ${Math.floor(f / perPacket)})` : ''} · ${formatTime(Math.max(0, frameStart(info, f)), 3)} · ${FRAME_STYLE[code].name}`;
+      if (bytes && code !== 0) text += ` · ${bytes} B${code === FRAME_LOST || code === FRAME_LATE ? '' : ` (${(bytes * 8 / (info.frameMs || 20)).toFixed(1)} kbps)`}`;
+    }
   }
   ctx.stroke();
-  drawTag(text, x + 10, Math.max(16, Math.min(h - 32, y - 20)), w);
+  const tagY = region === 'main' ? Math.max(4, Math.min(L.mainH - 18, y - 20)) : Math.max(4, L.lufsY - 18);
+  drawTag(text, x + 10, tagY, w);
 }
 
 /* ---------------- BARS ---------------- */
@@ -2378,6 +2852,7 @@ function bufferBandLevels(buffer, bands, out) {
   if (offset) for (let i = 0; i < out.length; i++) out[i] += offset;
   return out;
 }
+
 
 function drawBarsView(buffer, w, h, now) {
   const live = state.isPlaying && state.analyser;
@@ -2456,34 +2931,42 @@ function drawWaveLabels(w, h) {
   const map = waveMapper(), mid = h / 2;
   for (const dbLevel of waveGridDb()) {
     const y = mid - map(Math.pow(10, dbLevel / 20)) * mid;
-    if (y < 30) continue;
+    if (y < 18) continue;
     ctx.fillStyle = 'rgba(0, 0, 0, 0.55)'; ctx.fillRect(2, y - 5, 24, 10);
     drawLabel(String(dbLevel), 4, y - 5, 'rgba(200, 210, 220, 0.7)');
   }
 }
+
 
 /* ---------------- main draw ---------------- */
 
 function drawVisualizer(now = performance.now()) {
   const { w, h, dpr } = resizeCanvas();
   const buffer = audibleBuffer();
-  if (!buffer) { drawBackdrop(w, h); drawLabel('Load audio to visualize', 8, 8); return; }
+  if (!buffer) { drawBackdrop(w, h); drawLabel('Load audio to visualize', 8, 8); els.canvas.dataset.view = ''; return; }
   if (state.vizMode === 'bars') { drawBarsView(buffer, w, h, now); return; }
-  const range = drawTimeView(buffer, w, h, dpr);
-  if (state.vizMode === 'spec') {
-    drawFrequencyAxisLabels(w, h, buffer.rate, state.vizScale);
-    drawColorbar(w, h);
+  const L = vizLayout(w, h);
+  const range = drawTimeView(buffer, w, L.mainH, dpr);
+  const spec = state.vizMode === 'spec';
+  if (spec) {
+    drawFrequencyAxisLabels(w, L.mainH, buffer.rate);
+    drawColorbar(w, L.mainH);
   } else {
-    drawWaveLabels(w, h);
+    drawWaveLabels(w, L.mainH);
   }
-  drawTimeRuler(w, h, range);
+  drawLufsLane(L, range);
+  drawCodecLane(L, range);
+  drawTimeRuler(w, L.rulerY, L.rulerH, range);
+  drawSelection(L, range);
   const zoom = range.zoomed ? `  ${formatTime(range.t0, 2)}–${formatTime(range.t1, 2)}` : '';
-  drawLabel(`${buffer.label}${zoom}`, state.vizMode === 'spec' ? 32 : 8, 4);
-  drawPlayhead(w, h, range);
-  drawHover(w, h, buffer, range);
+  const resolution = spec && vizImage && vizImage.tiers && vizImage.base === imageBase(buffer) ? `  ·  ${describeResolution(vizImage)}` : '';
+  drawPlate(`${buffer.label}${zoom}${resolution}`, spec ? VIZ.freqRulerW : 6, 3);
+  drawPlayhead(w, L.rulerY, range);
+  drawHover(L, buffer, range);
 }
 
 function animateVisualizer(now) {
+  checkLoop();
   // Zoomed in, the view pages along with the playhead.
   const buffer = state.vizMode !== 'bars' && audibleBuffer();
   if (buffer) {
@@ -2503,23 +2986,91 @@ function refreshVisualizer() {
   if (!state.isPlaying) drawVisualizer();
 }
 
+// The legend under the view: codec lane colours with frame counts, and the
+// loudness lane's lines.
+const frameCounts = new WeakMap();
+let legendKey = '';
+function updateLegend() {
+  if (!els.vizLegend) return;
+  const time = state.vizMode !== 'bars';
+  const info = time ? codecFrames() : null;
+  const lufs = time && state.showLufs && !!(state.processedBuffer || state.decodedSource);
+  const key = `${info ? bufferId(info.frameLog) : 0}:${lufs}`;
+  if (key === legendKey) return;
+  legendKey = key;
+  const items = [];
+  const item = (swatch, text, title) => {
+    const span = document.createElement('span');
+    span.className = 'lg-item';
+    if (title) span.title = title;
+    span.append(swatch, text);
+    return span;
+  };
+  const box = (color) => { const i = document.createElement('i'); i.className = 'lg-box'; i.style.background = color; return i; };
+  const line = (rgb, width, dashed) => {
+    const i = document.createElement('i');
+    i.className = 'lg-line';
+    i.style.borderTop = `${width}px ${dashed ? 'dashed' : 'solid'} rgb(${rgb})`;
+    return i;
+  };
+  if (info) {
+    if (!frameCounts.has(info.frameLog)) {
+      const counts = new Array(FRAME_STYLE.length).fill(0);
+      for (const code of info.frameLog) counts[code]++;
+      frameCounts.set(info.frameLog, counts);
+    }
+    const counts = frameCounts.get(info.frameLog);
+    const head = document.createElement('b');
+    head.textContent = 'Codec';
+    head.title = 'What the voice path did with each 20 ms frame; hover the lane for packet sizes';
+    items.push(head);
+    FRAME_STYLE.forEach((style, code) => {
+      if (counts[code]) items.push(item(box(style.color), `${style.name} ${counts[code]}`, style.text));
+    });
+  }
+  if (lufs) {
+    const head = document.createElement('b');
+    head.textContent = 'Loudness';
+    head.title = 'BS.1770 loudness over time: momentary (400 ms) and short-term (3 s), each at the centre of its window';
+    items.push(head);
+    for (const label of ['WET', 'DRY']) {
+      items.push(item(line(LUFS_STYLE[label], 2, false), `${label.toLowerCase()} S`, `${label.toLowerCase()} short-term (3 s)`));
+      items.push(item(line(LUFS_STYLE[label], 1, false), `${label.toLowerCase()} M`, `${label.toLowerCase()} momentary (400 ms)`));
+    }
+    items.push(item(line('180, 180, 180', 1, true), 'integrated', 'Integrated loudness of the whole file'));
+  }
+  els.vizLegend.replaceChildren(...items);
+  els.vizLegend.hidden = !items.length;
+}
+
 function updateVizTools() {
-  const timeView = state.vizMode !== 'bars' && !!(state.processedBuffer || state.decodedSource);
+  const loaded = !!(state.processedBuffer || state.decodedSource);
+  const timeView = state.vizMode !== 'bars' && loaded;
   for (const button of [els.vizZoomIn, els.vizZoomOut, els.vizFit]) if (button) button.disabled = !timeView;
   if (els.vizLog) {
     // SPEC: log frequency axis. WAVE: dBFS amplitude.
     const wave = state.vizMode === 'wave', on = wave ? state.waveScale === 'db' : state.vizScale === 'log';
     els.vizLog.textContent = wave ? 'dB' : 'LOG';
     els.vizLog.title = wave ? 'Waveform amplitude in dBFS: shows quiet detail, fades, gates and noise floors'
-      : 'Spectrogram frequency axis: log from 20 Hz, with ~3 Hz resolution below 400 Hz';
+      : 'Spectrogram frequency axis: log from 20 Hz, analysed with longer windows for the low octaves';
     els.vizLog.disabled = state.vizMode === 'bars';
-    els.vizLog.classList.toggle('active', on);
     els.vizLog.setAttribute('aria-pressed', String(on));
   }
   if (els.vizRange) {
     els.vizRange.hidden = !(state.vizMode === 'spec' || (state.vizMode === 'wave' && state.waveScale === 'db'));
     els.vizRange.textContent = `${state.vizRange} dB`;
   }
+  if (els.vizRes) {
+    els.vizRes.hidden = state.vizMode !== 'spec';
+    if (els.vizRes.value !== String(state.specRes)) els.vizRes.value = String(state.specRes);
+  }
+  if (els.vizLufs) {
+    els.vizLufs.disabled = state.vizMode === 'bars';
+    els.vizLufs.setAttribute('aria-pressed', String(state.showLufs));
+  }
+  if (els.vizLoop) els.vizLoop.disabled = !loaded;
+  applyLoop();
+  updateLegend();
 }
 
 // Segmented WAVE | BARS | SPEC control.
@@ -2535,12 +3086,20 @@ function setVizMode(mode) {
   refreshVisualizer();
 }
 
+// FIT: the whole file and the whole band; the selection stays.
+function fitView() {
+  vizView.t0 = 0;
+  vizView.t1 = Infinity;
+  resetFreqView();
+  refreshVisualizer();
+}
+
 if (els.vizWave) els.vizWave.addEventListener('click', () => setVizMode('wave'));
 if (els.vizBars) els.vizBars.addEventListener('click', () => setVizMode('bars'));
 if (els.vizSpec) els.vizSpec.addEventListener('click', () => setVizMode('spec'));
 if (els.vizZoomIn) els.vizZoomIn.addEventListener('click', () => zoomViz(0.5));
 if (els.vizZoomOut) els.vizZoomOut.addEventListener('click', () => zoomViz(2));
-if (els.vizFit) els.vizFit.addEventListener('click', () => { resetVizView(); refreshVisualizer(); });
+if (els.vizFit) els.vizFit.addEventListener('click', fitView);
 if (els.vizLog) els.vizLog.addEventListener('click', () => {
   if (state.vizMode === 'wave') {
     state.waveScale = state.waveScale === 'db' ? 'lin' : 'db';
@@ -2548,6 +3107,8 @@ if (els.vizLog) els.vizLog.addEventListener('click', () => {
   } else {
     state.vizScale = state.vizScale === 'log' ? 'lin' : 'log';
     LS.set('tf2ve_viz_scale', state.vizScale);
+    // Keep the visible band where the new axis can show it (log starts at 20 Hz).
+    if (vizFreq.lo !== null && state.vizScale === 'log') vizFreq.lo = Math.max(VIZ.logMinHz, vizFreq.lo);
   }
   refreshVisualizer();
 });
@@ -2556,20 +3117,40 @@ if (els.vizRange) els.vizRange.addEventListener('click', () => {
   LS.set('tf2ve_viz_range', state.vizRange);
   refreshVisualizer();
 });
+if (els.vizRes) els.vizRes.addEventListener('change', () => {
+  state.specRes = els.vizRes.value === 'auto' ? 'auto' : Number(els.vizRes.value);
+  LS.set('tf2ve_spec_res', String(state.specRes));
+  refreshVisualizer();
+});
+if (els.vizLufs) els.vizLufs.addEventListener('click', () => {
+  state.showLufs = !state.showLufs;
+  LS.set('tf2ve_lufs_lane', state.showLufs);
+  refreshVisualizer();
+});
+if (els.vizLoop) els.vizLoop.addEventListener('click', toggleLoop);
 
 // Taller view: the TALL button, or drag the bottom-right corner (desktop).
+// Taller than the stylesheet's height for this screen (TALL, or a drag).
+function isTall() {
+  const box = els.vizContainer, inline = box.style.height;
+  if (!inline) return false;
+  box.style.height = '';
+  const natural = box.offsetHeight;
+  box.style.height = inline;
+  return box.offsetHeight > natural + 20;
+}
 function setVizHeight(px) {
   els.vizContainer.style.height = px ? `${px}px` : '';
-  if (els.vizTall) els.vizTall.setAttribute('aria-pressed', String(els.vizContainer.offsetHeight > 250));
+  if (els.vizTall) els.vizTall.setAttribute('aria-pressed', String(isTall()));
 }
 if (els.vizTall) els.vizTall.addEventListener('click', () => {
-  const tall = els.vizContainer.offsetHeight > 250;
+  const tall = isTall();
   setVizHeight(tall ? 0 : VIZ.tallHeight);
   LS.set('tf2ve_viz_height', tall ? 0 : VIZ.tallHeight);
 });
 {
   const saved = Number(LS.get('tf2ve_viz_height', 0));
-  if (saved >= 120 && saved <= 2000) setVizHeight(saved);
+  if (saved >= 160 && saved <= 2000) setVizHeight(saved);
 }
 if (typeof ResizeObserver !== 'undefined') {
   let lastHeight = els.vizContainer.offsetHeight, timer = 0;
@@ -2579,7 +3160,7 @@ if (typeof ResizeObserver !== 'undefined') {
       const height = els.vizContainer.offsetHeight;
       if (height !== lastHeight && els.vizContainer.style.height) LS.set('tf2ve_viz_height', height);
       lastHeight = height;
-      if (els.vizTall) els.vizTall.setAttribute('aria-pressed', String(height > 250));
+      if (els.vizTall) els.vizTall.setAttribute('aria-pressed', String(isTall()));
       refreshVisualizer();
     }, 100);
   }).observe(els.vizContainer);
@@ -2593,12 +3174,27 @@ const canvasPoint = (event) => {
   const rect = els.canvas.getBoundingClientRect();
   return { x: event.clientX - rect.left, y: event.clientY - rect.top, w: rect.width, h: rect.height };
 };
+// What a point on the canvas is over: 'freq' (the SPEC frequency ruler),
+// 'main', 'lufs', 'lane' or 'ruler'.
+function pointRegion(p) {
+  const L = vizLayout(p.w, p.h), region = regionAt(L, p.y);
+  return { L, region: region === 'main' && state.vizMode === 'spec' && p.x < VIZ.freqRulerW ? 'freq' : region };
+}
+const timeAtPoint = (p, r) => Math.min(r.duration, Math.max(0, r.t0 + p.x / p.w * (r.t1 - r.t0)));
 
 els.canvas.addEventListener('wheel', (event) => {
   const buffer = state.vizMode !== 'bars' && audibleBuffer();
   if (!buffer) return;
-  const p = canvasPoint(event);
+  const p = canvasPoint(event), { L, region } = pointRegion(p);
   const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? p.h : 1;
+  const delta = Math.max(-100, Math.min(100, (event.deltaY || event.deltaX) * unit));
+  // Frequency zoom (SPEC): the wheel over the frequency ruler, or Alt or
+  // Ctrl/⌘ + Shift + wheel over the view, around the pointer's frequency.
+  if (state.vizMode === 'spec' && (region === 'freq' || event.altKey || ((event.ctrlKey || event.metaKey) && event.shiftKey))) {
+    event.preventDefault();
+    zoomFreq(Math.exp(delta * 0.005), Math.min(1, Math.max(0, 1 - p.y / L.mainH)));
+    return;
+  }
   if (event.ctrlKey || event.metaKey) {
     // Ctrl/⌘ + wheel, and trackpad pinches (which arrive as ctrl + wheel).
     event.preventDefault();
@@ -2613,13 +3209,23 @@ els.canvas.addEventListener('wheel', (event) => {
 }, { passive: false });
 
 els.canvas.addEventListener('pointerdown', (event) => {
-  if (state.vizMode === 'bars' || !audibleBuffer()) return;
-  const p = canvasPoint(event);
+  if (state.vizMode === 'bars' || !audibleBuffer() || event.button > 0) return;
+  const p = canvasPoint(event), { L, region } = pointRegion(p);
   vizPointers.set(event.pointerId, p);
   try { els.canvas.setPointerCapture(event.pointerId); } catch (e) { /* synthetic pointer */ }
-  const r = visibleRange(audibleBuffer());
+  const buffer = audibleBuffer(), r = visibleRange(buffer);
   if (vizPointers.size === 1) {
-    vizDrag = { x: p.x, w: p.w, moved: false, t0: r.t0, span: r.t1 - r.t0, duration: r.duration };
+    const base = { x: p.x, y: p.y, w: p.w, moved: false, t0: r.t0, span: r.t1 - r.t0, duration: r.duration, shift: event.shiftKey };
+    if (region === 'freq') {
+      // Drag the frequency ruler to move the band; double-click resets it.
+      const fr = freqRange(buffer.rate), d = freqDomain(fr.scale);
+      vizDrag = { ...base, kind: 'freq', h: L.mainH, d0: d(fr.lo), d1: d(fr.hi), rate: buffer.rate };
+    } else if (event.shiftKey || region === 'ruler') {
+      // Shift + drag, or a drag along the time ruler, selects a range.
+      vizDrag = { ...base, kind: 'select', anchor: timeAtPoint(p, r), region };
+    } else {
+      vizDrag = { ...base, kind: 'pan' };
+    }
   } else if (vizPointers.size === 2) {
     const [a, b] = [...vizPointers.values()];
     vizDrag = null;
@@ -2637,13 +3243,29 @@ els.canvas.addEventListener('pointermove', (event) => {
     const span = Math.min(vizPinch.duration, Math.max(vizPinch.minSpan, vizPinch.span * vizPinch.dist / dist));
     const at = vizPinch.t0 + vizPinch.mid / vizPinch.w * vizPinch.span;
     setVizView(at - mid / vizPinch.w * span, span, vizPinch.duration);
-  } else if (vizDrag) {
-    const dx = p.x - vizDrag.x;
-    if (Math.abs(dx) > 4) vizDrag.moved = true;
-    if (vizDrag.moved) setVizView(vizDrag.t0 - dx / vizDrag.w * vizDrag.span, vizDrag.span, vizDrag.duration);
+  } else if (vizDrag && vizPointers.has(event.pointerId)) {
+    const dx = p.x - vizDrag.x, dy = p.y - vizDrag.y;
+    if (Math.abs(dx) > 4 || (vizDrag.kind === 'freq' && Math.abs(dy) > 3)) vizDrag.moved = true;
+    if (vizDrag.moved) {
+      if (vizDrag.kind === 'pan') setVizView(vizDrag.t0 - dx / vizDrag.w * vizDrag.span, vizDrag.span, vizDrag.duration);
+      else if (vizDrag.kind === 'select') {
+        const t = Math.min(vizDrag.duration, Math.max(0, vizDrag.t0 + p.x / vizDrag.w * vizDrag.span));
+        setSelection({ t0: Math.min(vizDrag.anchor, t), t1: Math.max(vizDrag.anchor, t) });
+        refreshVisualizer();
+      } else if (vizDrag.kind === 'freq') {
+        // Dragging down shows higher frequencies, like dragging the image.
+        const span = vizDrag.d1 - vizDrag.d0, shift = dy / vizDrag.h * span;
+        const full = freqRange(vizDrag.rate), d = freqDomain(full.scale), inv = freqUndomain(full.scale);
+        const start = Math.min(Math.max(d(full.floor), vizDrag.d0 + shift), d(full.top) - span);
+        setFreqView(inv(start), inv(start + span), vizDrag.rate);
+      }
+    }
   }
   if (event.pointerType === 'mouse') {
     vizHover = { x: p.x, y: p.y };
+    const { region } = pointRegion(p);
+    els.canvas.style.cursor = vizDrag && vizDrag.moved && vizDrag.kind === 'pan' ? 'grabbing'
+      : region === 'freq' ? 'ns-resize' : region === 'ruler' || event.shiftKey ? 'col-resize' : '';
     if (!state.isPlaying) drawVisualizer();
   }
 });
@@ -2651,10 +3273,21 @@ els.canvas.addEventListener('pointermove', (event) => {
 function endVizPointer(event) {
   if (!vizPointers.has(event.pointerId)) return;
   vizPointers.delete(event.pointerId);
-  // A click without a drag seeks the player there.
-  if (event.type === 'pointerup' && vizDrag && !vizDrag.moved && els.audio.src && Number.isFinite(els.audio.duration)) {
-    const t = vizDrag.t0 + canvasPoint(event).x / vizDrag.w * vizDrag.span;
-    els.audio.currentTime = Math.min(Math.max(0, t), els.audio.duration);
+  const drag = vizDrag;
+  if (event.type === 'pointerup' && drag && !drag.moved && drag.kind !== 'freq' && els.audio.src && Number.isFinite(els.audio.duration)) {
+    const t = Math.min(Math.max(0, drag.t0 + canvasPoint(event).x / drag.w * drag.span), els.audio.duration);
+    if (drag.shift && vizSel) {
+      // Shift + click moves the nearer end of the selection there.
+      if (Math.abs(t - vizSel.t0) < Math.abs(t - vizSel.t1)) setSelection({ t0: t, t1: vizSel.t1 });
+      else setSelection({ t0: vizSel.t0, t1: t });
+      refreshVisualizer();
+    } else {
+      // A click seeks the player there; in the view, a click outside the
+      // selection also clears it.
+      if (drag.kind === 'pan' && vizSel && (t < vizSel.t0 || t > vizSel.t1)) setSelection(null);
+      els.audio.currentTime = t;
+      refreshVisualizer();
+    }
   }
   if (!vizPointers.size) { vizDrag = null; vizPinch = null; }
   else if (vizPinch) vizPinch = null;
@@ -2666,13 +3299,23 @@ els.canvas.addEventListener('pointerleave', () => {
   vizHover = null;
   if (!state.isPlaying) drawVisualizer();
 });
+els.canvas.addEventListener('dblclick', (event) => {
+  if (state.vizMode !== 'spec' || pointRegion(canvasPoint(event)).region !== 'freq') return;
+  resetFreqView();
+  refreshVisualizer();
+});
 
 els.canvas.addEventListener('keydown', (event) => {
   if (state.vizMode === 'bars' || event.ctrlKey || event.metaKey || event.altKey) return;
+  const spec = state.vizMode === 'spec';
   const actions = {
     '+': () => zoomViz(0.5), '=': () => zoomViz(0.5), '-': () => zoomViz(2), '_': () => zoomViz(2),
-    '0': () => { resetVizView(); refreshVisualizer(); },
-    ArrowLeft: () => panViz(-0.25), ArrowRight: () => panViz(0.25)
+    '0': fitView,
+    ArrowLeft: () => panViz(-0.25), ArrowRight: () => panViz(0.25),
+    ArrowUp: spec ? () => (event.shiftKey ? panFreq(0.25) : zoomFreq(0.5)) : null,
+    ArrowDown: spec ? () => (event.shiftKey ? panFreq(-0.25) : zoomFreq(2)) : null,
+    z: vizSel ? zoomToSelection : null, Z: vizSel ? zoomToSelection : null,
+    Escape: vizSel ? () => { setSelection(null); refreshVisualizer(); } : null
   };
   if (!actions[event.key]) return;
   event.preventDefault();
@@ -2706,6 +3349,9 @@ els.audio.addEventListener('play', () => {
     }
   }
   if (state.audioCtx && state.audioCtx.state === 'suspended') state.audioCtx.resume();
+  // A selection loop starts at the selection when played from outside it.
+  if (state.loop && vizSel && (els.audio.currentTime < vizSel.t0 || els.audio.currentTime >= vizSel.t1)) els.audio.currentTime = vizSel.t0;
+  loopLastTime = els.audio.currentTime;
   if (els.audioDry && els.audioDry.src) { syncDry(); els.audioDry.play().catch(() => {}); }
   state.isPlaying = true;
   cancelAnimationFrame(state.animationId);
@@ -2718,9 +3364,13 @@ function stopVisualizer() {
   refreshVisualizer();
 }
 els.audio.addEventListener('pause', stopVisualizer);
-els.audio.addEventListener('ended', stopVisualizer);
-els.audio.addEventListener('seeked', () => { syncDry(); refreshVisualizer(); });
-els.audio.addEventListener('timeupdate', refreshVisualizer);
+els.audio.addEventListener('ended', () => {
+  // A selection that runs to the end of the file loops from here.
+  if (state.loop && vizSel) { els.audio.currentTime = vizSel.t0; els.audio.play().catch(() => {}); return; }
+  stopVisualizer();
+});
+els.audio.addEventListener('seeked', () => { syncDry(); loopLastTime = els.audio.currentTime; refreshVisualizer(); });
+els.audio.addEventListener('timeupdate', () => { checkLoop(); refreshVisualizer(); });
 let resizeTimer = 0;
 window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(refreshVisualizer, 150); });
 

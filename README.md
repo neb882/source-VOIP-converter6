@@ -119,16 +119,32 @@ The developer console supports Source-style `;` chaining, `alias`, `toggle`, `fi
 The visualizer has three views. All three follow the A/B toggle.
 - **WAVE:** peak and RMS envelope, down to individual samples. **dB** switches to a dBFS amplitude scale for quiet detail: fades, the gate's tails, DTX comfort noise and noise floors. Full-scale samples are marked red.
 - **BARS:** a log-frequency spectrum from 20 Hz, 8192-point, in dBFS; live while playing, computed at the playhead when paused. The version you are not hearing (dry or wet) is drawn over it as a line.
-- **SPEC:** a spectrogram with a dB colour scale.
-  - **LIN** shows the 12 kHz Opus edge and the post-clip shelf as lines.
-  - **LOG** runs from 20 Hz. Below 400 Hz it analyses a 16× decimated signal with a 1024-point FFT, for about 3 Hz resolution there. Its levels are per Hz, so noise reads the same across the split.
+- **SPEC:** a spectrogram with a dB colour scale, on a linear axis or, with **LOG**, from 20 Hz. The ruler marks the 12 kHz Opus band edge in amber.
+
+**Spectrogram resolution.** The visible band is analysed in tiers. Each tier reads the signal decimated as far as its top frequency allows (by up to 64), so a low band gets long windows cheaply. **RES AUTO** sizes the FFT to the zoom, as iZotope RX's auto-adjust does. A Blackman window of T seconds blurs about 0.4 T in time and 2.35 / T in frequency. AUTO picks T = 3.4 · √(seconds per column / Hz per row), which blurs about twice as many pixels in time as in frequency, so tones, harmonics and hum stay sharp.
+- Zooming in on time shortens the window.
+- Zooming in on frequency, or going lower on the log axis, lengthens it (up to 1.4 s).
+- On the log axis every octave-ish band has its own window, and levels are per Hz so noise reads the same across them.
+
+A fixed RES (256–16384 samples at the file's rate) uses one window length everywhere. The corner label and the hover readout give the window and bin width in use.
 
 **Navigating** WAVE and SPEC:
 - Zoom in time with Ctrl/⌘ + wheel, a trackpad or touch pinch, the − and + buttons or the + and − keys.
-- Pan by dragging, with Shift + wheel or with the arrow keys; FIT or 0 shows the whole file.
+- Pan by dragging, with Shift + wheel or with the arrow keys.
+- SPEC's frequency axis: the wheel over the frequency ruler, Alt + wheel or Ctrl/⌘ + Shift + wheel over the view, or ↑ and ↓. Drag the ruler to move the band (Shift + ↑/↓ with the keys). Double-click the ruler to show the whole band.
+- FIT or 0 shows the whole file and the whole band.
 - Click to seek. While playing zoomed in, the view pages along with the playhead.
 
-Only the visible range is analysed, at the display's full pixel resolution. The range button sets how many dB the colours (or the dB waveform) span. TALL, or dragging the bottom-right corner, makes the view taller. Hovering reads out time, frequency and level.
+Only the visible range is analysed, at the display's full pixel resolution. The range button sets how many dB the colours (or the dB waveform) span. TALL, or dragging the bottom-right corner, makes the view taller. Hovering reads out time, level, and in SPEC the frequency with its nearest note, the level and the analysis window.
+
+**Lanes** under WAVE and SPEC:
+- **Codec lane:** what the voice path did with each 20 ms frame, in playback time. It shows SILK, Hybrid or CELT coding, DTX (comfort noise), not sent (gate closed), lost (concealed) and late (played as silence).
+  - Zoomed out, a pixel shows the most common frame type, with a red or orange strip on top for the share lost or late.
+  - Hovering gives the frame's packet size and bitrate.
+  - The legend under the view counts each type.
+- **LUFS** adds a loudness lane: momentary (400 ms, thin) and short-term (3 s, bold) loudness of the render (blue) and the source (white), each drawn at the centre of its window. Dashed lines mark each version's integrated loudness.
+
+**Selection and loop.** Shift + drag, or a drag along the time ruler, selects a range. Shift + click moves the nearer end. The meter then measures just the selection, wet and dry, with a header offering **Zoom to selection** (Z) and **Clear** (Esc). **LOOP** (L) loops the selection or, with none, the whole file.
 
 **Meter.** Under the visualizer, the meter lists for the wet render and the dry source:
 - integrated loudness and maximum short-term and momentary loudness (ITU-R BS.1770-4, gated)
@@ -138,9 +154,9 @@ Only the visible range is analysed, at the display's full pixel resolution. The 
 
 A Δ row gives wet minus dry. Values are measured as one channel; played as dual mono they read 3 dB higher.
 
-**Match loudness** makes the A/B comparison fair: the louder version plays quieter by the difference in integrated loudness, so neither wins just by being louder.
+**Match loudness** makes the A/B comparison fair: the louder version plays quieter by the difference in integrated loudness over the whole file, so neither wins just by being louder.
 
-**Shortcuts:** Space plays and pauses, B switches A/B.
+**Shortcuts:** Space plays and pauses, B switches A/B, L loops. With the view focused: + − 0 and the arrows navigate, Z zooms to the selection and Esc clears it.
 
 The meter shows a real codec property. When DTX replaces a steady tone below about 60 Hz, libopus 1.1.x's comfort noise is nearly DC, and TF2 plays it as is. See finding 18 in [REFERENCE_2026.md](tests/REFERENCE_2026.md).
 
@@ -171,7 +187,7 @@ pnpm test:all
 ```
 
 - **`tests/verify.js`:** resampler passband/stopband/alignment, the profile FIR, and the auto-gain law. The law checks cover the measured sine overdrive at `voice_avggain` 0.5 and 0.25, the cap, the int16 clamp, silence hold, step timing and the `voice_scale` sawtooth and truncation. Also the voice gate (threshold, pre-roll, hold, talk spurts, DTX comfort noise on steady tones, send/skip accounting), stereo capture, real codec modes per profile, all room presets 0–29, the measured loss bursts and late-frame jitter with PLC, option robustness and WAV structure.
-- **`tests/opus.verify.mjs`:** frame timing and boundary pulses, exact lengths, bitrates and packet sizes, TOC mode reporting, native concealment, silence, mute, determinism, the sender gate inside the round trip (pre-roll, hold, talk spurts), opt-in DTX, leveling and cap behavior, output-volume linearity, pre-encoder filtering, and codec-failure reporting. Also the libopus 1.1.5 build: its packets are bit-identical to a native build of the release, and its DTX differs from 1.6.1's as Steam's does.
+- **`tests/opus.verify.mjs`:** frame timing and boundary pulses, exact lengths, bitrates and packet sizes, TOC mode reporting, native concealment, silence, mute, determinism, the sender gate inside the round trip (pre-roll, hold, talk spurts), opt-in DTX, the per-frame log behind the codec lane, leveling and cap behavior, output-volume linearity, pre-encoder filtering, and codec-failure reporting. Also the libopus 1.1.5 build: its packets are bit-identical to a native build of the release, and its DTX differs from 1.6.1's as Steam's does.
 - **`tests/reference.verify.mjs`:** alignment, clock drift, polarity, fractional delay, clip-signature and level-tracking metrics.
 - **`tests/formats.verify.mjs`:** download formats and ZIPs.
   - FLAC decodes bit-exact with valid frame CRCs, through an independent decoder in the test.
@@ -184,9 +200,11 @@ pnpm test:all
   - both gates
   - LRA 10 LU on the two-level case
   - true peak 0 dBTP on the fs/4, 45° sine
+  - the loudness history that the LUFS lane draws
 - **Chromium checks:**
   - worker parity, cancellation, PCM recording and offline conversion
   - every visualizer mode, zoom, pan, seek, keys and scales
+  - the codec and loudness lanes, frequency zoom, AUTO and fixed resolution, selection statistics, zoom to selection and loop
   - the meter, loudness-matched A/B and shortcuts
   - batch queueing: picker, step 1 multi-select, drop on the batch panel, single-file drop as source
   - batch rendering with loudness per file, and ZIPs in all three formats, with FLAC decoded in the browser to exactly the WAV's samples

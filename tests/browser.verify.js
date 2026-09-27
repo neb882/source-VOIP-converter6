@@ -6,6 +6,8 @@ const { chromium } = require('playwright');
 const { createStaticServer } = require('./static-server');
 
 let passed = 0;
+// The app shell cache sw.js populates, e.g. tf2ve-v13.
+const SHELL_CACHE = `tf2ve-v${/CACHE_PREFIX\}v(\d+)/.exec(fs.readFileSync(path.join(__dirname, '..', 'sw.js'), 'utf8'))[1]}`;
 function check(condition, name, detail = '') {
   if (!condition) throw new Error(`${name}${detail ? ` (${detail})` : ''}`);
   passed++;
@@ -171,6 +173,131 @@ async function verifyVisualizerTools(page) {
   await page.keyboard.press('b');
   check(await page.locator('#ab-toggle').textContent() !== before, 'the B key switches A/B');
   await page.keyboard.press('b');
+}
+
+async function verifyLanesAndSelection(page) {
+  console.log('\n[Browser 3d] Codec and loudness lanes, frequency zoom, resolution, selection and loop');
+  const view = () => page.evaluate(() => document.getElementById('visualizer').dataset.view || '');
+  const band = (v) => { const m = /:f([\d.]+)-([\d.]+):/.exec(v); return m ? [Number(m[1]), Number(m[2])] : null; };
+  const span = (v) => { const m = /:([\d.]+)-([\d.]+)$/.exec(v); return m ? Number(m[2]) - Number(m[1]) : NaN; };
+  // The canvas's place on screen, read before each gesture (clicks may scroll the page).
+  const canvasBox = async () => { await page.locator('#visualizer').scrollIntoViewIfNeeded(); return page.locator('#visualizer').boundingBox(); };
+  let box = await canvasBox();
+  await page.mouse.move(0, 0);
+  await page.locator('#viz-wave').click();
+  await page.waitForFunction(() => (document.getElementById('visualizer').dataset.view || '').startsWith('wave'));
+  // Pixels of a lane, as [r, g, b] per pixel of its middle row or of its whole height.
+  const lanePixels = (region) => page.evaluate((which) => {
+    const canvas = document.getElementById('visualizer'), rect = canvas.getBoundingClientRect(), scale = canvas.width / rect.width;
+    const L = vizLayout(rect.width, rect.height);
+    const [y0, h] = which === 'lane' ? [L.laneY + L.laneH / 2, 1] : [L.lufsY + 2, L.lufsH - 4];
+    if (!h || (which === 'lane' && !L.laneH)) return [];
+    const data = canvas.getContext('2d').getImageData(0, Math.round(y0 * scale), canvas.width, Math.max(1, Math.round(h * scale))).data;
+    const out = [];
+    for (let i = 0; i < data.length; i += 4) out.push([data[i], data[i + 1], data[i + 2]]);
+    return out;
+  }, region);
+
+  const lane = await page.evaluate(() => {
+    const info = state.lastCodecInfo;
+    const items = [...document.querySelectorAll('#viz-legend .lg-item')].filter(e => e.querySelector('.lg-box')).map(e => e.textContent);
+    return { frames: info.frames, log: info.frameLog.length, bytes: info.frameBytes.reduce((a, b) => a + b, 0), encoded: info.encodedBytes,
+      items, sum: items.reduce((n, t) => n + Number(t.split(' ').pop()), 0), legend: !document.getElementById('viz-legend').hidden,
+      colors: FRAME_STYLE.map(f => f.color) };
+  });
+  check(lane.log === lane.frames && lane.bytes === lane.encoded && lane.legend && lane.sum === lane.frames,
+    'the codec lane logs every frame and its legend counts them', lane.items.join(', '));
+  const hex = (c) => '#' + c.map(v => v.toString(16).padStart(2, '0')).join('');
+  const laneColors = new Set((await lanePixels('lane')).map(hex));
+  check([...laneColors].some(c => lane.colors.includes(c)), 'the codec lane is drawn under the waveform in the frame colours', [...laneColors].slice(0, 4).join(' '));
+
+  await page.locator('#viz-lufs').click();
+  await page.waitForFunction(() => state.meterStats && state.meterStats.wet && state.meterStats.wet.history);
+  const lufsLegend = await page.locator('#viz-legend').textContent();
+  const blue = (await lanePixels('lufs')).filter(([r, g, b]) => b > 80 && b > r + 30).length;
+  check(await page.locator('#viz-lufs').getAttribute('aria-pressed') === 'true' && lufsLegend.includes('Loudness') && blue > 0,
+    'the loudness lane draws the render\'s loudness history', `${blue} px`);
+
+  // Frequency zoom and resolution, on the linear axis.
+  await page.locator('#viz-spec').click();
+  if (await page.locator('#viz-log').getAttribute('aria-pressed') === 'true') await page.locator('#viz-log').click();
+  await page.waitForFunction(() => (document.getElementById('visualizer').dataset.view || '').startsWith('spec:lin'));
+  const fullBand = band(await view());
+  box = await canvasBox();
+  const mainH = await page.evaluate(() => { const r = document.getElementById('visualizer').getBoundingClientRect(); return vizLayout(r.width, r.height).mainH; });
+  await page.mouse.move(box.x + 10, box.y + mainH * 0.8);
+  await page.mouse.wheel(0, -100);
+  await page.mouse.wheel(0, -100);
+  await page.waitForFunction((hi) => { const m = /:f([\d.]+)-([\d.]+):/.exec(document.getElementById('visualizer').dataset.view || ''); return m && Number(m[2]) - Number(m[1]) < hi * 0.5; }, fullBand[1]);
+  const zoomedBand = band(await view());
+  check(fullBand[0] === 0 && zoomedBand[1] - zoomedBand[0] < (fullBand[1] - fullBand[0]) * 0.5,
+    'the wheel over the frequency ruler zooms the spectrogram\'s band', `${zoomedBand[0].toFixed(0)}–${zoomedBand[1].toFixed(0)} Hz`);
+  box = await canvasBox();
+  await page.mouse.dblclick(box.x + 10, box.y + mainH * 0.5);
+  await page.waitForFunction((hi) => { const m = /:f([\d.]+)-([\d.]+):/.exec(document.getElementById('visualizer').dataset.view || ''); return m && Number(m[2]) === hi; }, fullBand[1]);
+  await page.locator('#visualizer').focus();
+  await page.keyboard.press('ArrowUp');
+  await page.waitForFunction((hi) => { const m = /:f([\d.]+)-([\d.]+):/.exec(document.getElementById('visualizer').dataset.view || ''); return m && Number(m[2]) - Number(m[1]) < hi * 0.6; }, fullBand[1]);
+  await page.keyboard.press('0');
+  await page.waitForFunction((hi) => { const m = /:f([\d.]+)-([\d.]+):/.exec(document.getElementById('visualizer').dataset.view || ''); return m && Number(m[2]) === hi && Number(m[1]) === 0; }, fullBand[1]);
+  check(true, 'double-click on the ruler, ↑ and 0 reset and zoom the band');
+
+  const resolution = () => page.evaluate(() => (vizImage && vizImage.tiers ? { fixed: vizImage.fixed, windows: vizImage.tiers.map(t => t.windowSec), rate: audibleBuffer().rate } : null));
+  const whole = await resolution();
+  await page.locator('#viz-zoom-in').click();
+  await page.locator('#viz-zoom-in').click();
+  await page.waitForFunction(() => vizImage && vizImage.tiers && (document.getElementById('visualizer').dataset.view || '').startsWith('spec') && vizImage.t1 - vizImage.t0 < 0.2);
+  const zoomed = await resolution();
+  check(!whole.fixed && zoomed.windows[0] < whole.windows[0], 'AUTO resolution shortens the window when zoomed in on time',
+    `${(whole.windows[0] * 1000).toFixed(1)} → ${(zoomed.windows[0] * 1000).toFixed(1)} ms`);
+  await page.locator('#viz-res').selectOption('4096');
+  await page.waitForFunction(() => vizImage && vizImage.fixed === 4096 && (document.getElementById('visualizer').dataset.view || '').startsWith('spec'));
+  const fixed = await resolution();
+  check(fixed.windows.every(w => Math.abs(w - 4096 / fixed.rate) < 1e-9), 'a fixed RES sets the FFT size', `${(fixed.windows[0] * 1000).toFixed(1)} ms`);
+  await page.locator('#viz-res').selectOption('auto');
+  await page.locator('#viz-fit').click();
+
+  // Selection: Shift + drag, meter statistics for it, Shift + click, loop, zoom, Esc.
+  await page.locator('#viz-wave').click();
+  await page.waitForFunction(() => (document.getElementById('visualizer').dataset.view || '').startsWith('wave'));
+  box = await canvasBox();
+  await page.keyboard.down('Shift');
+  await page.mouse.move(box.x + box.width * 0.04, box.y + 30);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width * 0.96, box.y + 30, { steps: 6 });
+  await page.mouse.up();
+  await page.keyboard.up('Shift');
+  await page.waitForFunction(() => !document.getElementById('meter-sel').hidden && document.querySelectorAll('#meter-rows tr').length >= 2
+    && !document.getElementById('meter-rows').textContent.includes('…'), null, { timeout: 60000 });
+  const selected = await page.evaluate(() => {
+    const rate = state.processedRate, from = Math.floor(vizSel.t0 * rate), to = Math.ceil(vizSel.t1 * rate);
+    return { t0: vizSel.t0, t1: vizSel.t1, expect: TF2Meter.analyze(state.processedBuffer.subarray(from, to), rate).integrated,
+      shown: Number(document.querySelector('#meter-rows tr td').textContent.replace('−', '-')), text: document.getElementById('meter-sel-text').textContent };
+  });
+  check(Math.abs(selected.t0 - 0.02) < 0.01 && Math.abs(selected.t1 - 0.48) < 0.01 && Math.abs(selected.shown - selected.expect) < 0.051,
+    'Shift + drag selects a range and the meter measures it', `${selected.text}; ${selected.shown} LUFS`);
+  box = await canvasBox();
+  await page.keyboard.down('Shift');
+  await page.mouse.click(box.x + box.width * 0.6, box.y + 30);
+  await page.keyboard.up('Shift');
+  const extended = await page.evaluate(() => vizSel && [vizSel.t0, vizSel.t1]);
+  check(Math.abs(extended[0] - 0.02) < 0.01 && Math.abs(extended[1] - 0.3) < 0.01, 'Shift + click moves the nearer end of the selection', extended.map(t => t.toFixed(3)).join('–'));
+  await page.locator('h1').click();
+  await page.keyboard.press('l');
+  check(await page.locator('#viz-loop').getAttribute('aria-pressed') === 'true' && !(await page.evaluate(() => document.getElementById('preview').loop)),
+    'L loops the selection (not the whole file)');
+  await page.locator('#visualizer').focus();
+  await page.keyboard.press('z');
+  await page.waitForFunction(() => { const m = /:([\d.]+)-([\d.]+)$/.exec(document.getElementById('visualizer').dataset.view || ''); return m && Number(m[2]) - Number(m[1]) < 0.4; });
+  check(Math.abs(span(await view()) - 0.28 * 1.1) < 0.01, 'Z zooms to the selection', span(await view()).toFixed(3));
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => document.getElementById('meter-sel').hidden);
+  check(await page.evaluate(() => document.getElementById('preview').loop), 'Esc clears the selection; the loop then covers the whole file');
+  await page.locator('h1').click();
+  await page.keyboard.press('l');
+  check(await page.locator('#viz-loop').getAttribute('aria-pressed') === 'false' && !(await page.evaluate(() => document.getElementById('preview').loop)), 'L turns the loop off');
+  await page.locator('#viz-lufs').click();
+  await page.locator('#viz-fit').click();
 }
 
 // A minimal reader for the stored ZIPs the batch writes.
@@ -428,6 +555,7 @@ async function main() {
       check(await painted() > 0.02, `${mode.toUpperCase()} view paints the rendered audio`);
     }
     await verifyVisualizerTools(page);
+    await verifyLanesAndSelection(page);
     await page.locator('#viz-wave').click();
     await page.locator('#loss').fill('12');
     await page.locator('#loss').dispatchEvent('change');
@@ -532,12 +660,12 @@ async function main() {
       'worker replacement preserves the loaded audio without reloading');
     check(afterUpdate.processEnabled, 'worker replacement leaves Process Audio enabled');
     check(afterUpdate.keys.includes('unrelated-test-cache'), 'activation preserves unrelated origin caches');
-    check(afterUpdate.keys.includes('tf2ve-v12'), 'current app shell cache is populated');
-    check(await page.evaluate(async () => {
-      const cache = await caches.open('tf2ve-v12');
+    check(afterUpdate.keys.includes(SHELL_CACHE), 'current app shell cache is populated', SHELL_CACHE);
+    check(await page.evaluate(async (name) => {
+      const cache = await caches.open(name);
       const needed = ['batch.js', 'formats.js', 'flac.js', 'zip.js', 'meter.js', 'vendor/lame/index.mjs', 'vendor/lame/lame-3.100.wasm.mjs'];
       return (await Promise.all(needed.map(path => cache.match(new URL(path, location.href).href)))).every(Boolean);
-    }), 'batch, format, meter and MP3 encoder files are cached for offline use');
+    }, SHELL_CACHE), 'batch, format, meter and MP3 encoder files are cached for offline use');
     // Restore the normal registration while still online. Otherwise reloading
     // registers sw.js again and races another replacement against file loading.
     await activateServiceWorker(page, 'sw.js');

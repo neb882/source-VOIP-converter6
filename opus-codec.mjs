@@ -16,6 +16,10 @@ function runtime(version) {
 const APPLICATIONS = { voip: 2048, audio: 2049, lowdelay: 2051 };
 const SIGNALS = { auto: -1000, voice: 3001, music: 3002 };
 
+// Codes in roundTrip's info.frameLog, one per 20 ms frame (info.frameBytes
+// holds each frame's packet size; 0 when the gate held it back).
+export const FRAME = { gated: 0, silk: 1, hybrid: 2, celt: 3, dtx: 4, lost: 5, late: 6 };
+
 // RFC 6716 section 3.1: the TOC configuration number selects the coding mode.
 function packetMode(packet) {
   const config = packet[0] >> 3;
@@ -69,6 +73,8 @@ export async function roundTrip(samples, sampleRate, bitrate, options = {}) {
     // outputs silence for them. Each talk spurt starts a fresh encoder and
     // decoder, as Steam's end-of-transmission marker resets the decoder.
     const plan = gate ? gatePlan(samples, frames, frameSize, gate) : null;
+    // What happened to each frame, for the visualizer's codec lane.
+    const frameLog = new Uint8Array(frames), frameBytes = new Uint16Array(frames);
     let encodedBytes = 0, lostFrames = 0, underrunFrames = 0, gatedFrames = 0, dtxFrames = 0, spurts = 0;
     let open = false;
     for (let f = 0; f < frames; f++) {
@@ -93,16 +99,20 @@ export async function roundTrip(samples, sampleRate, bitrate, options = {}) {
       // Encode even lost packets: capture/encoder state continues at the sender.
       const packet = encoder.encodeFloat(input);
       encodedBytes += packet.byteLength;
-      modes[packetMode(packet)]++;
+      frameBytes[f] = packet.byteLength;
+      const mode = packetMode(packet);
+      modes[mode]++;
       // A DTX packet is the TOC byte alone (plus at most one byte); the
       // decoder answers it with comfort noise.
-      if (packet.byteLength <= 2) dtxFrames++;
+      const dtx = packet.byteLength <= 2;
+      if (dtx) dtxFrames++;
+      frameLog[f] = dtx ? FRAME.dtx : FRAME[mode];
       options.onPacket?.(f, packet);
       // Loss mask: 1 = lost, concealed by the decoder; 2 = arrived too late
       // for playback, so the slot plays silence and the decoder skips it.
       const miss = lossMask ? lossMask[f] : 0;
-      if (miss === 1) lostFrames++;
-      else if (miss === 2) underrunFrames++;
+      if (miss === 1) { lostFrames++; frameLog[f] = FRAME.lost; }
+      else if (miss === 2) { underrunFrames++; frameLog[f] = FRAME.late; }
       if (miss !== 2) {
         const decoded = miss === 1 ? decoder.decodePacketLossFloat(frameSize)
           : decoder.decodeFloat(packet, { frameSize });
@@ -124,7 +134,7 @@ export async function roundTrip(samples, sampleRate, bitrate, options = {}) {
       lookahead, frames, lostFrames, underrunFrames, gatedFrames, dtxFrames, spurts,
       gate: gate ? Number(options.gate.thresholdDb) : null,
       prerollFrames: gate ? gate.preroll : 0, holdFrames: gate ? gate.hold : 0,
-      encodedBytes, modes, plc: 'opus' } };
+      encodedBytes, modes, plc: 'opus', frameLog, frameBytes } };
   } finally {
     decoder?.free();
     encoder?.free();
