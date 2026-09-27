@@ -838,12 +838,23 @@
   /* WAV encoder (16-bit PCM mono)                                      */
   /* ------------------------------------------------------------------ */
 
+  // Float samples to 16-bit PCM, the conversion every download format uses.
+  function toInt16(samples) {
+    const out = new Int16Array(samples.length);
+    for (let i = 0; i < samples.length; i++) {
+      const s = clamp(samples[i], -1, 1);
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return out;
+  }
+
   function encodeWav(samples, rate) {
-    const buf = new ArrayBuffer(44 + samples.length * 2);
+    const pcm = toInt16(samples);
+    const buf = new ArrayBuffer(44 + pcm.length * 2);
     const view = new DataView(buf);
     const wstr = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
     wstr(0, 'RIFF');
-    view.setUint32(4, 36 + samples.length * 2, true);
+    view.setUint32(4, 36 + pcm.length * 2, true);
     wstr(8, 'WAVE');
     wstr(12, 'fmt ');
     view.setUint32(16, 16, true);
@@ -854,12 +865,8 @@
     view.setUint16(32, 2, true);        // block align
     view.setUint16(34, 16, true);       // bits per sample
     wstr(36, 'data');
-    view.setUint32(40, samples.length * 2, true);
-    let offset = 44;
-    for (let i = 0; i < samples.length; i++, offset += 2) {
-      const s = clamp(samples[i], -1, 1);
-      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-    }
+    view.setUint32(40, pcm.length * 2, true);
+    for (let i = 0; i < pcm.length; i++) view.setInt16(44 + 2 * i, pcm[i], true);
     return new Blob([buf], { type: 'audio/wav' });
   }
 
@@ -870,6 +877,7 @@
   const TF2Audio = {
     process,
     encodeWav,
+    toInt16,
     bufferToMono,
     // exposed for tests / tools
     resampleSinc,

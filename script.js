@@ -20,6 +20,7 @@ const els = {
   process:   document.getElementById('process'),
   cancel:    document.getElementById('cancel-process'),
   dl:        document.getElementById('download'),
+  format:    document.getElementById('format'),
   status:    document.getElementById('source-status'),
   progress:  document.getElementById('process-progress'),
   advancedToggle: document.getElementById('advanced-toggle'),
@@ -72,6 +73,9 @@ const els = {
 
 const state = {
   lastBlob: null,        // URL for processed wav
+  lastWav: null,         // Blob of the processed wav (the download master)
+  lastExports: {},       // format -> Promise<{ blob, crc }> made from lastWav
+  lastCodecKey: 'steam', // codec profile of the last render (download name)
   dryBlob: null,         // URL for original source (for A/B)
   processedBuffer: null, // Float32Array of last processed samples
   processedRate: null,
@@ -98,10 +102,9 @@ const state = {
   recorder: null,        // active PCM capture session
   recTick: null,         // recording timer interval
   processing: false,
-  worker: null,
+  batchRunning: false,   // batch.js is rendering its queue
   processId: 0,
-  cancelProcessing: null,
-  downloadName: 'tf2_voice.wav'
+  cancelProcessing: null
 };
 
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
@@ -613,6 +616,7 @@ function execCommand(rawStr, isFromGui = false, depth = 0) {
       if (el.value !== normalized) el.value = normalized;
       if (cvar.action) cvar.action(normalized);
       logLine(`"${cmdName}" = "${normalized}"`, 'val');
+      updateSignalChain();
     } else {
       logLine(`"${cmdName}" = "${el.value}"`, 'text');
       if (cvar.help) logLine(` - ${cvar.help}`, 'help');
@@ -680,6 +684,8 @@ function updateSignalChain() {
     li.append(b, span);
     return li;
   }));
+  // The batch queue marks renders made with other settings.
+  document.dispatchEvent(new Event('tf2:settings'));
 }
 
 function runPreset(name) {
@@ -818,6 +824,7 @@ function applyConfig(cfg) {
     } catch (e) { /* invalid persisted value — retain the current setting */ }
   });
   if (els.position.value === 'manual' || els.env.value === '99') showAdvanced(true);
+  if (applied) updateSignalChain();
   return applied;
 }
 
@@ -892,6 +899,8 @@ function mountSource(mono, sampleRate, name, left = null) {
   if (state.dryBlob) URL.revokeObjectURL(state.dryBlob);
   if (state.lastBlob) URL.revokeObjectURL(state.lastBlob);
   state.lastBlob = null;
+  state.lastWav = null;
+  state.lastExports = {};
   state.processedBuffer = null;
   state.decodedSource = { sampleRate, duration, length: mono.length,
     numberOfChannels: 1, getChannelData: () => mono, left };
@@ -906,7 +915,9 @@ function mountSource(mono, sampleRate, name, left = null) {
   els.abToggle.textContent = 'A/B: Wet';
   state.abMode = 'wet';
   state.lastCodecInfo = null;
+  resetVizView();
   refreshVisualizer();
+  updateMeter();
   setStatus(`${name} · ${duration.toFixed(1)}s · ${sampleRate.toLocaleString()} Hz`, 'success');
   logLine(`FS_MountFile: "${name}" (${duration.toFixed(1)}s) mounted.`, 'sys');
   updateSignalChain();
@@ -1131,13 +1142,11 @@ document.querySelectorAll('.preset-btn').forEach(btn => {
   btn.addEventListener('click', () => { const cmd = btn.getAttribute('data-cmd'); if (cmd) execCommand(cmd); });
 });
 
-els.file.addEventListener('change', async () => {
-  if (!els.file.files.length) return;
-  const f = els.file.files[0];
+// Load one file as the source (file picker or a single dropped file).
+async function loadSourceFile(f) {
   if (f.size > MAX_FILE_BYTES) {
     setStatus(`File is ${(f.size / 1024 / 1024).toFixed(1)} MB; the limit is ${MAX_FILE_BYTES / 1024 / 1024} MB.`, 'error');
     logLine('FS_MountFile: file exceeds the 100 MB safety limit.', 'err');
-    els.file.value = '';
     return;
   }
   const selection = ++sourceLoadId;
@@ -1151,6 +1160,19 @@ els.file.addEventListener('change', async () => {
     setStatus(`Could not read audio: ${error.message}`, 'error');
     els.process.disabled = !state.decodedSource;
   }
+}
+
+els.file.addEventListener('change', () => {
+  if (!els.file.files.length) return;
+  const files = Array.from(els.file.files);
+  // Several files at once go to the batch queue (batch.js).
+  if (files.length > 1 && window.TF2Batch) {
+    els.file.value = '';
+    window.TF2Batch.add(files, { reveal: true });
+    return;
+  }
+  if (files[0].size > MAX_FILE_BYTES) els.file.value = '';
+  loadSourceFile(files[0]);
 });
 
 /* ------------------------------------------------------------------ */
@@ -1166,53 +1188,77 @@ if (els.consoleDetails) {
   });
 }
 
-function processInWorker(source, opts) {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker('audio-worker.js');
-    const id = ++state.processId;
-    const mono = source.getChannelData(0).slice();
-    const workerOpts = { ...opts };
-    delete workerOpts.onProgress;
-    state.worker = worker;
+// Whether jobs can run in audio-worker.js (not from file://).
+function canUseWorker() {
+  return typeof Worker !== 'undefined' && location.protocol !== 'file:';
+}
 
-    const cleanup = () => {
-      worker.terminate();
-      if (state.worker === worker) state.worker = null;
-      state.cancelProcessing = null;
-    };
-    state.cancelProcessing = () => {
-      cleanup();
+// One job in a dedicated worker. Returns { promise, cancel }: the promise
+// resolves with the worker's reply; cancel() terminates the worker and
+// rejects with an AbortError.
+function startWorker(message, transfer, onProgress) {
+  const worker = new Worker('audio-worker.js');
+  const id = ++state.processId;
+  let cancel;
+  const promise = new Promise((resolve, reject) => {
+    let done = false;
+    const finish = () => { done = true; worker.terminate(); };
+    cancel = () => {
+      if (done) return;
+      finish();
       const error = new Error('Audio processing cancelled.');
       error.name = 'AbortError';
       reject(error);
     };
     worker.onmessage = (event) => {
-      const message = event.data || {};
-      if (message.id !== id) return;
-      if (message.type === 'progress') {
-        if (opts.onProgress) opts.onProgress(message.value);
-      } else if (message.type === 'result') {
-        cleanup();
-        resolve({
-          samples: new Float32Array(message.samples),
-          sampleRate: message.sampleRate,
-          blob: message.blob,
-          realOpus: message.realOpus,
-          codecInfo: message.codecInfo
-        });
-      } else if (message.type === 'error') {
-        cleanup();
-        reject(new Error(message.message || 'Audio worker failed.'));
+      const reply = event.data || {};
+      if (reply.id !== id || done) return;
+      if (reply.type === 'progress') {
+        if (onProgress) onProgress(reply.value);
+      } else if (reply.type === 'error') {
+        finish();
+        reject(new Error(reply.message || 'Audio worker failed.'));
+      } else {
+        finish();
+        resolve(reply);
       }
     };
     worker.onerror = (event) => {
-      cleanup();
+      if (done) return;
+      finish();
       reject(new Error(event.message || 'Audio worker could not start.'));
     };
-    worker.postMessage({
-      type: 'process', id, sampleRate: source.sampleRate,
-      samples: mono.buffer, opts: workerOpts
-    }, [mono.buffer]);
+    worker.postMessage({ ...message, id }, transfer);
+  });
+  return { promise, cancel };
+}
+
+// One render in a dedicated worker, as { promise, cancel }. The result
+// carries the render's loudness and levels (meter.js) as `stats`.
+function startWorkerJob(source, opts) {
+  const mono = source.getChannelData(0).slice();
+  const workerOpts = { ...opts };
+  delete workerOpts.onProgress;
+  const job = startWorker({ type: 'process', sampleRate: source.sampleRate, samples: mono.buffer, opts: workerOpts, measure: true },
+    [mono.buffer], opts.onProgress);
+  return {
+    cancel: job.cancel,
+    promise: job.promise.then((reply) => ({
+      samples: new Float32Array(reply.samples),
+      sampleRate: reply.sampleRate,
+      blob: reply.blob,
+      realOpus: reply.realOpus,
+      codecInfo: reply.codecInfo,
+      stats: reply.stats
+    }))
+  };
+}
+
+function processInWorker(source, opts) {
+  const job = startWorkerJob(source, opts);
+  state.cancelProcessing = job.cancel;
+  return job.promise.finally(() => {
+    if (state.cancelProcessing === job.cancel) state.cancelProcessing = null;
   });
 }
 
@@ -1236,9 +1282,42 @@ function captureSource(source, channel) {
   return { sampleRate: source.sampleRate, duration: source.duration, length: mono.length, numberOfChannels: 1, getChannelData: () => mono };
 }
 
+// The render settings of the current controls (everything but progress).
+function renderOptions() {
+  const posKey = els.position.value;
+  const dspRoomId = parseInt(els.env.value);
+  return {
+    codec: els.codec.value,
+    // If user chose 'manual', respect the dsp_room dropdown; otherwise use listener position.
+    listenerPos: (posKey === 'manual') ? null : posKey,
+    dspRoom: dspRoomId,
+    customEnv: (dspRoomId === 99) ? {
+      duration: Number(els.cDur.value),
+      decay:    Number(els.cDec.value),
+      mix:      Number(els.cMix.value) / 100
+    } : null,
+    captureChannel: els.captureChannel.value,
+    micGain:     Number(els.gain.value),
+    voiceScale:  Number(els.voiceScale.value),
+    hp:          Number(els.hp.value),
+    lp:          Number(els.lp.value),
+    bits:        Number(els.bits.value),
+    agc:         els.agc.value === '1',
+    maxGain:     Number(els.maxGain.value),
+    avgGain:     Number(els.avgGain.value),
+    gate:        els.vad.value === 'auto' ? null : els.vad.value === '1',
+    gateThresholdDb: Number(els.vadThreshold.value),
+    volume:      Number(els.volume.value),
+    lossPct:     Number(els.loss.value),
+    frameMs:     Number(els.frameMs.value),
+    enableWarble: els.warble.value === '1',
+    jitterMs:    Number(els.jitter.value)
+  };
+}
+
 async function runAudioProcess(source, opts) {
   source = captureSource(source, opts.captureChannel);
-  if (typeof Worker !== 'undefined' && location.protocol !== 'file:') {
+  if (canUseWorker()) {
     try {
       return await processInWorker(source, opts);
     } catch (error) {
@@ -1251,22 +1330,157 @@ async function runAudioProcess(source, opts) {
   return TF2Audio.process(source, opts);
 }
 
+// Download name for a render of `sourceName` with codec profile `codecKey`.
+function outputName(sourceName, codecKey, ext = 'wav') {
+  const base = (sourceName || 'clip').replace(/\.[^/.]+$/, '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+  return `${base}_tf2_${codecKey}.${ext}`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Download formats (formats.js): WAV, FLAC, MP3                      */
+/* ------------------------------------------------------------------ */
+
+function currentFormat() {
+  const key = els.format ? els.format.value : 'wav';
+  return TF2Formats.FORMATS[key] ? key : 'wav';
+}
+
+// The file for `format` made from a rendered WAV blob, as { blob, crc }
+// (crc: CRC-32 for ZIP archives). Runs in a worker when it can.
+async function exportWav(wavBlob, format) {
+  const { mime } = TF2Formats.FORMATS[format];
+  const wav = await wavBlob.arrayBuffer();
+  if (canUseWorker()) {
+    const reply = await startWorker({ type: 'export', wav, format }, [wav]).promise;
+    return { blob: new Blob([reply.bytes], { type: mime }), crc: reply.crc };
+  }
+  const bytes = await TF2Formats.fromWav(new Uint8Array(wav), format);
+  return { blob: new Blob([bytes], { type: mime }), crc: TF2Zip.crc32(bytes) };
+}
+
+// exportWav with the result kept per format in `cache`; a failure is not kept.
+function cachedExport(cache, wavBlob, format) {
+  if (!cache[format]) {
+    cache[format] = exportWav(wavBlob, format);
+    cache[format].catch(() => { delete cache[format]; });
+  }
+  return cache[format];
+}
+
+function saveBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+function updateDownloadLabel() {
+  if (els.dl && !els.dl.dataset.busy) els.dl.textContent = `Download ${TF2Formats.FORMATS[currentFormat()].label}`;
+}
+
+if (els.format) {
+  const saved = LS.get('tf2ve_format', 'wav');
+  if (TF2Formats.FORMATS[saved]) els.format.value = saved;
+  els.format.addEventListener('change', () => {
+    LS.set('tf2ve_format', currentFormat());
+    updateDownloadLabel();
+    document.dispatchEvent(new Event('tf2:format'));
+  });
+  updateDownloadLabel();
+}
+
+// Show a finished render: console report, preview players (wet plus the muted
+// dry twin for A/B), download name, visualizer and status.
+function presentRender({ samples, sampleRate, blob, realOpus, codecInfo, stats }, took, codecKey) {
+  // Report the actual processing path: codec version, bitrate and the
+  // Opus modes the encoder really chose.
+  logLine(realOpus
+    ? `S_Voice: ${codecInfo.version}, ${codecInfo.bitrate / 1000} kbps ${codecInfo.vbr ? 'VBR' : 'CBR'}${codecInfo.dtx ? ' + DTX' : ''}, 20 ms frames, native PLC (${describeModes(codecInfo.modes)})`
+    : 'S_Voice: codec bypassed', 'sys');
+  if (realOpus && codecInfo.gate != null) {
+    const held = codecInfo.frames ? Math.round(100 * codecInfo.gatedFrames / codecInfo.frames) : 0;
+    logLine(`S_Voice: voice gate at ${codecInfo.gate} dBFS sent ${codecInfo.spurts} talk spurt${codecInfo.spurts === 1 ? '' : 's'} and held back ${codecInfo.gatedFrames} of ${codecInfo.frames} frames (${held}%)`, 'sys');
+  }
+  if (realOpus && codecInfo.dtxFrames) {
+    logLine(`S_Voice: ${codecInfo.dtxFrames} inactive frames sent as DTX comfort noise`, 'sys');
+  }
+  if (realOpus && (codecInfo.lostFrames || codecInfo.underrunFrames)) {
+    logLine(`S_Voice: ${codecInfo.lostFrames} frames lost and concealed, ${codecInfo.underrunFrames || 0} late frames played as silence`, 'sys');
+  }
+  logLine(`S_Voice: receiver auto-gain ${codecInfo.autoGain ? 'on' : 'off'} at ${codecInfo.voiceRate} Hz`, 'sys');
+
+  state.processedBuffer = samples;
+  state.processedRate   = sampleRate;
+  if (stats) meterResults.set(bufferId(samples), Promise.resolve(stats));
+  if (state.lastBlob) URL.revokeObjectURL(state.lastBlob);
+  state.lastBlob = URL.createObjectURL(blob);
+  state.lastWav = blob;
+  state.lastExports = {};
+
+  // Default to wet after a new render; arm the muted dry twin so the
+  // A/B toggle is an instant unmute rather than a src swap.
+  state.abMode = 'wet';
+  els.abToggle.disabled = false;
+  els.abToggle.textContent = 'A/B: Wet';
+
+  els.audio.src = state.lastBlob;
+  els.audio.muted = false;
+  if (els.audioDry) {
+    els.audioDry.src = state.dryBlob;
+    els.audioDry.muted = true;
+    els.audioDry.volume = els.audio.volume;
+  }
+  state.lastCodecKey = codecKey;
+  els.dl.disabled = false;
+
+  state.renderId++;
+  state.lastCodecInfo = codecInfo;
+  resetVizView();
+  refreshVisualizer();
+  updateMeter();
+  const method = realOpus ? `Real Opus · ${codecInfo.bitrate / 1000} kbps` : 'Codec bypassed';
+  setStatus(`Ready · ${method} · ${(took / 1000).toFixed(1)}s render · ${sampleRate.toLocaleString()} Hz`, 'success');
+  logLine(`ChangeLevel: rendered ${samples.length} samples @ ${sampleRate}Hz in ${took}ms`, 'sys');
+  logLine(`Net_SendPacket: reliable stream ready.`);
+}
+
 if (els.cancel) els.cancel.addEventListener('click', () => {
   if (state.cancelProcessing) state.cancelProcessing();
 });
 
-if (els.dl) els.dl.addEventListener('click', () => {
-  if (!state.lastBlob || els.dl.disabled) return;
-  const link = document.createElement('a');
-  link.href = state.lastBlob;
-  link.download = state.downloadName;
-  link.click();
+if (els.dl) els.dl.addEventListener('click', async () => {
+  if (!state.lastWav || els.dl.disabled) return;
+  const format = currentFormat(), wav = state.lastWav;
+  const { ext, label } = TF2Formats.FORMATS[format];
+  const name = outputName(state.sourceName, state.lastCodecKey, ext);
+  if (format === 'wav') { saveBlob(wav, name); return; }
+  els.dl.disabled = true;
+  els.dl.dataset.busy = '1';
+  els.dl.textContent = `Encoding ${label}…`;
+  try {
+    const { blob } = await cachedExport(state.lastExports, wav, format);
+    // Skip the save if a new render or source replaced this one meanwhile.
+    if (state.lastWav === wav) saveBlob(blob, name);
+    logLine(`Host_WriteFile: ${name} (${(blob.size / 1048576).toFixed(1)} MB)`, 'sys');
+  } catch (e) {
+    logLine(`${label} export failed: ${e.message}`, 'err');
+    setStatus(`Could not make the ${label} file: ${e.message}`, 'error');
+  } finally {
+    delete els.dl.dataset.busy;
+    updateDownloadLabel();
+    els.dl.disabled = !state.lastWav || state.processing;
+  }
 });
 
 els.process.addEventListener('click', async () => {
   if (!state.decodedSource) { logLine('No decoded audio — select a file first.', 'err'); return; }
-  if (state.processing) return;
+  if (state.processing || state.batchRunning) return;
   state.processing = true;
+  document.dispatchEvent(new Event('tf2:busy'));
   els.process.disabled = true;
   els.dl.disabled = true;
   els.file.disabled = true;
@@ -1279,35 +1493,8 @@ els.process.addEventListener('click', async () => {
 
   try {
     const codecKey = els.codec.value;
-    const posKey   = els.position.value;
-    const dspRoomId = parseInt(els.env.value);
-
     const opts = {
-      codec: codecKey,
-      // If user chose 'manual', respect the dsp_room dropdown; otherwise use listener position.
-      listenerPos: (posKey === 'manual') ? null : posKey,
-      dspRoom: dspRoomId,
-      customEnv: (dspRoomId === 99) ? {
-        duration: Number(els.cDur.value),
-        decay:    Number(els.cDec.value),
-        mix:      Number(els.cMix.value) / 100
-      } : null,
-      captureChannel: els.captureChannel.value,
-      micGain:     Number(els.gain.value),
-      voiceScale:  Number(els.voiceScale.value),
-      hp:          Number(els.hp.value),
-      lp:          Number(els.lp.value),
-      bits:        Number(els.bits.value),
-      agc:         els.agc.value === '1',
-      maxGain:     Number(els.maxGain.value),
-      avgGain:     Number(els.avgGain.value),
-      gate:        els.vad.value === 'auto' ? null : els.vad.value === '1',
-      gateThresholdDb: Number(els.vadThreshold.value),
-      volume:      Number(els.volume.value),
-      lossPct:     Number(els.loss.value),
-      frameMs:     Number(els.frameMs.value),  // net_split — previously never passed
-      enableWarble: els.warble.value === '1',
-      jitterMs:    Number(els.jitter.value),
+      ...renderOptions(),
       onProgress:  (p) => {
         const percent = Math.min(100, Math.max(0, Math.round(p * 100)));
         els.process.textContent = `Processing… ${percent}%`;
@@ -1318,55 +1505,10 @@ els.process.addEventListener('click', async () => {
     logLine(`MIX: codec=${opts.codec} pos=${opts.listenerPos || 'manual:'+opts.dspRoom} gain=${opts.micGain} vs=${opts.voiceScale}`);
 
     const t0 = performance.now();
-    const { samples, sampleRate, blob, realOpus, codecInfo } = await runAudioProcess(state.decodedSource, opts);
+    const result = await runAudioProcess(state.decodedSource, opts);
     const took = Math.round(performance.now() - t0);
 
-    // Report the actual processing path: codec version, bitrate and the
-    // Opus modes the encoder really chose.
-    logLine(realOpus
-      ? `S_Voice: ${codecInfo.version}, ${codecInfo.bitrate / 1000} kbps ${codecInfo.vbr ? 'VBR' : 'CBR'}${codecInfo.dtx ? ' + DTX' : ''}, 20 ms frames, native PLC (${describeModes(codecInfo.modes)})`
-      : 'S_Voice: codec bypassed', 'sys');
-    if (realOpus && codecInfo.gate != null) {
-      const held = codecInfo.frames ? Math.round(100 * codecInfo.gatedFrames / codecInfo.frames) : 0;
-      logLine(`S_Voice: voice gate at ${codecInfo.gate} dBFS sent ${codecInfo.spurts} talk spurt${codecInfo.spurts === 1 ? '' : 's'} and held back ${codecInfo.gatedFrames} of ${codecInfo.frames} frames (${held}%)`, 'sys');
-    }
-    if (realOpus && codecInfo.dtxFrames) {
-      logLine(`S_Voice: ${codecInfo.dtxFrames} inactive frames sent as DTX comfort noise`, 'sys');
-    }
-    if (realOpus && (codecInfo.lostFrames || codecInfo.underrunFrames)) {
-      logLine(`S_Voice: ${codecInfo.lostFrames} frames lost and concealed, ${codecInfo.underrunFrames || 0} late frames played as silence`, 'sys');
-    }
-    logLine(`S_Voice: receiver auto-gain ${codecInfo.autoGain ? 'on' : 'off'} at ${codecInfo.voiceRate} Hz`, 'sys');
-
-    state.processedBuffer = samples;
-    state.processedRate   = sampleRate;
-    if (state.lastBlob) URL.revokeObjectURL(state.lastBlob);
-    state.lastBlob = URL.createObjectURL(blob);
-
-    // Default to wet after a new render; arm the muted dry twin so the
-    // A/B toggle is an instant unmute rather than a src swap.
-    state.abMode = 'wet';
-    els.abToggle.disabled = false;
-    els.abToggle.textContent = 'A/B: Wet';
-
-    els.audio.src = state.lastBlob;
-    els.audio.muted = false;
-    if (els.audioDry) {
-      els.audioDry.src = state.dryBlob;
-      els.audioDry.muted = true;
-      els.audioDry.volume = els.audio.volume;
-    }
-    const base = (state.sourceName || 'clip').replace(/\.[^/.]+$/, "").replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
-    state.downloadName = `${base}_tf2_${codecKey}.wav`;
-    els.dl.disabled = false;
-
-    state.renderId++;
-    state.lastCodecInfo = codecInfo;
-    refreshVisualizer();
-    const method = realOpus ? `Real Opus · ${codecInfo.bitrate / 1000} kbps` : 'Codec bypassed';
-    setStatus(`Ready · ${method} · ${(took / 1000).toFixed(1)}s render · ${sampleRate.toLocaleString()} Hz`, 'success');
-    logLine(`ChangeLevel: rendered ${samples.length} samples @ ${sampleRate}Hz in ${took}ms`, 'sys');
-    logLine(`Net_SendPacket: reliable stream ready.`);
+    presentRender(result, took, codecKey);
   } catch (e) {
     if (e.name === 'AbortError') {
       logLine('S_StopSound: render cancelled.', 'warn');
@@ -1380,12 +1522,14 @@ els.process.addEventListener('click', async () => {
     state.processing = false;
     state.cancelProcessing = null;
     els.process.disabled = false;
+    els.dl.disabled = !state.lastWav;
     els.file.disabled = false;
     if (els.mic) els.mic.disabled = false;
     if (els.controls) els.controls.inert = false;
     els.process.textContent = 'Process Audio';
     if (els.cancel) els.cancel.hidden = true;
     if (els.progress) els.progress.hidden = true;
+    document.dispatchEvent(new Event('tf2:busy'));
   }
 });
 
@@ -1420,23 +1564,202 @@ els.audio.addEventListener('volumechange', () => { if (els.audioDry) els.audioDr
 els.audio.addEventListener('ratechange', () => { if (els.audioDry) els.audioDry.playbackRate = els.audio.playbackRate; });
 
 /* ------------------------------------------------------------------ */
+/* Meter and loudness-matched A/B (meter.js)                          */
+/*                                                                    */
+/* The meter lists loudness and levels of the wet render and the dry  */
+/* source. Matching plays the louder of the two quieter by their      */
+/* difference in integrated loudness, so an A/B compares sound rather */
+/* than level.                                                        */
+/* ------------------------------------------------------------------ */
+
+els.meter = document.getElementById('meter');
+els.meterRows = document.getElementById('meter-rows');
+els.abMatch = document.getElementById('ab-match');
+state.abMatch = LS.get('tf2ve_ab_match', false) === true;
+state.abOffsetDb = 0;         // gain applied to the louder version, dB (<= 0)
+state.abLouder = null;        // 'WET' or 'DRY'
+
+const meterResults = new Map();   // buffer id -> Promise<stats>
+function measure(samples, rate) {
+  const id = bufferId(samples);
+  if (!meterResults.has(id)) {
+    let job;
+    if (canUseWorker()) {
+      const copy = samples.slice();
+      job = startWorker({ type: 'analyze', samples: copy.buffer, sampleRate: rate }, [copy.buffer]).promise.then(reply => reply.stats);
+    } else {
+      job = new Promise(resolve => setTimeout(() => resolve(TF2Meter.analyze(samples, rate)), 0));
+    }
+    job.catch(() => meterResults.delete(id));
+    meterResults.set(id, job);
+  }
+  return meterResults.get(id);
+}
+
+function meterSources() {
+  const out = [];
+  if (state.processedBuffer) out.push({ label: 'WET', samples: state.processedBuffer, rate: state.processedRate });
+  if (state.decodedSource) out.push({ label: 'DRY', samples: state.decodedSource.getChannelData(0), rate: state.decodedSource.sampleRate });
+  return out;
+}
+
+const METER_COLUMNS = [
+  ['integrated', 'LUFS', 1], ['lra', 'LU', 1], ['shortTermMax', 'LUFS', 1], ['momentaryMax', 'LUFS', 1],
+  ['truePeak', 'dBTP', 1], ['samplePeak', 'dBFS', 1], ['rms', 'dBFS', 1], ['plr', 'dB', 1], ['dc', '%', 3]
+];
+function meterCell(key, value) {
+  if (value === null || value === undefined) return '—';
+  if (key === 'dc') return `${(value * 100).toFixed(3)}`;
+  if (!Number.isFinite(value)) return '−∞';
+  return value.toFixed(1).replace('-', '−');
+}
+
+// Values worth a second look: peaks that clip on 16-bit export or lossy
+// encoding, and a DC offset (libopus 1.1.x SILK can add one to strong
+// content below ~60 Hz; see README).
+function meterWarning(key, value) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  if (key === 'truePeak' && value > 0) return { level: 'meter-bad', text: 'Inter-sample peaks above 0 dBTP clip after MP3 decoding or resampling' };
+  if (key === 'truePeak' && value > -1) return { level: 'meter-warn', text: 'Less than 1 dB below 0 dBTP: MP3 decoding may clip' };
+  if (key === 'samplePeak' && value >= -0.01) return { level: 'meter-bad', text: 'Samples at full scale clip in the 16-bit file' };
+  if (key === 'dc' && Math.abs(value) >= 0.005) return { level: 'meter-warn', text: 'DC offset over 0.5% of full scale' };
+  return null;
+}
+
+let meterGeneration = 0;
+async function updateMeter() {
+  const sources = meterSources();
+  const generation = ++meterGeneration;
+  if (els.meter) els.meter.hidden = !sources.length;
+  state.meterStats = null;
+  applyAbMatch();
+  if (!sources.length || !els.meterRows) return;
+  const row = (label, cells, cls = '', stats = null) => {
+    const tr = document.createElement('tr');
+    if (cls) tr.className = cls;
+    const th = document.createElement('th');
+    th.scope = 'row';
+    th.textContent = label;
+    tr.appendChild(th);
+    cells.forEach((text, i) => {
+      const td = document.createElement('td');
+      td.textContent = text;
+      const warning = stats && meterWarning(METER_COLUMNS[i][0], stats[METER_COLUMNS[i][0]]);
+      if (warning) { td.className = warning.level; td.title = warning.text; }
+      tr.appendChild(td);
+    });
+    return tr;
+  };
+  els.meterRows.replaceChildren(...sources.map(src => row(src.label, METER_COLUMNS.map(() => '…'))));
+  const results = await Promise.all(sources.map(src => measure(src.samples, src.rate).catch(() => null)));
+  if (generation !== meterGeneration) return;
+  const rows = sources.map((src, i) => row(src.label, METER_COLUMNS.map(([key]) => (results[i] ? meterCell(key, results[i][key]) : 'error')), '', results[i]));
+  if (results.length === 2 && results[0] && results[1]) {
+    // Wet minus dry, for the columns where a difference means something.
+    const diff = new Set(['integrated', 'truePeak', 'samplePeak', 'rms', 'plr', 'lra']);
+    rows.push(row('Δ', METER_COLUMNS.map(([key]) => {
+      const a = results[0][key], b = results[1][key];
+      if (!diff.has(key) || a === null || b === null || !Number.isFinite(a) || !Number.isFinite(b)) return '';
+      const d = a - b;
+      return `${d > 0 ? '+' : d < 0 ? '−' : '±'}${Math.abs(d).toFixed(1)}`;
+    }), 'meter-delta'));
+  }
+  els.meterRows.replaceChildren(...rows);
+  state.meterStats = { wet: results[0] && sources[0].label === 'WET' ? results[0] : null,
+    dry: results[sources.length - 1] && sources[sources.length - 1].label === 'DRY' ? results[sources.length - 1] : null };
+  applyAbMatch();
+}
+
+// A/B gain (dB) for 'WET' or 'DRY'; 0 unless matching is on.
+function abGainDb(label) {
+  return state.abMatch && state.abLouder === label ? state.abOffsetDb : 0;
+}
+
+function applyAbMatch() {
+  const stats = state.meterStats || {};
+  const wet = stats.wet && stats.wet.integrated, dry = stats.dry && stats.dry.integrated;
+  const known = state.processedBuffer && state.decodedSource && Number.isFinite(wet) && Number.isFinite(dry);
+  state.abLouder = known ? (wet > dry ? 'WET' : 'DRY') : null;
+  state.abOffsetDb = known ? -Math.abs(wet - dry) : 0;
+  const now = state.audioCtx ? state.audioCtx.currentTime : 0;
+  if (state.wetGain) state.wetGain.gain.setTargetAtTime(Math.pow(10, abGainDb('WET') / 20), now, 0.01);
+  if (state.dryGain) state.dryGain.gain.setTargetAtTime(Math.pow(10, abGainDb('DRY') / 20), now, 0.01);
+  if (els.abMatch) {
+    els.abMatch.disabled = !state.lastBlob || !state.dryBlob;
+    els.abMatch.setAttribute('aria-pressed', String(state.abMatch));
+    els.abMatch.classList.toggle('active', state.abMatch);
+    els.abMatch.textContent = state.abMatch && state.abLouder
+      ? `Matched: ${state.abLouder.toLowerCase()} ${state.abOffsetDb.toFixed(1).replace('-', '−')} dB`
+      : 'Match loudness';
+  }
+}
+
+if (els.abMatch) els.abMatch.addEventListener('click', () => {
+  state.abMatch = !state.abMatch;
+  LS.set('tf2ve_ab_match', state.abMatch);
+  applyAbMatch();
+  refreshVisualizer();
+});
+
+// Space plays and pauses the preview, B switches A/B, outside text fields and buttons.
+document.addEventListener('keydown', (event) => {
+  if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || event.repeat) return;
+  const target = event.target;
+  if (target && target.closest && target.closest('input, textarea, select, button, audio, summary, [contenteditable]')) return;
+  if (event.key === ' ' && els.audio.src) {
+    event.preventDefault();
+    if (els.audio.paused) els.audio.play().catch(() => {}); else els.audio.pause();
+  } else if ((event.key === 'b' || event.key === 'B') && !els.abToggle.disabled) {
+    event.preventDefault();
+    els.abToggle.click();
+  }
+});
+
+/* ------------------------------------------------------------------ */
 /* Visualizer                                                         */
 /*                                                                    */
-/* WAVE: peak + RMS envelope of the audible version with a playhead.  */
+/* WAVE: peak + RMS envelope of the audible version; the samples      */
+/*       themselves once zoomed in far enough.                        */
 /* BARS: log-frequency spectrum in dBFS. Live from the AnalyserNode   */
 /*       while playing; computed from the rendered buffer at the      */
 /*       playhead when paused, with the analyser's own window/scale.  */
-/* SPEC: whole-file log-frequency spectrogram with a playhead.        */
+/* SPEC: spectrogram with a linear frequency axis (codec band edges   */
+/*       read as lines) or a log axis from 20 Hz. On the log axis the */
+/*       band below 400 Hz comes from the signal decimated 16x and a  */
+/*       1024-point FFT: about 3 Hz resolution, with a longer window. */
+/*                                                                    */
+/* WAVE and SPEC zoom in time: Ctrl/⌘ + wheel or a pinch zooms, a     */
+/* drag or Shift + wheel pans, a click seeks, and the − + FIT buttons */
+/* and the + − 0 ← → keys do the same. Only the visible range is      */
+/* rendered, at the canvas's device-pixel size.                       */
 /* ------------------------------------------------------------------ */
 
 const ctx = els.canvas.getContext('2d', { alpha: false });
 const VIZ = {
-  minHz: 40, maxHz: 20000,   // log-frequency axis
+  minHz: 20, maxHz: 20000,   // BARS log-frequency axis
   minDb: -100, maxDb: -10,   // AnalyserNode dB scale (full-scale sine ~ -13.6)
-  fftSize: 4096,
-  bandEdgeHz: 12000          // Opus super-wideband edge used by the Steam profile
+  fftSize: 8192,             // BARS: 5.4-5.9 Hz bins, 170-186 ms window
+  ranges: [48, 72, 96, 120], // selectable displayed dynamic range (SPEC, WAVE in dB)
+  bandEdgeHz: 12000,         // Opus super-wideband edge used by the Steam profile
+  specFft: 2048,             // spectrogram FFT at the file's rate
+  logMinHz: 20,              // floor of the log spectrogram
+  lowSplitHz: 400,           // log spectrogram: rows below this use the decimated signal
+  lowFactor: 16,
+  lowFft: 1024,
+  maxColumns: 1600,          // spectrogram columns per image (stretched to the canvas)
+  minSpanSamples: 48,        // deepest zoom: this many samples across the view
+  tallHeight: 400            // px, the TALL view
 };
-const vizCache = { key: null, image: null };
+els.vizContainer = els.canvas.parentElement;
+els.vizLog = document.getElementById('viz-log');
+els.vizZoomIn = document.getElementById('viz-zoom-in');
+els.vizZoomOut = document.getElementById('viz-zoom-out');
+els.vizFit = document.getElementById('viz-fit');
+els.vizTall = document.getElementById('viz-tall');
+els.vizRange = document.getElementById('viz-range');
+state.vizScale = LS.get('tf2ve_viz_scale', 'lin') === 'log' ? 'log' : 'lin';
+state.waveScale = LS.get('tf2ve_wave_scale', 'lin') === 'db' ? 'db' : 'lin';
+state.vizRange = VIZ.ranges.includes(Number(LS.get('tf2ve_viz_range', 72))) ? Number(LS.get('tf2ve_viz_range', 72)) : 72;
 let vizPeaks = null, vizPeakTime = 0;
 
 function resizeCanvas() {
@@ -1479,14 +1802,6 @@ function logBands(count, sampleRate, fftSize) {
   return bands;
 }
 
-// Linear-frequency rows for the spectrogram: codec band edges read as
-// horizontal lines instead of being squeezed into the top of a log axis.
-function linearBands(count, sampleRate, fftSize) {
-  const top = Math.min(VIZ.maxHz, sampleRate / 2), binHz = sampleRate / fftSize, bands = [];
-  for (let i = 0; i < count; i++) bands.push([top * i / count / binHz, top * (i + 1) / count / binHz]);
-  return bands;
-}
-
 // Max over each band; narrow low bands interpolate between bins.
 function bandLevels(spectrumDb, bands, out) {
   const last = spectrumDb.length - 1;
@@ -1504,29 +1819,6 @@ function bandLevels(spectrumDb, bands, out) {
   return out;
 }
 
-// In-place radix-2 FFT for the paused/static views.
-function fftReal(re, im) {
-  const n = re.length;
-  for (let i = 1, j = 0; i < n; i++) {
-    let bit = n >> 1;
-    for (; j & bit; bit >>= 1) j ^= bit;
-    j ^= bit;
-    if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
-  }
-  for (let len = 2; len <= n; len <<= 1) {
-    const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang), half = len >> 1;
-    for (let i = 0; i < n; i += len) {
-      let cr = 1, ci = 0;
-      for (let k = 0; k < half; k++) {
-        const a = i + k, b = a + half;
-        const vr = re[b] * cr - im[b] * ci, vi = re[b] * ci + im[b] * cr;
-        re[b] = re[a] - vr; im[b] = im[a] - vi; re[a] += vr; im[a] += vi;
-        const nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr;
-      }
-    }
-  }
-}
-
 const blackman = (() => {
   const cache = new Map();
   return (n) => {
@@ -1536,16 +1828,48 @@ const blackman = (() => {
   };
 })();
 
+// Radix-2 FFT plans: bit-reversal and twiddle tables and work buffers,
+// made once per size.
+const fftPlans = new Map();
+function fftPlan(n) {
+  let plan = fftPlans.get(n);
+  if (!plan) {
+    const rev = new Uint32Array(n), cos = new Float64Array(n / 2), sin = new Float64Array(n / 2);
+    for (let i = 1; i < n; i++) rev[i] = (rev[i >> 1] >> 1) | (i & 1 ? n >> 1 : 0);
+    for (let i = 0; i < n / 2; i++) { cos[i] = Math.cos(2 * Math.PI * i / n); sin[i] = -Math.sin(2 * Math.PI * i / n); }
+    plan = { n, rev, cos, sin, re: new Float64Array(n), im: new Float64Array(n), win: blackman(n) };
+    fftPlans.set(n, plan);
+  }
+  return plan;
+}
+
+// Blackman-windowed FFT of `samples` centred on `center` (zero outside);
+// leaves the spectrum in plan.re / plan.im.
+function windowedFft(plan, samples, center) {
+  const { n, rev, cos, sin, re, im, win } = plan;
+  const start = Math.round(center - n / 2);
+  for (let i = 0; i < n; i++) {
+    const j = start + i;
+    re[rev[i]] = (j >= 0 && j < samples.length ? samples[j] : 0) * win[i];
+  }
+  im.fill(0);
+  for (let size = 2; size <= n; size <<= 1) {
+    const half = size >> 1, stride = n / size;
+    for (let i = 0; i < n; i += size) {
+      for (let k = 0, t = 0; k < half; k++, t += stride) {
+        const a = i + k, b = a + half, wr = cos[t], wi = sin[t];
+        const vr = re[b] * wr - im[b] * wi, vi = re[b] * wi + im[b] * wr;
+        re[b] = re[a] - vr; im[b] = im[a] - vi; re[a] += vr; im[a] += vi;
+      }
+    }
+  }
+}
+
 // Same windowing and scaling as AnalyserNode.getFloatFrequencyData.
 function spectrumAt(samples, center, fftSize, out) {
-  const re = new Float64Array(fftSize), im = new Float64Array(fftSize), win = blackman(fftSize);
-  const start = Math.round(center - fftSize / 2);
-  for (let i = 0; i < fftSize; i++) {
-    const j = start + i;
-    re[i] = (j >= 0 && j < samples.length ? samples[j] : 0) * win[i];
-  }
-  fftReal(re, im);
-  for (let k = 0; k < fftSize / 2; k++) out[k] = 20 * Math.log10(Math.hypot(re[k], im[k]) / fftSize + 1e-12);
+  const plan = fftPlan(fftSize);
+  windowedFft(plan, samples, center);
+  for (let k = 0; k < fftSize / 2; k++) out[k] = 20 * Math.log10(Math.hypot(plan.re[k], plan.im[k]) / fftSize + 1e-12);
   return out;
 }
 
@@ -1559,10 +1883,66 @@ function audibleBuffer() {
   return null;
 }
 
+// A stable id per sample array, so cached images never outlive their audio.
+const bufferIds = new WeakMap();
+let nextBufferId = 1;
+function bufferId(samples) {
+  if (!bufferIds.has(samples)) bufferIds.set(samples, nextBufferId++);
+  return bufferIds.get(samples);
+}
+
 function playheadFraction() {
   const d = els.audio.duration;
   return Number.isFinite(d) && d > 0 ? Math.min(1, Math.max(0, els.audio.currentTime / d)) : 0;
 }
+
+/* ---------------- time view (zoom and pan) ---------------- */
+
+// Visible time range in seconds; t1 = Infinity runs to the end of the file.
+const vizView = { t0: 0, t1: Infinity };
+function resetVizView() {
+  vizView.t0 = 0;
+  vizView.t1 = Infinity;
+}
+
+function visibleRange(buffer) {
+  const duration = Math.max(buffer.samples.length / buffer.rate, 1e-6);
+  const minSpan = Math.min(duration, VIZ.minSpanSamples / buffer.rate);
+  const end = Number.isFinite(vizView.t1) ? vizView.t1 : duration;
+  const span = Math.min(duration, Math.max(minSpan, end - vizView.t0));
+  const t0 = Math.min(Math.max(0, vizView.t0), duration - span);
+  return { t0, t1: t0 + span, duration, minSpan, zoomed: span < duration * (1 - 1e-9) };
+}
+
+function setVizView(start, span, duration) {
+  const t0 = Math.min(Math.max(0, start), Math.max(0, duration - span));
+  vizView.t0 = t0;
+  vizView.t1 = t0 + span >= duration * (1 - 1e-9) ? Infinity : t0 + span;
+  refreshVisualizer();
+}
+
+// Zoom by `factor` (< 1 zooms in) keeping the time at `anchor` (0..1 across the view) in place.
+function zoomViz(factor, anchor = null) {
+  const buffer = audibleBuffer();
+  if (!buffer || state.vizMode === 'bars') return;
+  const r = visibleRange(buffer), span = r.t1 - r.t0;
+  if (anchor === null) {
+    // Buttons and keys zoom around the playhead when it is in view.
+    const t = els.audio.currentTime;
+    anchor = els.audio.src && t >= r.t0 && t <= r.t1 ? (t - r.t0) / span : 0.5;
+  }
+  const next = Math.min(r.duration, Math.max(r.minSpan, span * factor));
+  setVizView(r.t0 + anchor * span - anchor * next, next, r.duration);
+}
+
+function panViz(fraction) {
+  const buffer = audibleBuffer();
+  if (!buffer || state.vizMode === 'bars') return;
+  const r = visibleRange(buffer);
+  setVizView(r.t0 + fraction * (r.t1 - r.t0), r.t1 - r.t0, r.duration);
+}
+
+/* ---------------- drawing helpers ---------------- */
 
 function drawBackdrop(w, h) {
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, w, h);
@@ -1572,6 +1952,22 @@ function drawLabel(text, x, y, color = 'rgba(200, 210, 220, 0.75)', align = 'lef
   ctx.font = '9px Verdana, sans-serif'; ctx.textAlign = align; ctx.textBaseline = 'top';
   ctx.fillStyle = color; ctx.fillText(text, x, y);
 }
+
+// A label on a dark plate, kept inside the canvas.
+function drawTag(text, x, y, w, color = 'rgba(230, 238, 245, 0.95)') {
+  ctx.font = '10px Verdana, sans-serif';
+  const width = ctx.measureText(text).width + 8;
+  const left = Math.max(0, Math.min(w - width, x));
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.72)'; ctx.fillRect(left, y, width, 14);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.fillStyle = color;
+  ctx.fillText(text, left + 4, y + 2);
+}
+
+function formatTime(t, decimals = 0) {
+  const minutes = Math.floor(t / 60), seconds = t - minutes * 60;
+  return `${minutes}:${seconds.toFixed(decimals).padStart(decimals ? decimals + 3 : 2, '0')}`;
+}
+const formatHz = (hz) => (hz >= 1000 ? `${(hz / 1000).toFixed(hz >= 10000 ? 1 : 2)} kHz` : `${hz.toFixed(hz < 100 ? 1 : 0)} Hz`);
 
 function drawFrequencyGrid(w, h, top, labels) {
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)'; ctx.lineWidth = 1;
@@ -1617,136 +2013,513 @@ function drawBars(levels, w, h, top, now) {
   drawFrequencyGrid(w, h, top, true);
 }
 
-function drawPlayhead(w, h) {
-  if (!state.processedBuffer && !state.decodedSource) return;
-  const x = Math.round(playheadFraction() * w) + 0.5;
+function drawPlayhead(w, h, range) {
+  if (!els.audio.src) return;
+  const t = els.audio.currentTime;
+  if (t < range.t0 || t > range.t1) return;
+  const x = Math.round((t - range.t0) / (range.t1 - range.t0) * w) + 0.5;
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)'; ctx.lineWidth = 1;
   ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
 }
 
-function renderWaveImage(buffer, W, H) {
+// Time ticks along the bottom edge, spaced at least ~70 px apart.
+function drawTimeRuler(w, h, range) {
+  const span = range.t1 - range.t0;
+  const steps = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+  const step = steps.find(s => s / span * w >= 70) || 600;
+  const decimals = step < 0.01 ? 3 : step < 0.1 ? 2 : step < 1 ? 1 : 0;
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)'; ctx.lineWidth = 1;
+  for (let k = Math.ceil(range.t0 / step - 1e-9); k * step <= range.t1 + 1e-9; k++) {
+    const x = Math.round((k * step - range.t0) / span * w) + 0.5;
+    ctx.beginPath(); ctx.moveTo(x, h - 4); ctx.lineTo(x, h); ctx.stroke();
+    // Clear of the frequency labels on the left and the edge on the right.
+    if (x + 44 < w && x > (state.vizMode === 'spec' ? 34 : 0)) {
+      const text = formatTime(k * step, decimals);
+      ctx.font = '9px Verdana, sans-serif';
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.6)'; ctx.fillRect(x + 1, h - 13, ctx.measureText(text).width + 5, 11);
+      drawLabel(text, x + 3, h - 12, 'rgba(210, 220, 230, 0.85)');
+    }
+  }
+}
+
+function specTop(rate) { return Math.min(VIZ.maxHz, rate / 2); }
+// Frequency at height fraction u (0 = bottom, 1 = top) of the spectrogram.
+function specHz(u, rate, scale) {
+  const top = specTop(rate);
+  return scale === 'log' ? VIZ.logMinHz * Math.pow(top / VIZ.logMinHz, u) : top * u;
+}
+
+function drawFrequencyAxisLabels(w, h, rate, scale) {
+  const top = specTop(rate);
+  const marks = scale === 'log' ? [20, 50, 100, 200, 500, 1000, 2000, 5000, VIZ.bandEdgeHz] : [4000, 8000, VIZ.bandEdgeHz, 16000];
+  for (const hz of marks) {
+    if (hz >= top || hz < (scale === 'log' ? VIZ.logMinHz : 1)) continue;
+    const u = scale === 'log' ? Math.log(hz / VIZ.logMinHz) / Math.log(top / VIZ.logMinHz) : hz / top;
+    const y = h - h * u;
+    const edge = hz === VIZ.bandEdgeHz;
+    const text = hz >= 1000 ? `${hz / 1000}k` : String(hz);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)'; ctx.fillRect(2, Math.max(0, y - 10), 24, 10);
+    drawLabel(text, 4, Math.max(0, y - 10), edge ? 'rgba(255, 184, 34, 0.9)' : 'rgba(220, 230, 240, 0.85)');
+    ctx.strokeStyle = edge ? 'rgba(255, 184, 34, 0.25)' : 'rgba(255, 255, 255, 0.08)';
+    ctx.beginPath(); ctx.moveTo(26, Math.round(y) + 0.5); ctx.lineTo(34, Math.round(y) + 0.5); ctx.stroke();
+  }
+}
+
+/* ---------------- static images of the visible range ---------------- */
+
+// The last WAVE or SPEC image: { base, key, canvas, t0, t1, ... }. `base`
+// names what it shows apart from the time range; while a new range is
+// computed, the last image with the same base is drawn stretched to it.
+let vizImage = null;
+let vizPending = null, specJob = 0, specTimer = 0;
+const yieldToUi = () => new Promise(resolve => setTimeout(resolve, 0));
+
+function imageBase(buffer, H) {
+  const scale = state.vizMode === 'spec' ? state.vizScale : state.waveScale === 'db' ? `db${state.vizRange}` : 'lin';
+  return `${state.vizMode}:${scale}:${bufferId(buffer.samples)}:${buffer.rate}:${H}`;
+}
+
+// Height fraction (0..1 from the centre line) of a sample value on the
+// waveform: linear, or dBFS down to the selected range.
+function waveMapper() {
+  if (state.waveScale !== 'db') return (v) => v;
+  const floor = -state.vizRange;
+  return (v) => {
+    const a = Math.abs(v);
+    if (a <= 0) return 0;
+    const u = Math.max(0, 1 - (20 * Math.log10(a)) / floor);
+    return v < 0 ? -u : u;
+  };
+}
+// Amplitude grid levels in dBFS for the current waveform scale.
+function waveGridDb() {
+  return state.waveScale === 'db' ? [-6, -12, -24, -48, -72, -96].filter(d => d > -state.vizRange) : [-6];
+}
+
+function renderWaveImage(buffer, W, H, range) {
   const image = document.createElement('canvas');
   image.width = W; image.height = H;
   const g = image.getContext('2d', { alpha: false });
   g.fillStyle = '#000'; g.fillRect(0, 0, W, H);
+  const mid = H / 2, map = waveMapper();
   g.strokeStyle = 'rgba(255, 255, 255, 0.06)';
-  g.beginPath(); g.moveTo(0, H / 2); g.lineTo(W, H / 2); g.stroke();
-  const data = buffer.samples, step = data.length / W, mid = H / 2;
-  for (let x = 0; x < W; x++) {
-    const from = Math.floor(x * step), to = Math.max(from + 1, Math.floor((x + 1) * step));
-    let min = 0, max = 0, sq = 0;
-    for (let i = from; i < to && i < data.length; i++) {
-      const v = data[i];
-      if (v < min) min = v; if (v > max) max = v;
-      sq += v * v;
-    }
-    const rmsValue = Math.sqrt(sq / Math.max(1, to - from));
-    g.fillStyle = '#2a5f86';
-    g.fillRect(x, mid - max * mid, 1, Math.max(1, (max - min) * mid));
-    g.fillStyle = '#66c0f4';
-    g.fillRect(x, mid - rmsValue * mid, 1, Math.max(1, 2 * rmsValue * mid));
+  g.beginPath();
+  g.moveTo(0, Math.round(mid) + 0.5); g.lineTo(W, Math.round(mid) + 0.5);
+  for (const dbLevel of waveGridDb()) {
+    const u = map(Math.pow(10, dbLevel / 20));
+    for (const y of [mid - u * mid, mid + u * mid]) { g.moveTo(0, Math.round(y) + 0.5); g.lineTo(W, Math.round(y) + 0.5); }
   }
-  return image;
+  g.stroke();
+  const data = buffer.samples, first = range.t0 * buffer.rate;
+  const clip = 0.999;   // full scale: samples here clip when saved as 16-bit
+  const perPixel = (range.t1 - range.t0) * buffer.rate / W;
+  if (perPixel >= 2) {
+    for (let x = 0; x < W; x++) {
+      const from = Math.max(0, Math.floor(first + x * perPixel));
+      const to = Math.min(data.length, Math.max(from + 1, Math.floor(first + (x + 1) * perPixel)));
+      let min = 0, max = 0, sq = 0;
+      for (let i = from; i < to; i++) {
+        const v = data[i];
+        if (v < min) min = v; if (v > max) max = v;
+        sq += v * v;
+      }
+      const rmsValue = Math.sqrt(sq / Math.max(1, to - from));
+      const top = map(max), bottom = map(min), r = map(rmsValue);
+      g.fillStyle = '#2a5f86';
+      g.fillRect(x, mid - top * mid, 1, Math.max(1, (top - bottom) * mid));
+      g.fillStyle = '#66c0f4';
+      g.fillRect(x, mid - r * mid, 1, Math.max(1, 2 * r * mid));
+      if (max >= clip || min <= -clip) {
+        g.fillStyle = '#ff4040';
+        g.fillRect(x, 0, 1, 3); g.fillRect(x, H - 3, 1, 3);
+      }
+    }
+  } else {
+    // Zoomed in to single samples: the sample values joined by lines, and
+    // dots once they are far enough apart.
+    const i0 = Math.max(0, Math.floor(first) - 1), i1 = Math.min(data.length - 1, Math.ceil(first + W * perPixel) + 1);
+    g.strokeStyle = '#66c0f4'; g.lineWidth = Math.max(1, Math.round(H / 180));
+    g.beginPath();
+    for (let i = i0; i <= i1; i++) {
+      const x = (i - first) / perPixel, y = mid - map(data[i]) * mid;
+      if (i === i0) g.moveTo(x, y); else g.lineTo(x, y);
+    }
+    g.stroke();
+    if (perPixel < 0.15) {
+      const r = Math.max(2, Math.round(H / 120));
+      for (let i = i0; i <= i1; i++) {
+        g.fillStyle = Math.abs(data[i]) >= clip ? '#ff4040' : '#d7efff';
+        g.fillRect((i - first) / perPixel - r / 2, mid - map(data[i]) * mid - r / 2, r, r);
+      }
+    }
+  }
+  return { canvas: image, t0: range.t0, t1: range.t1 };
 }
 
-function renderSpectrogramImage(buffer, W, H) {
-  const image = document.createElement('canvas');
-  image.width = W; image.height = H;
-  const g = image.getContext('2d');
-  const pixels = g.createImageData(W, H);
-  const fftSize = 2048, spectrum = new Float32Array(fftSize / 2), level = new Float32Array(H);
-  const rows = linearBands(H, buffer.rate, fftSize), grid = new Float32Array(W * H);
-  const data = buffer.samples, step = data.length / W;
-  for (let x = 0; x < W; x++) {
+// The signal decimated by VIZ.lowFactor for the low band of the log
+// spectrogram, made in slices so the page stays responsive. Sample i of the
+// result is sample lowFactor * i of the input.
+const lowSignals = new WeakMap();
+function decimatedSignal(samples) {
+  if (!lowSignals.has(samples)) lowSignals.set(samples, (async () => {
+    const factor = VIZ.lowFactor, out = new Float32Array(Math.max(1, Math.round(samples.length / factor)));
+    // resampleSinc reads 16 * factor inputs either side of each output.
+    const margin = 32 * factor, block = factor * 16384;
+    for (let s = 0; s < samples.length; s += block) {
+      const from = Math.max(0, s - margin), to = Math.min(samples.length, s + block + margin);
+      const part = TF2Audio.resampleSinc(samples.subarray(from, to), factor, 1);
+      const offset = (s - from) / factor, count = Math.min(block / factor, out.length - s / factor);
+      out.set(part.subarray(offset, offset + count), s / factor);
+      await yieldToUi();
+    }
+    return out;
+  })());
+  return lowSignals.get(samples);
+}
+
+// Spectrogram of the visible range, computed a few columns at a time.
+// Linear: one 2048-point FFT per column (up to three, max-held, when a
+// column spans more). Log: the same above 400 Hz; below, the decimated
+// signal. On the log axis levels are per Hz, so noise stays continuous
+// across the two resolutions.
+async function renderSpectrogram(job, buffer, W, H, range, base, key) {
+  const log = state.vizScale === 'log';
+  const { samples, rate } = buffer;
+  const cols = Math.min(W, VIZ.maxColumns);
+  const tiers = [];
+  if (log) {
+    const low = await decimatedSignal(samples);
+    if (job !== specJob) return;
+    tiers.push({ data: low, rate: rate / VIZ.lowFactor, fft: VIZ.lowFft, below: VIZ.lowSplitHz });
+  }
+  tiers.push({ data: samples, rate, fft: VIZ.specFft, below: Infinity });
+  for (const tier of tiers) {
+    Object.assign(tier, { rows: [], bands: [], plan: fftPlan(tier.fft), spectrum: new Float32Array(tier.fft / 2),
+      norm: log ? -10 * Math.log10(tier.rate / tier.fft) : 0 });
+  }
+  for (let r = 0; r < H; r++) {
+    const lo = specHz(r / H, rate, state.vizScale), hi = specHz((r + 1) / H, rate, state.vizScale);
+    const tier = tiers.find(t => hi <= t.below);
+    const binHz = tier.rate / tier.fft;
+    tier.rows.push(r);
+    tier.bands.push([lo / binHz, hi / binHz]);
+  }
+  for (const tier of tiers) tier.level = new Float32Array(tier.rows.length);
+  const grid = new Float32Array(cols * H);
+  const step = (range.t1 - range.t0) * rate / cols;
+  let yieldAt = performance.now() + 12;
+  for (let x = 0; x < cols; x++) {
     const column = grid.subarray(x * H, (x + 1) * H);
-    column.fill(-200);
-    // Up to three FFTs per column: max-hold keeps short events visible.
-    const hops = Math.max(1, Math.min(3, Math.floor(step / fftSize)));
-    for (let hop = 0; hop < hops; hop++) {
-      spectrumAt(data, x * step + (hop + 0.5) * step / hops, fftSize, spectrum);
-      bandLevels(spectrum, rows, level);
-      for (let r = 0; r < H; r++) if (level[r] > column[r]) column[r] = level[r];
+    column.fill(-400);
+    const start = range.t0 * rate + x * step;
+    for (const tier of tiers) {
+      const scale = tier.rate / rate;
+      const hops = Math.max(1, Math.min(3, Math.floor(step * scale / tier.fft)));
+      for (let hop = 0; hop < hops; hop++) {
+        windowedFft(tier.plan, tier.data, (start + (hop + 0.5) * step / hops) * scale);
+        const { re, im, n } = tier.plan;
+        for (let k = 0; k < n / 2; k++) tier.spectrum[k] = 10 * Math.log10((re[k] * re[k] + im[k] * im[k]) / (n * n) + 1e-24) + tier.norm;
+        bandLevels(tier.spectrum, tier.bands, tier.level);
+        for (let i = 0; i < tier.rows.length; i++) if (tier.level[i] > column[tier.rows[i]]) column[tier.rows[i]] = tier.level[i];
+      }
+    }
+    if (performance.now() > yieldAt) {
+      await yieldToUi();
+      if (job !== specJob) return;
+      yieldAt = performance.now() + 12;
     }
   }
   // Scale each image to its own loud end so band edges stay visible on
-  // loud, clipped renders: 72 dB below the 99th-percentile level.
+  // loud, clipped renders: the colours span the selected range below the
+  // 99th-percentile level.
   const sorted = grid.filter((_, i) => i % 7 === 0).sort();
-  const topDb = sorted[Math.floor(sorted.length * 0.99)] || VIZ.maxDb, range = 72;
-  for (let x = 0; x < W; x++) {
+  const topDb = sorted[Math.floor(sorted.length * 0.99)] ?? VIZ.maxDb;
+  vizImage = { base, key, canvas: document.createElement('canvas'), t0: range.t0, t1: range.t1, grid, cols, rows: H, log, topDb };
+  paintSpectrogram(vizImage);
+  vizPending = null;
+  refreshVisualizer();
+}
+
+// Colour a computed spectrogram grid for the selected range (cheap; redone
+// when only the range changes).
+function paintSpectrogram(image) {
+  const { grid, cols, rows: H, topDb } = image, span = state.vizRange;
+  image.canvas.width = cols; image.canvas.height = H;
+  const g = image.canvas.getContext('2d');
+  const pixels = g.createImageData(cols, H);
+  for (let x = 0; x < cols; x++) {
     for (let r = 0; r < H; r++) {
-      const u = Math.min(1, Math.max(0, (grid[x * H + r] - topDb + range) / range));
-      const c = Math.round(u * 255) * 3, p = ((H - 1 - r) * W + x) * 4;
+      const u = Math.min(1, Math.max(0, (grid[x * H + r] - topDb + span) / span));
+      const c = Math.round(u * 255) * 3, p = ((H - 1 - r) * cols + x) * 4;
       pixels.data[p] = PALETTE[c]; pixels.data[p + 1] = PALETTE[c + 1]; pixels.data[p + 2] = PALETTE[c + 2]; pixels.data[p + 3] = 255;
     }
   }
   g.putImageData(pixels, 0, 0);
-  return image;
+  image.range = span;
 }
 
-// Whole-file images are cached per buffer, mode and canvas size.
-function staticImage(mode, buffer, W, H) {
-  const key = `${mode}:${buffer.label}:${buffer.samples.length}:${buffer.rate}:${W}x${H}:${state.renderId}`;
-  if (vizCache.key !== key) {
-    vizCache.image = mode === 'spec' ? renderSpectrogramImage(buffer, W, H) : renderWaveImage(buffer, W, H);
-    vizCache.key = key;
+// Colour scale at the right edge of the spectrogram.
+function drawColorbar(w, h) {
+  const img = vizImage;
+  if (!img || !img.grid) return;
+  const x = w - 12, top = 40, bottom = h - 20, height = bottom - top;
+  if (height < 40) return;
+  for (let y = 0; y < height; y++) {
+    const c = Math.round((1 - y / height) * 255) * 3;
+    ctx.fillStyle = `rgb(${PALETTE[c]}, ${PALETTE[c + 1]}, ${PALETTE[c + 2]})`;
+    ctx.fillRect(x, top + y, 7, 1);
   }
-  return vizCache.image;
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)'; ctx.strokeRect(x - 0.5, top - 0.5, 8, height + 1);
+  const unit = img.log ? ' dB/Hz' : ' dB';
+  for (const [value, y] of [[img.topDb, top], [img.topDb - img.range, bottom - 10]]) {
+    const text = `${value.toFixed(0)}${y === top ? unit : ''}`;
+    ctx.font = '9px Verdana, sans-serif';
+    const tw = ctx.measureText(text).width;
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)'; ctx.fillRect(x - tw - 7, y, tw + 5, 11);
+    drawLabel(text, x - 4, y + 1, 'rgba(220, 230, 240, 0.85)', 'right');
+  }
 }
+
+function requestSpectrogram(buffer, W, H, range, base, key) {
+  if (vizPending === key) return;
+  vizPending = key;
+  clearTimeout(specTimer);
+  const job = ++specJob;
+  // Right away when nothing comparable is on screen; otherwise once a zoom or
+  // pan gesture settles, showing the stretched last image meanwhile.
+  const delay = vizImage && vizImage.base === base ? 90 : 0;
+  specTimer = setTimeout(() => {
+    renderSpectrogram(job, buffer, W, H, range, base, key).catch((error) => {
+      if (job === specJob) { vizPending = null; logLine(`spectrogram failed: ${error.message}`, 'err'); }
+    });
+  }, delay);
+}
+
+// WAVE or SPEC for the visible range. Returns the range drawn.
+function drawTimeView(buffer, w, h, dpr) {
+  const W = Math.max(1, Math.round(w * dpr)), H = Math.max(1, Math.round(h * dpr));
+  const range = visibleRange(buffer);
+  const base = imageBase(buffer, H);
+  const key = `${base}:${W}:${range.t0}:${range.t1}`;
+  if (vizImage && vizImage.key === key && vizImage.grid && vizImage.range !== state.vizRange) paintSpectrogram(vizImage);
+  if (!vizImage || vizImage.key !== key) {
+    if (state.vizMode === 'wave') {
+      vizImage = { base, key, ...renderWaveImage(buffer, W, H, range) };
+    } else {
+      requestSpectrogram(buffer, W, H, range, base, key);
+    }
+  }
+  drawBackdrop(w, h);
+  const ready = vizImage && vizImage.key === key;
+  if (vizImage && vizImage.base === base) {
+    const span = vizImage.t1 - vizImage.t0, iw = vizImage.canvas.width;
+    const sx = (range.t0 - vizImage.t0) / span * iw, sw = (range.t1 - range.t0) / span * iw;
+    // Draw the part of the image that overlaps the view.
+    const from = Math.max(0, sx), to = Math.min(iw, sx + sw);
+    if (to > from) {
+      ctx.drawImage(vizImage.canvas, from, 0, to - from, vizImage.canvas.height,
+        (from - sx) / sw * w, 0, (to - from) / sw * w, h);
+    }
+  }
+  if (!ready) drawLabel('Analyzing…', w - 8, h - 24, 'rgba(255, 184, 34, 0.9)', 'right');
+  els.canvas.dataset.view = ready ? `${state.vizMode}:${state.vizMode === 'spec' ? state.vizScale : ''}:${range.t0.toFixed(4)}-${range.t1.toFixed(4)}` : '';
+  return range;
+}
+
+/* ---------------- hover readout ---------------- */
+
+let vizHover = null;   // pointer position over the canvas, CSS pixels
+function drawHover(w, h, buffer, range) {
+  if (!vizHover) return;
+  const { x, y } = vizHover;
+  const span = range.t1 - range.t0, t = range.t0 + x / w * span;
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(Math.round(x) + 0.5, 0); ctx.lineTo(Math.round(x) + 0.5, h);
+  let text;
+  if (state.vizMode === 'spec') {
+    ctx.moveTo(0, Math.round(y) + 0.5); ctx.lineTo(w, Math.round(y) + 0.5);
+    const hz = specHz(1 - y / h, buffer.rate, state.vizScale);
+    text = `${formatTime(t, 3)} · ${formatHz(hz)}`;
+    const img = vizImage;
+    if (img && img.grid && img.base === imageBase(buffer, img.rows) && t >= img.t0 && t <= img.t1) {
+      const col = Math.min(img.cols - 1, Math.floor((t - img.t0) / (img.t1 - img.t0) * img.cols));
+      const row = Math.min(img.rows - 1, Math.max(0, Math.floor((1 - y / h) * img.rows)));
+      const db = img.grid[col * img.rows + row];
+      if (db > -300) text += ` · ${db.toFixed(0)} dB${img.log ? '/Hz' : ''}`;
+    }
+  } else {
+    const perPixel = Math.max(1, span * buffer.rate / w);
+    const from = Math.max(0, Math.floor(t * buffer.rate)), to = Math.min(buffer.samples.length, from + Math.ceil(perPixel));
+    let peak = 0;
+    for (let i = from; i < to; i++) peak = Math.max(peak, Math.abs(buffer.samples[i]));
+    text = `${formatTime(t, 3)} · ${peak > 0 ? (20 * Math.log10(peak)).toFixed(1) : '-inf'} dBFS`;
+  }
+  ctx.stroke();
+  drawTag(text, x + 10, Math.max(16, Math.min(h - 32, y - 20)), w);
+}
+
+/* ---------------- BARS ---------------- */
+
+// The version not being heard, for the BARS overlay.
+function otherBuffer() {
+  if (!state.processedBuffer || !state.decodedSource) return null;
+  return state.abMode === 'dry'
+    ? { samples: state.processedBuffer, rate: state.processedRate, label: 'WET' }
+    : { samples: state.decodedSource.getChannelData(0), rate: state.decodedSource.sampleRate, label: 'DRY' };
+}
+
+// Spectrum of `buffer` at the playhead, as band levels, shifted by its A/B
+// matching gain so it compares with what is heard.
+function bufferBandLevels(buffer, bands, out) {
+  const spectrum = state.vizSpectrum2 || (state.vizSpectrum2 = new Float32Array(VIZ.fftSize / 2));
+  spectrumAt(buffer.samples, els.audio.currentTime * buffer.rate, VIZ.fftSize, spectrum);
+  bandLevels(spectrum, bands, out);
+  const offset = abGainDb(buffer.label);
+  if (offset) for (let i = 0; i < out.length; i++) out[i] += offset;
+  return out;
+}
+
+function drawBarsView(buffer, w, h, now) {
+  const live = state.isPlaying && state.analyser;
+  const rate = live ? state.audioCtx.sampleRate : buffer.rate;
+  const top = Math.min(VIZ.maxHz, rate / 2);
+  const count = Math.max(16, Math.min(200, Math.floor(w / 5)));
+  if (!state.vizBands || state.vizBands.count !== count || state.vizBands.rate !== rate) {
+    state.vizBands = { count, rate, bands: logBands(count, rate, VIZ.fftSize), levels: new Float32Array(count),
+      overlay: new Float32Array(count), smoothed: null };
+  }
+  const bands = state.vizBands;
+  if (live) {
+    const spectrum = state.vizSpectrum || (state.vizSpectrum = new Float32Array(VIZ.fftSize / 2));
+    state.analyser.getFloatFrequencyData(spectrum);
+    bandLevels(spectrum, bands.bands, bands.levels);
+  } else {
+    bufferBandLevels(buffer, bands.bands, bands.levels);
+  }
+  drawBars(bands.levels, w, h, top, now);
+
+  // The other version (dry when hearing wet, and vice versa) as a line,
+  // smoothed like the analyser while playing.
+  const other = otherBuffer();
+  if (other) {
+    const fresh = bufferBandLevels(other, logBands(count, other.rate, VIZ.fftSize), bands.overlay);
+    if (live && bands.smoothed && bands.smoothed.length === count) {
+      const tau = state.analyser.smoothingTimeConstant;
+      for (let i = 0; i < count; i++) {
+        bands.smoothed[i] = 20 * Math.log10(tau * Math.pow(10, bands.smoothed[i] / 20) + (1 - tau) * Math.pow(10, fresh[i] / 20) + 1e-12);
+      }
+    } else {
+      bands.smoothed = Float32Array.from(fresh);
+    }
+    const slot = w / count;
+    ctx.strokeStyle = 'rgba(235, 235, 235, 0.75)'; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < count; i++) {
+      const x = (i + 0.5) * slot, y = h - dbToUnit(bands.smoothed[i]) * h;
+      if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  for (const dbLine of [-20, -40, -60, -80]) {
+    const y = Math.round(h * (1 - dbToUnit(dbLine)));
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)'; ctx.fillRect(2, y - 5, 22, 10);
+    drawLabel(String(dbLine), 4, y - 5, 'rgba(200, 210, 220, 0.75)');
+  }
+  if (live) {
+    const wave = state.vizWave || (state.vizWave = new Float32Array(state.analyser.fftSize));
+    state.analyser.getFloatTimeDomainData(wave);
+    let peak = 0, sq = 0;
+    for (const v of wave) { peak = Math.max(peak, Math.abs(v)); sq += v * v; }
+    const toDb = (v) => (v > 0 ? (20 * Math.log10(v)).toFixed(1) : '-inf');
+    drawLabel(`${buffer.label}  peak ${toDb(peak)}  rms ${toDb(Math.sqrt(sq / wave.length))} dBFS`, 30, 4);
+  } else {
+    drawLabel(`${buffer.label}  spectrum at ${els.audio.currentTime.toFixed(2)} s`, 30, 4);
+  }
+  if (other) drawLabel(`— ${other.label}`, 30, 16, 'rgba(235, 235, 235, 0.85)');
+  if (state.abMatch && state.abOffsetDb) drawLabel('levels matched', 30, 28, 'rgba(164, 208, 7, 0.9)');
+
+  if (vizHover) {
+    const i = Math.min(count - 1, Math.max(0, Math.floor(vizHover.x / (w / count))));
+    const [lo, hi] = bands.bands[i], binHz = rate / VIZ.fftSize;
+    const hz = Math.sqrt(Math.max(lo, 0.5) * hi) * binHz;
+    let text = `${formatHz(hz)} · ${buffer.label} ${bands.levels[i].toFixed(1)} dB`;
+    if (other && bands.smoothed) text += ` · ${other.label} ${bands.smoothed[i].toFixed(1)} dB`;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(Math.round(vizHover.x) + 0.5, 0); ctx.lineTo(Math.round(vizHover.x) + 0.5, h); ctx.stroke();
+    drawTag(text, vizHover.x + 10, Math.max(40, Math.min(h - 32, vizHover.y - 20)), w);
+  }
+}
+
+// dBFS labels for the waveform's amplitude grid.
+function drawWaveLabels(w, h) {
+  const map = waveMapper(), mid = h / 2;
+  for (const dbLevel of waveGridDb()) {
+    const y = mid - map(Math.pow(10, dbLevel / 20)) * mid;
+    if (y < 30) continue;
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)'; ctx.fillRect(2, y - 5, 24, 10);
+    drawLabel(String(dbLevel), 4, y - 5, 'rgba(200, 210, 220, 0.7)');
+  }
+}
+
+/* ---------------- main draw ---------------- */
 
 function drawVisualizer(now = performance.now()) {
   const { w, h, dpr } = resizeCanvas();
   const buffer = audibleBuffer();
   if (!buffer) { drawBackdrop(w, h); drawLabel('Load audio to visualize', 8, 8); return; }
-  if (state.vizMode === 'bars') {
-    const live = state.isPlaying && state.analyser;
-    const rate = live ? state.audioCtx.sampleRate : buffer.rate;
-    const top = Math.min(VIZ.maxHz, rate / 2);
-    const count = Math.max(16, Math.min(160, Math.floor(w / 5)));
-    if (!state.vizBands || state.vizBands.count !== count || state.vizBands.rate !== rate) {
-      state.vizBands = { count, rate, bands: logBands(count, rate, VIZ.fftSize), levels: new Float32Array(count) };
-    }
-    const spectrum = state.vizSpectrum || (state.vizSpectrum = new Float32Array(VIZ.fftSize / 2));
-    if (live) state.analyser.getFloatFrequencyData(spectrum);
-    else spectrumAt(buffer.samples, playheadFraction() * buffer.samples.length, VIZ.fftSize, spectrum);
-    drawBars(bandLevels(spectrum, state.vizBands.bands, state.vizBands.levels), w, h, top, now);
-    if (live) {
-      const wave = state.vizWave || (state.vizWave = new Float32Array(state.analyser.fftSize));
-      state.analyser.getFloatTimeDomainData(wave);
-      let peak = 0, sq = 0;
-      for (const v of wave) { peak = Math.max(peak, Math.abs(v)); sq += v * v; }
-      const toDb = (v) => (v > 0 ? (20 * Math.log10(v)).toFixed(1) : '-inf');
-      drawLabel(`${buffer.label}  peak ${toDb(peak)}  rms ${toDb(Math.sqrt(sq / wave.length))} dBFS`, 8, 4);
-    } else {
-      drawLabel(`${buffer.label}  spectrum at ${els.audio.currentTime.toFixed(2)} s`, 8, 4);
-    }
-    return;
+  if (state.vizMode === 'bars') { drawBarsView(buffer, w, h, now); return; }
+  const range = drawTimeView(buffer, w, h, dpr);
+  if (state.vizMode === 'spec') {
+    drawFrequencyAxisLabels(w, h, buffer.rate, state.vizScale);
+    drawColorbar(w, h);
+  } else {
+    drawWaveLabels(w, h);
   }
-  const image = staticImage(state.vizMode, buffer, Math.round(w * dpr), Math.round(h * dpr));
-  ctx.drawImage(image, 0, 0, w, h);
-  if (state.vizMode === 'spec') drawFrequencyAxisLabels(w, h, buffer.rate);
-  drawLabel(buffer.label, state.vizMode === 'spec' ? 30 : 8, 4);
-  drawPlayhead(w, h);
-}
-
-function drawFrequencyAxisLabels(w, h, rate) {
-  const top = Math.min(VIZ.maxHz, rate / 2);
-  for (const hz of [4000, 8000, VIZ.bandEdgeHz, 16000]) {
-    if (hz >= top) continue;
-    const y = h - h * hz / top;
-    const edge = hz === VIZ.bandEdgeHz;
-    const text = `${hz / 1000}k`;
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)'; ctx.fillRect(2, Math.max(0, y - 10), 22, 10);
-    drawLabel(text, 4, Math.max(0, y - 10), edge ? 'rgba(255, 184, 34, 0.9)' : 'rgba(220, 230, 240, 0.85)');
-  }
+  drawTimeRuler(w, h, range);
+  const zoom = range.zoomed ? `  ${formatTime(range.t0, 2)}–${formatTime(range.t1, 2)}` : '';
+  drawLabel(`${buffer.label}${zoom}`, state.vizMode === 'spec' ? 32 : 8, 4);
+  drawPlayhead(w, h, range);
+  drawHover(w, h, buffer, range);
 }
 
 function animateVisualizer(now) {
+  // Zoomed in, the view pages along with the playhead.
+  const buffer = state.vizMode !== 'bars' && audibleBuffer();
+  if (buffer) {
+    const r = visibleRange(buffer), t = els.audio.currentTime;
+    if (r.zoomed && (t > r.t1 || t < r.t0)) {
+      const span = r.t1 - r.t0;
+      vizView.t0 = Math.min(Math.max(0, t - 0.02 * span), r.duration - span);
+      vizView.t1 = vizView.t0 + span;
+    }
+  }
   drawVisualizer(now);
   if (state.isPlaying) state.animationId = requestAnimationFrame(animateVisualizer);
 }
 
 function refreshVisualizer() {
+  updateVizTools();
   if (!state.isPlaying) drawVisualizer();
+}
+
+function updateVizTools() {
+  const timeView = state.vizMode !== 'bars' && !!(state.processedBuffer || state.decodedSource);
+  for (const button of [els.vizZoomIn, els.vizZoomOut, els.vizFit]) if (button) button.disabled = !timeView;
+  if (els.vizLog) {
+    // SPEC: log frequency axis. WAVE: dBFS amplitude.
+    const wave = state.vizMode === 'wave', on = wave ? state.waveScale === 'db' : state.vizScale === 'log';
+    els.vizLog.textContent = wave ? 'dB' : 'LOG';
+    els.vizLog.title = wave ? 'Waveform amplitude in dBFS: shows quiet detail, fades, gates and noise floors'
+      : 'Spectrogram frequency axis: log from 20 Hz, with ~3 Hz resolution below 400 Hz';
+    els.vizLog.disabled = state.vizMode === 'bars';
+    els.vizLog.classList.toggle('active', on);
+    els.vizLog.setAttribute('aria-pressed', String(on));
+  }
+  if (els.vizRange) {
+    els.vizRange.hidden = !(state.vizMode === 'spec' || (state.vizMode === 'wave' && state.waveScale === 'db'));
+    els.vizRange.textContent = `${state.vizRange} dB`;
+  }
 }
 
 // Segmented WAVE | BARS | SPEC control.
@@ -1765,6 +2538,146 @@ function setVizMode(mode) {
 if (els.vizWave) els.vizWave.addEventListener('click', () => setVizMode('wave'));
 if (els.vizBars) els.vizBars.addEventListener('click', () => setVizMode('bars'));
 if (els.vizSpec) els.vizSpec.addEventListener('click', () => setVizMode('spec'));
+if (els.vizZoomIn) els.vizZoomIn.addEventListener('click', () => zoomViz(0.5));
+if (els.vizZoomOut) els.vizZoomOut.addEventListener('click', () => zoomViz(2));
+if (els.vizFit) els.vizFit.addEventListener('click', () => { resetVizView(); refreshVisualizer(); });
+if (els.vizLog) els.vizLog.addEventListener('click', () => {
+  if (state.vizMode === 'wave') {
+    state.waveScale = state.waveScale === 'db' ? 'lin' : 'db';
+    LS.set('tf2ve_wave_scale', state.waveScale);
+  } else {
+    state.vizScale = state.vizScale === 'log' ? 'lin' : 'log';
+    LS.set('tf2ve_viz_scale', state.vizScale);
+  }
+  refreshVisualizer();
+});
+if (els.vizRange) els.vizRange.addEventListener('click', () => {
+  state.vizRange = VIZ.ranges[(VIZ.ranges.indexOf(state.vizRange) + 1) % VIZ.ranges.length];
+  LS.set('tf2ve_viz_range', state.vizRange);
+  refreshVisualizer();
+});
+
+// Taller view: the TALL button, or drag the bottom-right corner (desktop).
+function setVizHeight(px) {
+  els.vizContainer.style.height = px ? `${px}px` : '';
+  if (els.vizTall) els.vizTall.setAttribute('aria-pressed', String(els.vizContainer.offsetHeight > 250));
+}
+if (els.vizTall) els.vizTall.addEventListener('click', () => {
+  const tall = els.vizContainer.offsetHeight > 250;
+  setVizHeight(tall ? 0 : VIZ.tallHeight);
+  LS.set('tf2ve_viz_height', tall ? 0 : VIZ.tallHeight);
+});
+{
+  const saved = Number(LS.get('tf2ve_viz_height', 0));
+  if (saved >= 120 && saved <= 2000) setVizHeight(saved);
+}
+if (typeof ResizeObserver !== 'undefined') {
+  let lastHeight = els.vizContainer.offsetHeight, timer = 0;
+  new ResizeObserver(() => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const height = els.vizContainer.offsetHeight;
+      if (height !== lastHeight && els.vizContainer.style.height) LS.set('tf2ve_viz_height', height);
+      lastHeight = height;
+      if (els.vizTall) els.vizTall.setAttribute('aria-pressed', String(height > 250));
+      refreshVisualizer();
+    }, 100);
+  }).observe(els.vizContainer);
+}
+
+/* ---------------- pointer, wheel and keys ---------------- */
+
+const vizPointers = new Map();
+let vizDrag = null, vizPinch = null;
+const canvasPoint = (event) => {
+  const rect = els.canvas.getBoundingClientRect();
+  return { x: event.clientX - rect.left, y: event.clientY - rect.top, w: rect.width, h: rect.height };
+};
+
+els.canvas.addEventListener('wheel', (event) => {
+  const buffer = state.vizMode !== 'bars' && audibleBuffer();
+  if (!buffer) return;
+  const p = canvasPoint(event);
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? p.h : 1;
+  if (event.ctrlKey || event.metaKey) {
+    // Ctrl/⌘ + wheel, and trackpad pinches (which arrive as ctrl + wheel).
+    event.preventDefault();
+    zoomViz(Math.exp(Math.max(-100, Math.min(100, event.deltaY * unit)) * 0.005), p.x / p.w);
+    return;
+  }
+  const dx = event.shiftKey ? (event.deltaY || event.deltaX) : event.deltaX;
+  if (dx && visibleRange(buffer).zoomed) {
+    event.preventDefault();
+    panViz(dx * unit / p.w);
+  }
+}, { passive: false });
+
+els.canvas.addEventListener('pointerdown', (event) => {
+  if (state.vizMode === 'bars' || !audibleBuffer()) return;
+  const p = canvasPoint(event);
+  vizPointers.set(event.pointerId, p);
+  try { els.canvas.setPointerCapture(event.pointerId); } catch (e) { /* synthetic pointer */ }
+  const r = visibleRange(audibleBuffer());
+  if (vizPointers.size === 1) {
+    vizDrag = { x: p.x, w: p.w, moved: false, t0: r.t0, span: r.t1 - r.t0, duration: r.duration };
+  } else if (vizPointers.size === 2) {
+    const [a, b] = [...vizPointers.values()];
+    vizDrag = null;
+    vizPinch = { dist: Math.max(10, Math.abs(a.x - b.x)), mid: (a.x + b.x) / 2, w: p.w, t0: r.t0, span: r.t1 - r.t0,
+      duration: r.duration, minSpan: r.minSpan };
+  }
+});
+
+els.canvas.addEventListener('pointermove', (event) => {
+  const p = canvasPoint(event);
+  if (vizPointers.has(event.pointerId)) vizPointers.set(event.pointerId, p);
+  if (vizPinch && vizPointers.size === 2) {
+    const [a, b] = [...vizPointers.values()];
+    const dist = Math.max(10, Math.abs(a.x - b.x)), mid = (a.x + b.x) / 2;
+    const span = Math.min(vizPinch.duration, Math.max(vizPinch.minSpan, vizPinch.span * vizPinch.dist / dist));
+    const at = vizPinch.t0 + vizPinch.mid / vizPinch.w * vizPinch.span;
+    setVizView(at - mid / vizPinch.w * span, span, vizPinch.duration);
+  } else if (vizDrag) {
+    const dx = p.x - vizDrag.x;
+    if (Math.abs(dx) > 4) vizDrag.moved = true;
+    if (vizDrag.moved) setVizView(vizDrag.t0 - dx / vizDrag.w * vizDrag.span, vizDrag.span, vizDrag.duration);
+  }
+  if (event.pointerType === 'mouse') {
+    vizHover = { x: p.x, y: p.y };
+    if (!state.isPlaying) drawVisualizer();
+  }
+});
+
+function endVizPointer(event) {
+  if (!vizPointers.has(event.pointerId)) return;
+  vizPointers.delete(event.pointerId);
+  // A click without a drag seeks the player there.
+  if (event.type === 'pointerup' && vizDrag && !vizDrag.moved && els.audio.src && Number.isFinite(els.audio.duration)) {
+    const t = vizDrag.t0 + canvasPoint(event).x / vizDrag.w * vizDrag.span;
+    els.audio.currentTime = Math.min(Math.max(0, t), els.audio.duration);
+  }
+  if (!vizPointers.size) { vizDrag = null; vizPinch = null; }
+  else if (vizPinch) vizPinch = null;
+}
+els.canvas.addEventListener('pointerup', endVizPointer);
+els.canvas.addEventListener('pointercancel', endVizPointer);
+els.canvas.addEventListener('pointerleave', () => {
+  if (!vizHover) return;
+  vizHover = null;
+  if (!state.isPlaying) drawVisualizer();
+});
+
+els.canvas.addEventListener('keydown', (event) => {
+  if (state.vizMode === 'bars' || event.ctrlKey || event.metaKey || event.altKey) return;
+  const actions = {
+    '+': () => zoomViz(0.5), '=': () => zoomViz(0.5), '-': () => zoomViz(2), '_': () => zoomViz(2),
+    '0': () => { resetVizView(); refreshVisualizer(); },
+    ArrowLeft: () => panViz(-0.25), ArrowRight: () => panViz(0.25)
+  };
+  if (!actions[event.key]) return;
+  event.preventDefault();
+  actions[event.key]();
+});
 
 els.audio.addEventListener('play', () => {
   if (!state.audioCtx) {
@@ -1775,15 +2688,19 @@ els.audio.addEventListener('play', () => {
       state.analyser.smoothingTimeConstant = 0.6;
       state.analyser.minDecibels = VIZ.minDb;
       state.analyser.maxDecibels = VIZ.maxDb;
+      // Each element has its own gain for the loudness-matched A/B.
+      state.wetGain = state.audioCtx.createGain();
       state.sourceNode = state.audioCtx.createMediaElementSource(els.audio);
-      state.sourceNode.connect(state.analyser);
+      state.sourceNode.connect(state.wetGain).connect(state.analyser);
       state.analyser.connect(state.audioCtx.destination);
       if (els.audioDry) {
         // Route the dry twin through the same analyser: a muted element is
         // silent in the graph, so the visualizer always shows the audible one.
+        state.dryGain = state.audioCtx.createGain();
         state.sourceNodeDry = state.audioCtx.createMediaElementSource(els.audioDry);
-        state.sourceNodeDry.connect(state.analyser);
+        state.sourceNodeDry.connect(state.dryGain).connect(state.analyser);
       }
+      applyAbMatch();
     } catch (e) {
       state.analyser = null;   // visualizer falls back to buffer analysis
     }

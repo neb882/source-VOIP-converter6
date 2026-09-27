@@ -135,6 +135,13 @@ check('Invalid PCM is rejected before encoding', true);
   const old = await opus.roundTrip(steadyTone, rate, 32000, { runtime: '1.1.5', complexity: 10, vbr: true, dtx: true, signal: 'voice' });
   const cur = await opus.roundTrip(steadyTone, rate, 32000, { runtime: '1.6.1', complexity: 10, vbr: true, dtx: true, signal: 'voice' });
   check('At complexity 10, libopus 1.1.5 puts a steady tone into DTX and 1.6.1 does not', old.info.dtxFrames > 50 && cur.info.dtxFrames === 0);
+  // libopus 1.1.x's SILK turns a strong sustained 50 Hz tone into a DC offset, as a native build does (REFERENCE_2026.md finding 18).
+  const hum = Float32Array.from({ length: 8 * rate }, (_, i) => .3 * Math.sin(2 * Math.PI * 50 * i / rate));
+  const mean = (a) => a.reduce((sum, v) => sum + v, 0) / a.length;
+  const humOld = await opus.roundTrip(hum, rate, 32000, { runtime: '1.1.5', complexity: 10, vbr: true, dtx: true, signal: 'voice' });
+  const humNew = await opus.roundTrip(hum, rate, 32000, { runtime: '1.6.1', complexity: 10, vbr: true, dtx: true, signal: 'voice' });
+  check('libopus 1.1.5 adds the native build\'s DC offset to a sustained 50 Hz tone; 1.6.1 does not',
+    Math.abs(mean(humOld.samples) - 0.2127) < 0.002 && Math.abs(mean(humNew.samples)) < 0.005);
   await assert.rejects(() => opus.roundTrip(x, rate, 32000, { runtime: '0.9' }), /Unknown libopus runtime/);
   check('Unknown runtimes are rejected', true);
 }
