@@ -1,16 +1,18 @@
 {
   "name": "tf2-voice-emulator",
-  "version": "4.7.0",
+  "version": "4.8.0",
   "private": true,
   "description": "Browser-based TF2 voice-chat emulator: real Opus plus the measured Steam voice gate and Source receiver auto-gain and clipping.",
   "scripts": {
     "dev": "node tests/static-server.js",
-    "test": "node tests/verify.js && node tests/opus.verify.mjs && node tests/reference.verify.mjs && node tests/formats.verify.mjs && node tests/meter.verify.mjs",
+    "test": "node tests/verify.js && node tests/opus.verify.mjs && node tests/reference.verify.mjs && node tests/formats.verify.mjs && node tests/meter.verify.mjs && node tests/video.verify.mjs",
     "vendor:opus": "node tests/vendor-opus.mjs",
     "test:vendor": "node tests/vendor-opus.mjs --check",
     "build:opus11": "node tests/libopus11/build.mjs",
     "build:lame": "node tests/lame/build.mjs",
     "test:browser": "node tests/browser.verify.js",
+    "accuracy": "node tests/accuracy.mjs",
+    "build:celt": "node tests/celt011/build.mjs",
     "test:all": "pnpm test:vendor && pnpm test && pnpm test:browser",
     "analyze:reference": "node tests/reference.analyze.mjs",
     "compare:reference": "node tests/reference.compare.mjs --compact"

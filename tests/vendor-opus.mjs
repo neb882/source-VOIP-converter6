@@ -36,4 +36,10 @@ if (process.argv.includes('--check')) {
     throw new Error('vendor/libopus-1.1/libopus-1.1.5.wasm.mjs differs from the recorded build');
   }
   console.log('libopus 1.1.5 build matches its recorded hash.');
+  // Likewise the CELT 0.11 build (tests/celt011/build.mjs) for vaudio_celt.
+  const celt = fs.readFileSync(path.join(root, 'vendor/celt-0.11/celt-0.11.wasm.mjs'));
+  if (createHash('sha256').update(celt).digest('hex') !== '6f2522f50db3167cbff36e73518cbeda55db720a71219cef35923ce0c9c756e5') {
+    throw new Error('vendor/celt-0.11/celt-0.11.wasm.mjs differs from the recorded build');
+  }
+  console.log('CELT 0.11 build matches its recorded hash.');
 }

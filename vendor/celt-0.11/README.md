@@ -12,4 +12,4 @@ This folder holds the codec for the `vaudio_celt` and `vaudio_celt_high` profile
 
 To rebuild the module, run `node tests/celt011/build.mjs`. It needs git, clang with the wasm32 target, and wasm-ld; no Emscripten.
 
-Built with Ubuntu clang 18.1.3, the wasm module's SHA-256 is `2947bcd94aff0303ccfec291bf71bbfdbd764101a7053fadea582fc32a7b8770` (113 290 bytes).
+Built with Ubuntu clang 18.1.3, `celt-0.11.wasm.mjs` has SHA-256 `6f2522f50db3167cbff36e73518cbeda55db720a71219cef35923ce0c9c756e5` (the WebAssembly inside it: `2947bcd94aff0303ccfec291bf71bbfdbd764101a7053fadea582fc32a7b8770`, 113 290 bytes). `pnpm test:vendor` checks it.

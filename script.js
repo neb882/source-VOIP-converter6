@@ -20,6 +20,7 @@ const els = {
   process:   document.getElementById('process'),
   cancel:    document.getElementById('cancel-process'),
   dl:        document.getElementById('download'),
+  dlVideo:   document.getElementById('download-video'),
   format:    document.getElementById('format'),
   status:    document.getElementById('source-status'),
   progress:  document.getElementById('process-progress'),
@@ -56,6 +57,7 @@ const els = {
   lp:        document.getElementById('lp'),
   bits:      document.getElementById('bits'),
   agc:       document.getElementById('agc'),
+  retime:    document.getElementById('retime'),
   maxGain:   document.getElementById('maxgain'),
   avgGain:   document.getElementById('avggain'),
   vad:       document.getElementById('vad'),
@@ -99,6 +101,7 @@ const state = {
   renderId: 0,           // invalidates cached visualizer images per render
   lastCodecInfo: null,   // codec statistics of the last render (net_graph)
   sourceName: null,      // name of the loaded clip (file or mic)
+  sourceVideo: null,     // the MP4/MOV the clip came from: { bytes, name, info } (video.js)
   recorder: null,        // active PCM capture session
   recTick: null,         // recording timer interval
   processing: false,
@@ -108,6 +111,7 @@ const state = {
 };
 
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
+const MAX_VIDEO_BYTES = 1024 * 1024 * 1024;   // a video's audio is small; its picture is copied, not decoded
 const MAX_AUDIO_SECONDS = 10 * 60;
 const MAX_RECORDING_SECONDS = 5 * 60;
 
@@ -491,6 +495,7 @@ const cvars = {
   'voice_micgain':   { help: 'Sender capture gain; above 1 clips the int16 capture', link: 'gain' },
   'voice_scale':     { help: 'Receiver voice scale, applied inside the auto-gain (more = more clipping)', link: 'voice_scale' },
   'voice_agc':       { help: 'Receiver auto-gain with int16 clamp (0 = unity gain)', link: 'agc' },
+  'voice_retime':    { help: "TF2's early talk-spurt starts after short silences (1), or the source's timing (0)", link: 'retime' },
   'voice_maxgain':   { help: 'Auto-gain cap (TF2 default 10)', link: 'maxgain' },
   'voice_avggain':   { help: 'Auto-gain normalizes each block between its mean (0) and peak (1) to full scale; 0.5 = TF2 default', link: 'avggain' },
   'voice_capture_channel': { help: 'Stereo input to the mono mic: left (measured through a virtual cable) / mix / right', link: 'capture_channel' },
@@ -670,9 +675,11 @@ function updateSignalChain() {
   const filters = [num(els.hp, 0) > 10 ? `HP ${num(els.hp, 0)} Hz` : '', num(els.lp, 20000) < 20000 ? `LP ${num(els.lp, 20000)} Hz` : ''].filter(Boolean);
   const steps = [
     ['Capture', `${channelLabel}mic ×${gain.toFixed(1)}${filters.length ? ' · ' + filters.join(' · ') : ''} · ${gateOn ? `gate > ${gateDb} dBFS` : 'no gate'}`, gain > 1 ? 'hot' : ''],
-    ['Codec', codecOn ? `Opus ${codec.codecRate / 1000} kHz · ${codec.encoder?.vbr ? 'VBR ' : ''}${kbps} kbps${codec.encoder?.dtx ? ' · DTX' : ''} · ${mode}` : 'bypassed', codecOn ? '' : 'off'],
+    ['Codec', !codecOn ? 'bypassed' : codec.engine === 'celt011'
+      ? `CELT 0.11 ${codec.codecRate / 1000} kHz · ${Math.max(8, Math.round(codec.packetBytes * bits / 16))}-byte packets of ${(1000 * codec.frameSize / codec.codecRate).toFixed(1)} ms`
+      : `Opus ${codec.codecRate / 1000} kHz · ${codec.encoder?.vbr ? 'VBR ' : ''}${kbps} kbps${codec.encoder?.dtx ? ' · DTX' : ''} · ${mode}`, codecOn ? '' : 'off'],
     ['Network', `${packetMs} ms packets · ${loss}% lost${jitter > 0 ? ` · ${jitter} ms jitter` : ''}`, loss > 0 || jitter > 0 ? 'hot' : ''],
-    ['Receiver', agcOn ? `auto-gain ≤${maxGain}× · int16 clip` : 'unity gain · int16 clip', ''],
+    ['Receiver', `${agcOn ? `auto-gain ≤${maxGain}× · int16 clip` : 'unity gain · int16 clip'}${els.retime && els.retime.value === '1' ? ' · spurts re-timed' : ''}`, ''],
     ['Mixer', `44.1 kHz · ${room}`, ''],
     ['Output', `volume ${Math.round(volume * 100)}%`, '']
   ];
@@ -804,7 +811,8 @@ const CONFIG_FIELDS = [
   configControl('cdur', els.cDur),
   configControl('cdec', els.cDec),
   configControl('cmix', els.cMix),
-  configControl('jit', els.jitter)
+  configControl('jit', els.jitter),
+  configControl('retime', els.retime)
 ];
 
 function collectConfig() {
@@ -896,6 +904,8 @@ function mountSource(mono, sampleRate, name, left = null) {
   if (!Number.isFinite(duration) || duration <= 0) throw new Error('the clip has no decodable audio');
   if (duration > MAX_AUDIO_SECONDS) throw new Error('the clip exceeds the 10 minute limit');
   state.sourceName = name;
+  state.sourceVideo = null;
+  updateVideoButton();
   if (state.dryBlob) URL.revokeObjectURL(state.dryBlob);
   if (state.lastBlob) URL.revokeObjectURL(state.lastBlob);
   state.lastBlob = null;
@@ -926,6 +936,8 @@ function mountSource(mono, sampleRate, name, left = null) {
 }
 
 let sourceLoadId = 0;
+// Resolves true once the clip is the source (false if a newer one took over
+// or it failed).
 async function loadSourceFromArrayBuffer(ab, name) {
   const id = ++sourceLoadId;
   els.process.disabled = true;
@@ -933,16 +945,18 @@ async function loadSourceFromArrayBuffer(ab, name) {
     setStatus(`Decoding ${name}…`);
     if (!state.decodeCtx) state.decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
     const decoded = await state.decodeCtx.decodeAudioData(ab);
-    if (id !== sourceLoadId) return; // A newer selection superseded this decode.
+    if (id !== sourceLoadId) return false; // A newer selection superseded this decode.
     if (decoded.duration > MAX_AUDIO_SECONDS) throw new Error('the clip exceeds the 10 minute limit');
     mountSource(TF2Audio.bufferToMono(decoded), decoded.sampleRate, name,
       decoded.numberOfChannels > 1 ? decoded.getChannelData(0).slice() : null);
+    return true;
   } catch (e) {
-    if (id !== sourceLoadId) return;
+    if (id !== sourceLoadId) return false;
     logLine(`decodeAudioData failed: ${e.message}`, 'err');
     setStatus(`Could not load audio: ${e.message}`, 'error');
     state.decodedSource = null;
     els.process.disabled = true;
+    return false;
   }
 }
 
@@ -1144,11 +1158,16 @@ document.querySelectorAll('.preset-btn').forEach(btn => {
   btn.addEventListener('click', () => { const cmd = btn.getAttribute('data-cmd'); if (cmd) execCommand(cmd); });
 });
 
-// Load one file as the source (file picker or a single dropped file).
+const isVideoFile = (f) => /^video\//.test(f.type) || /\.(mp4|m4v|mov|3gp|webm|mkv)$/i.test(f.name);
+
+// Load one file as the source (file picker or a single dropped file). A
+// video's audio becomes the source; an MP4 or MOV is also kept, so the render
+// can go back into it (video.js).
 async function loadSourceFile(f) {
-  if (f.size > MAX_FILE_BYTES) {
-    setStatus(`File is ${(f.size / 1024 / 1024).toFixed(1)} MB; the limit is ${MAX_FILE_BYTES / 1024 / 1024} MB.`, 'error');
-    logLine('FS_MountFile: file exceeds the 100 MB safety limit.', 'err');
+  const video = isVideoFile(f), limit = video ? MAX_VIDEO_BYTES : MAX_FILE_BYTES;
+  if (f.size > limit) {
+    setStatus(`File is ${(f.size / 1024 / 1024).toFixed(1)} MB; the limit is ${limit / 1024 / 1024} MB${video ? ' for video' : ''}.`, 'error');
+    logLine(`FS_MountFile: file exceeds the ${limit / 1024 / 1024} MB safety limit.`, 'err');
     return;
   }
   const selection = ++sourceLoadId;
@@ -1156,13 +1175,55 @@ async function loadSourceFile(f) {
   try {
     const bytes = await f.arrayBuffer();
     if (selection !== sourceLoadId) return;
-    await loadSourceFromArrayBuffer(bytes, f.name);
+    // Decoding takes the buffer over, so a remuxable video keeps a copy.
+    const info = video && window.TF2Video ? TF2Video.inspect(new Uint8Array(bytes)) : null;
+    const keep = info && info.video ? bytes.slice(0) : null;
+    if (!(await loadSourceFromArrayBuffer(bytes, f.name))) return;
+    if (keep) {
+      state.sourceVideo = { bytes: keep, name: f.name, info };
+      logLine(`FS_MountFile: video (${info.container.toUpperCase()}, ${info.codec}) kept; Download video puts the render back into it.`, 'sys');
+    } else if (video) {
+      logLine(`FS_MountFile: ${info && info.note ? info.note : 'only MP4 and MOV videos can take the render back; this one gives its audio only.'}`, 'warn');
+    }
+    updateVideoButton();
   } catch (error) {
     if (selection !== sourceLoadId) return;
-    setStatus(`Could not read audio: ${error.message}`, 'error');
+    setStatus(video ? `Could not read the video's audio: ${error.message}` : `Could not read audio: ${error.message}`, 'error');
     els.process.disabled = !state.decodedSource;
   }
 }
+
+// The video download: shown for an MP4 or MOV source, usable after a render.
+function updateVideoButton() {
+  if (!els.dlVideo) return;
+  const video = state.sourceVideo;
+  els.dlVideo.hidden = !video;
+  if (els.dlVideo.dataset.busy) return;
+  els.dlVideo.disabled = !video || !state.processedBuffer;
+  els.dlVideo.textContent = video ? `Download video (${video.info.container.toUpperCase()})` : 'Download video';
+}
+
+if (els.dlVideo) els.dlVideo.addEventListener('click', async () => {
+  const video = state.sourceVideo, samples = state.processedBuffer, rate = state.processedRate;
+  if (!video || !samples || els.dlVideo.disabled) return;
+  els.dlVideo.disabled = true;
+  els.dlVideo.dataset.busy = '1';
+  els.dlVideo.textContent = 'Writing video…';
+  try {
+    const { blob, audioCodec, container } = await TF2Video.remux(video.bytes, samples, rate);
+    if (state.sourceVideo !== video) return;
+    const name = outputName(video.name, state.lastCodecKey, container);
+    saveBlob(blob, name);
+    logLine(`Video: ${name} (${(blob.size / 1048576).toFixed(1)} MB): picture copied as is, voice as ${audioCodec}.`, 'sys');
+    setStatus(`Saved ${name}: the video with the render as its audio (${audioCodec}).`, 'success');
+  } catch (error) {
+    setStatus(`Could not write the video: ${error.message}`, 'error');
+    logLine(`Video: ${error.message}`, 'err');
+  } finally {
+    delete els.dlVideo.dataset.busy;
+    updateVideoButton();
+  }
+});
 
 els.file.addEventListener('change', () => {
   if (!els.file.files.length) return;
@@ -1173,7 +1234,7 @@ els.file.addEventListener('change', () => {
     window.TF2Batch.add(files, { reveal: true });
     return;
   }
-  if (files[0].size > MAX_FILE_BYTES) els.file.value = '';
+  if (files[0].size > (isVideoFile(files[0]) ? MAX_VIDEO_BYTES : MAX_FILE_BYTES)) els.file.value = '';
   loadSourceFile(files[0]);
 });
 
@@ -1305,6 +1366,7 @@ function renderOptions() {
     lp:          Number(els.lp.value),
     bits:        Number(els.bits.value),
     agc:         els.agc.value === '1',
+    retime:      !!els.retime && els.retime.value === '1',
     maxGain:     Number(els.maxGain.value),
     avgGain:     Number(els.avgGain.value),
     gate:        els.vad.value === 'auto' ? null : els.vad.value === '1',
@@ -1443,6 +1505,7 @@ function presentRender({ samples, sampleRate, blob, realOpus, codecInfo, stats }
 
   state.renderId++;
   state.lastCodecInfo = codecInfo;
+  updateVideoButton();
   // A re-render of the same source keeps the view, band and selection.
   refreshVisualizer();
   updateMeter();

@@ -374,6 +374,41 @@
   /* net_split frames. See tests/REFERENCE_2026.md.                      */
   /* ------------------------------------------------------------------ */
 
+  // TF2's receiver re-timing of talk spurts (tests/REFERENCE_2026.md,
+  // finding 19): after a silence of up to 0.45 s, 42% of spurts play early,
+  // by the silence less 0-130 ms (at most 350 ms); the spurt after keeps its
+  // time. Moves the decoded audio (codec rate) and the frame log in place;
+  // returns the moves as { time, shiftMs }.
+  const RETIME = { maxGap: 0.45, chance: 0.42, leftMax: 0.13, maxShift: 0.35 };
+  function retimeSpurts(samples, info, rate, rand) {
+    const log = info.frameLog, size = info.frameSamples, lookahead = info.lookahead || 0;
+    if (!log || !size) return [];
+    const spurts = [];
+    for (let f = 0; f < log.length; f++) {
+      if (!log[f]) continue;
+      const first = f;
+      while (f + 1 < log.length && log[f + 1]) f++;
+      spurts.push({ first, last: f });
+    }
+    const moves = [];
+    let early = false;
+    for (let k = 1; k < spurts.length; k++) {
+      const gap = (spurts[k].first - spurts[k - 1].last - 1) * size / rate;
+      if (early || gap > RETIME.maxGap || rand() >= RETIME.chance) { early = false; continue; }
+      const shift = Math.round(Math.min(RETIME.maxShift, gap - RETIME.leftMax * rand()) * rate);
+      const frames = Math.round(shift / size);
+      if (frames < 1) { early = false; continue; }
+      const { first, last } = spurts[k];
+      const start = Math.max(shift, first * size - lookahead), end = Math.min(samples.length, (last + 1) * size - lookahead);
+      if (end > start) { samples.copyWithin(start - shift, start, end); samples.fill(0, Math.max(start - shift, end - shift), end); }
+      log.copyWithin(first - frames, first, last + 1); log.fill(0, last + 1 - frames, last + 1);
+      if (info.frameBytes) { info.frameBytes.copyWithin(first - frames, first, last + 1); info.frameBytes.fill(0, last + 1 - frames, last + 1); }
+      moves.push({ time: start / rate, shiftMs: 1000 * shift / rate });
+      early = true;
+    }
+    return moves;
+  }
+
   function buildLossMask(nFrames, framesPerPacket, lossPct, rand, jitterMs = 0) {
     nFrames = Math.max(0, Math.floor(finiteOr(nFrames, 0)));
     framesPerPacket = Math.max(1, Math.round(finiteOr(framesPerPacket, 1)));
@@ -693,6 +728,7 @@
    *   gate:         Steam sender voice gate; null = profile default     [null]
    *   gateThresholdDb: gate opening level, frame RMS in dBFS [profile/-39.5]
    *   agc:          receiver auto-gain (false = unity gain)             [true]
+   *   retime:       TF2's early talk-spurt starts (finding 19)          [false]
    *   avgGain:      voice_avggain, mean (0) to peak (1) normalization   [0.5]
    *   maxGain:      voice_maxgain gain cap                              [10]
    *   voiceScale:   voice_scale, applied inside the auto-gain           [1]
@@ -788,6 +824,8 @@
       codecInfo = { ...result.info, framesPerPacket };
       const eq = profileEq(codec);
       if (eq) samples = applyFirZeroPhase(samples, eq);
+      // The receiver's re-timing, from its own seed so loss patterns stay put.
+      if (opts.retime) codecInfo.retimed = retimeSpurts(samples, codecInfo, codecRate, mulberry32((finiteOr(opts.seed, 0xC0FFEE) ^ 0x9E3779B9) >>> 0));
     }
     report(0.72);
     await microYield();

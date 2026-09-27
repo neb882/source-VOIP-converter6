@@ -255,3 +255,25 @@ export async function createCeltStream(sampleRate, options = {}) {
     free() { codec.free(); }
   };
 }
+
+// A finished recording as Opus packets for a container (video.js): libopus
+// 1.6.1, fullband music settings, 20 ms frames. The first preSkip samples
+// of the decoded stream are the encoder's delay.
+export async function encodeForContainer(samples, sampleRate, bitrate = 128000) {
+  const { createEncoder } = await runtime('1.6.1');
+  const encoder = await createEncoder({ sampleRate, channels: 1, frameSize: sampleRate / 50, application: APPLICATIONS.audio,
+    signal: SIGNALS.auto, bitrate, complexity: 10, vbr: true, dtx: false, fec: false });
+  try {
+    const frameSize = sampleRate / 50, preSkip = encoder.getLookahead();
+    const frames = Math.ceil((samples.length + preSkip) / frameSize), packets = [], frame = new Float32Array(frameSize);
+    for (let f = 0; f < frames; f++) {
+      frame.fill(0);
+      const start = f * frameSize;
+      if (start < samples.length) frame.set(samples.subarray(start, Math.min(samples.length, start + frameSize)));
+      packets.push(encoder.encodeFloat(frame));
+    }
+    return { packets, preSkip, frameSize };
+  } finally {
+    encoder.free();
+  }
+}

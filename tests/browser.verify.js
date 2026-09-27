@@ -371,6 +371,40 @@ async function verifyAverageAndRealTake(page) {
   await page.locator('#viz-wave').click();
 }
 
+// Video in and out: the audio of an MP4 or MOV is the source, and the render
+// goes back into the video, which is copied sample for sample.
+async function verifyVideo(page) {
+  console.log('\n[Browser 3g] Video in and out');
+  const TF2Video = require('../video.js');
+  for (const name of ['vp9_opus.mp4', 'h264_pcm.mov']) {
+    const file = path.join(__dirname, 'video', name);
+    await page.locator('#file').setInputFiles(file);
+    await page.waitForFunction((n) => state.sourceName === n && !document.getElementById('process').disabled
+      && !document.getElementById('download-video').hidden, name);
+    const shown = await page.evaluate(() => ({ hidden: document.getElementById('download-video').hidden,
+      disabled: document.getElementById('download-video').disabled, label: document.getElementById('download-video').textContent }));
+    check(!shown.hidden && shown.disabled, `${name}: a video source offers the video download once rendered`, shown.label);
+    await page.locator('#process').click();
+    await page.waitForFunction(() => !document.getElementById('download-video').disabled, null, { timeout: 60000 });
+    const [download] = await Promise.all([page.waitForEvent('download'), page.locator('#download-video').click()]);
+    const bytes = new Uint8Array(fs.readFileSync(await download.path()));
+    const a = TF2Video.parse(new Uint8Array(fs.readFileSync(file))), b = TF2Video.parse(bytes);
+    const va = a.tracks.find(t => t.handler === 'vide'), vb = b.tracks.find(t => t.handler === 'vide');
+    const same = va.samples.length === vb.samples.length && va.samples.every((s, i) => {
+      const x = a.u8.subarray(s.offset, s.offset + s.size), y = b.u8.subarray(vb.samples[i].offset, vb.samples[i].offset + vb.samples[i].size);
+      return x.length === y.length && x.every((v, k) => v === y[k]);
+    });
+    const audio = b.tracks.filter(t => t.handler === 'soun');
+    const ext = name.endsWith('.mov') ? 'mov' : 'mp4';
+    check(same && audio.length === 1 && download.suggestedFilename().endsWith(`_tf2_steam.${ext}`),
+      `${name}: Download video keeps the picture byte for byte and carries the render`, `${download.suggestedFilename()}, audio ${audio[0] && audio[0].format}`);
+  }
+  // Loading plain audio hides it again.
+  await page.locator('#file').setInputFiles({ name: 'after-video.wav', mimeType: 'audio/wav', buffer: wavTone(.5) });
+  await page.waitForFunction(() => state.sourceName === 'after-video.wav');
+  check(await page.locator('#download-video').isHidden(), 'an audio source hides the video download');
+}
+
 async function verifyLiveMonitor(page) {
   console.log('\n[Browser 3f] Live monitor');
   await page.locator('#live-toggle').click();
@@ -732,6 +766,7 @@ async function main() {
     check(parity.exact && parity.plc === 'opus' && parity.lost > 0, 'worker and main thread agree with native packet-loss concealment');
     await verifyAverageAndRealTake(page);
     await verifyLiveMonitor(page);
+    await verifyVideo(page);
 
     await page.locator('#file').setInputFiles({ name: 'long-tone.wav', mimeType: 'audio/wav', buffer: wavTone(20) });
     await page.waitForFunction(() => !document.getElementById('process').disabled);
@@ -793,10 +828,10 @@ async function main() {
     check(afterUpdate.keys.includes(SHELL_CACHE), 'current app shell cache is populated', SHELL_CACHE);
     check(await page.evaluate(async (name) => {
       const cache = await caches.open(name);
-      const needed = ['batch.js', 'formats.js', 'flac.js', 'zip.js', 'meter.js', 'reference.js', 'live.js', 'live-worker.js', 'live-worklet.js',
-        'vendor/lame/index.mjs', 'vendor/lame/lame-3.100.wasm.mjs'];
+      const needed = ['batch.js', 'formats.js', 'flac.js', 'zip.js', 'meter.js', 'reference.js', 'video.js', 'live.js', 'live-worker.js', 'live-worklet.js',
+        'vendor/lame/index.mjs', 'vendor/lame/lame-3.100.wasm.mjs', 'vendor/celt-0.11/index.mjs', 'vendor/celt-0.11/celt-0.11.wasm.mjs'];
       return (await Promise.all(needed.map(path => cache.match(new URL(path, location.href).href)))).every(Boolean);
-    }, SHELL_CACHE), 'batch, format, meter, reference, live-monitor and MP3 encoder files are cached for offline use');
+    }, SHELL_CACHE), 'batch, format, meter, reference, video, live-monitor, CELT and MP3 encoder files are cached for offline use');
     // Restore the normal registration while still online. Otherwise reloading
     // registers sw.js again and races another replacement against file loading.
     await activateServiceWorker(page, 'sw.js');

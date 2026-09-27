@@ -368,6 +368,24 @@ Music with held sub-bass is where it would show. The app's meter reports it.
 - Between tones the recording's mean is +0.01% of full scale, so the recording chain adds no offset.
 - With `voice_maxgain 1` the same plateaus appear at the codec's own scale, so they do not come from the receiver's clipping.
 
+### 19. The receiver starts some talk spurts early, closing the silence before them
+
+The accuracy suite ([`tests/accuracy.mjs`](accuracy.mjs)) lines every take up with the app's render talk spurt by talk spurt and records each spurt's delay. Over the 13 takes without simulated loss there are 149 transitions from one spurt to the next:
+
+- **Most keep the delay.** 96 (64%) change it by less than 40 ms (median 10 ms).
+- **Early starts.** 26 spurts start 80–350 ms early, most by 280–350 ms.
+  - 22 of them follow a silence of at most 0.45 s in the gate model.
+  - The early start takes up most of that silence: 0–130 ms of it is left in 21 of the 26.
+  - The next spurt goes back to the usual delay in 19 of the 26.
+- **Rate.** After a silence of at most 0.45 s, not directly after an early start, 21 of 50 spurts (42%) start early. It varies from take to take (1 of 9 for listener B, 4 of 4 in two takes), and the same test signal gets different spurts moved in different takes. Which spurt moves is not predictable from the signal.
+- **Inside a spurt**, the delay steps by a few milliseconds (57 steps of 4–20 ms, a few up to 68 ms, over 25 minutes of talk spurts). These include the 5.8 ms latency trims of finding 10.
+
+The render keeps the source's timeline by default, so the dry/wet A/B and the real-take check line up. **Talk-spurt timing → TF2 re-timing** (`voice_retime 1`) applies this finding: after a silence of up to 0.45 s, a spurt starts early with probability 0.42, by the silence less a random 0–130 ms (at most 350 ms), and the spurt after it keeps its time. It is seeded like the loss model.
+
+### 20. The Steam render's low frequencies lead the source by Opus's own phase
+
+A render of white noise lines up with its source to 0.3 µs in the 8–11 kHz band, which the CELT layer of hybrid mode codes: the encoder's lookahead is trimmed exactly. Below 8 kHz the SILK layer leads by a frequency-dependent amount: 35–70 µs at 1–6 kHz, 86 µs at 0.3–1 kHz and about 370 µs at 100–300 Hz. libopus alone, without the app's chain, does the same in both 1.1.5 and 1.6.1. It is the phase response of SILK's own processing, which TF2's libopus shares, so the render keeps it rather than shifting it. An Opus test pins both bands.
+
 ## Model
 
 | Stage | Setting | Basis |
@@ -437,17 +455,12 @@ A pure sine's codec noise moves by about 2 dB with where the 20 ms frames fall o
 
 ## What remains unverified
 
-- **Talk-spurt timing and latency trimming.** Renders keep the source timeline; none of the following is modeled:
-  - the per-spurt delay changes, up to about 330 ms
-  - the 5.8 ms latency-trimming skips (finding 10)
-  - the −0.4 ms/s drift (finding 15)
-  
-  They occur with a remote listener on a dedicated server too (Set D).
+- **Talk-spurt timing and latency trimming.** Renders keep the source timeline by default. Early starts after short silences (finding 19) are an option, modeled statistically: which spurt TF2 moves is not predictable. The 5.8 ms latency trims inside a spurt (finding 10) and the recorder's clock drift (about 400 ppm in every take, finding 15) are not modeled. All of these occur with a remote listener on a dedicated server too (Set D).
 - **Steam's libopus build.** Finding 16 identifies libopus 1.1.x, most likely 1.1.2 or later, which give identical packets here. Steam's compiler and math library could still change packets in their last bits. Steam's capture resampler is modeled by its measured roll-off, not reproduced. Pure tones at 11.5–12 kHz fall into DTX in Steam's encoder more often than in the model.
 - **Stereo capture.** Finding 6 is one capture chain (a stereo virtual cable). A physical microphone is mono either way.
 - **Comfort-noise details.** The model reproduces when comfort noise starts and how often it refreshes, but not the random excitation's exact values. For a steady tone below 60 Hz, the sign and height of each near-DC plateau differ from TF2's (finding 18).
 - **Output stage.** The small post-clip roll-off may come from the recording chain rather than the game.
-- **Legacy profiles and rooms.** Speex and CELT stand-ins, and room presets, are not validated against recordings.
+- **Legacy profiles and rooms.** The CELT profiles run the real CELT 0.11 at the settings public decoders use, but neither they nor the Speex stand-in nor the room presets are validated against recordings ([LEGACY_CODECS.md](LEGACY_CODECS.md)).
 - **Network settings.** Set C used simulated loss on a listen server, where `net_fakeloss` hits both directions. How a given real-world or one-way loss rate maps to lost frames is not measured, so the app's control is the share of frames lost. The jitter rate is calibrated at one setting (`net_fakejitter 50` with `net_fakelag 100`) and scaled linearly. Set D ran on a LAN with no loss. Real internet loss was not recorded.
 
 ## Reproduce
