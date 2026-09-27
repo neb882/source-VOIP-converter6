@@ -1825,19 +1825,30 @@ function takeChannel(decoded, channel) {
   return decoded.getChannelData(channel === 'right' ? 1 : 0).slice();
 }
 
+// Where the gate model puts talk spurts, for track(): the current profile
+// and settings, as the render would use them.
+function takeTrackOptions() {
+  const o = renderOptions(), profile = CODEC_PROFILES[o.codec] || CODEC_PROFILES.steam;
+  const on = o.enableWarble !== false && (o.gate == null ? !!profile.senderGate : o.gate);
+  if (!on) return {};
+  const spec = profile.senderGate || { thresholdDb: -39.5, prerollMs: 120, holdMs: 440 };
+  return { gate: { thresholdDb: Number.isFinite(o.gateThresholdDb) ? o.gateThresholdDb : spec.thresholdDb,
+    prerollMs: spec.prerollMs, holdMs: spec.holdMs }, micGain: o.micGain };
+}
+
 // The search and the warp, in a worker when there is one. The aligned take
 // keeps the take's sample rate and runs the length of the source.
 function locateTake(take, takeRate, source, sourceRate, onProgress) {
-  const length = Math.round(source.length / sourceRate * takeRate);
+  const length = Math.round(source.length / sourceRate * takeRate), options = takeTrackOptions();
   if (canUseWorker()) {
     const t = take.slice(), s = source.slice();
-    return startWorker({ type: 'locate', take: t.buffer, takeRate, source: s.buffer, sourceRate, length }, [t.buffer, s.buffer], onProgress)
+    return startWorker({ type: 'locate', take: t.buffer, takeRate, source: s.buffer, sourceRate, length, options }, [t.buffer, s.buffer], onProgress)
       .promise.then(reply => ({ timeline: reply.timeline, aligned: new Float32Array(reply.aligned) }));
   }
   return new Promise((resolve, reject) => setTimeout(() => {
     try {
-      const timeline = TF2Reference.locate(take, takeRate, source, sourceRate);
-      resolve({ timeline, aligned: TF2Reference.warp(take, takeRate, timeline, takeRate, length) });
+      const timeline = TF2Reference.track(take, takeRate, source, sourceRate, options);
+      resolve({ timeline, aligned: TF2Reference.warpSegments(take, takeRate, timeline.segments, takeRate, length) });
     } catch (error) { reject(error); }
   }, 0));
 }
@@ -1877,9 +1888,7 @@ async function alignReferenceTake(job = ++referenceJob) {
       (value) => { if (job === referenceJob) setReferenceStatus(`Finding the source in ${name}… ${Math.round(value * 100)}%`); });
     if (job !== referenceJob) return;
     clearReferenceTake(false);
-    const sourceSeconds = source.length / sourceRate;
-    const overlap = { t0: Math.max(0, timeline.offsetSeconds),
-      t1: Math.min(sourceSeconds, timeline.offsetSeconds + timeline.scale * take.length / rate) };
+    const overlap = timeline.overlap;
     const blob = URL.createObjectURL(TF2Audio.encodeWav(aligned, rate));
     state.realTake = { name, samples: aligned, rate, timeline, overlap, blob };
     if (els.audioReal) {
@@ -1891,19 +1900,35 @@ async function alignReferenceTake(job = ++referenceJob) {
       if (!els.audio.paused) els.audioReal.play().catch(() => {});
     }
     if (els.referenceClear) els.referenceClear.hidden = false;
-    const t = timeline, fmt = (s) => formatTime(Math.abs(s), 3);
-    const where = t.offsetSeconds >= 0 ? `the take starts ${fmt(t.offsetSeconds)} into the source`
-      : `the source starts ${fmt(-t.offsetSeconds / t.scale)} into the take`;
-    const ppm = (t.scale - 1) * 1e6;
-    setReferenceStatus(`${name}: ${where}, clock ${ppm >= 0 ? '+' : '−'}${Math.abs(ppm).toFixed(0)} ppm, correlation ${t.correlation.toFixed(2)}`
-      + `${t.polarity < 0 ? ', polarity inverted' : ''}. It plays as the third A/B version (B cycles wet, dry, real).`, 'reference-good');
-    logLine(`Reference: aligned "${name}" (offset ${(t.offsetSeconds * 1000).toFixed(2)} ms, clock ${ppm.toFixed(1)} ppm, ${t.windows} windows, r ${t.correlation.toFixed(3)})`, 'sys');
+    setReferenceStatus(`${name}: ${describeTiming(timeline)} It plays as the third A/B version (B cycles wet, dry, real).`, 'reference-good');
+    const first = timeline.segments[0];
+    logLine(`Reference: aligned "${name}" in ${timeline.segments.length} segment${timeline.segments.length === 1 ? '' : 's'} `
+      + `(delay ${first.delayMs.toFixed(1)} ms first, clock ${first.clockPpm.toFixed(1)} ppm, ${timeline.points} windows, r ${timeline.correlation.toFixed(3)})`, 'sys');
     updateReferenceReport();
     updateMeter();
     refreshVisualizer();
   } catch (error) {
     if (job === referenceJob) setReferenceStatus(`Could not align ${name}: ${error.message}`, 'reference-bad');
   }
+}
+
+// The take's timing against the source, in words: TF2's receiver re-times
+// talk spurts and trims latency in 256-sample (5.8 ms) skips.
+function describeTiming(timeline) {
+  const segs = timeline.segments;
+  // Delay: take time minus source time (negative when the take starts
+  // after the source does).
+  const fmt = (ms) => `${ms < 0 ? '−' : '+'}${(Math.abs(ms) / 1000).toFixed(3)} s`;
+  const delays = segs.map(g => g.delayMs);
+  const steps = delays.slice(1).map((d, i) => d - delays[i]);
+  const trims = steps.filter(d => Math.abs(Math.abs(d) - 1000 * 256 / 44100) < 0.8).length;
+  const clock = segs[0].clockPpm;
+  const spurts = timeline.spurts || 1;
+  let text = segs.length === 1 ? `delay ${fmt(delays[0])} (take minus source)`
+    : `${spurts} talk spurt${spurts === 1 ? '' : 's'} in ${segs.length} segments, delay ${fmt(Math.min(...delays))} to ${fmt(Math.max(...delays))}`
+      + ` (take minus source; ${trims} 5.8 ms latency trim${trims === 1 ? '' : 's'}, ${steps.length - trims} other re-timing${steps.length - trims === 1 ? '' : 's'})`;
+  text += `, clock ${clock >= 0 ? '+' : '−'}${Math.abs(clock).toFixed(0)} ppm, correlation ${timeline.correlation.toFixed(2)}${timeline.polarity < 0 ? ', polarity inverted' : ''}.`;
+  return text;
 }
 
 // Remove the aligned take (and, unless keepFile, forget the decoded file).

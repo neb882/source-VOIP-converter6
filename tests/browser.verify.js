@@ -347,12 +347,13 @@ async function verifyAverageAndRealTake(page) {
   await page.locator('#reference summary').click();
   await page.locator('#reference-file').setInputFiles({ name: 'take.wav', mimeType: 'audio/wav', buffer: Buffer.from(wav) });
   await page.waitForFunction(() => document.querySelector('#reference-report table'), null, { timeout: 60000 });
-  const take = await page.evaluate(() => ({ offset: state.realTake.timeline.offsetSeconds, scale: state.realTake.timeline.scale,
+  const take = await page.evaluate(() => ({ segments: state.realTake.timeline.segments.length,
+    delay: state.realTake.timeline.segments[0].a, ppm: state.realTake.timeline.segments[0].clockPpm,
     status: document.getElementById('reference-status').textContent,
     bands: [...document.querySelectorAll('#reference-report tbody td')].map(td => td.textContent),
     rows: [...document.querySelectorAll('#meter-rows tr th')].map(th => th.textContent) }));
-  check(Math.abs(take.offset + .4321 * 1.0001) < .001 && Math.abs(take.scale - 1.0001) < 10e-6,
-    'a real take is found in the source and lined up (offset and clock)', `${(take.offset * 1000).toFixed(2)} ms, ${((take.scale - 1) * 1e6).toFixed(1)} ppm`);
+  check(take.segments === 1 && Math.abs(take.delay - .4321) < .001 && Math.abs(take.ppm - 100) < 10,
+    'a real take is found in the source and lined up (delay and clock)', `${take.segments} segment, ${(take.delay * 1000).toFixed(2)} ms, ${take.ppm.toFixed(1)} ppm; ${take.status}`);
   const within = take.bands.slice(0, 13).map(t => Math.abs(Number(t.replace('−', '-'))));
   check(within.every(d => d <= .3), 'the report finds the take and the render alike, band by band up to 12 kHz', take.bands.join(' '));
   check(take.rows.includes('REAL') && take.rows.includes('Δ real'), 'the meter adds the real take and wet minus real');

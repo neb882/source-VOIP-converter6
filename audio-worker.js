@@ -46,13 +46,14 @@ async function analyzeMessage(message) {
   self.postMessage({ type: 'analyzed', id: message.id, stats });
 }
 
-// A real take of the source: where the source is in it, and the take on the
-// source's timeline at the take's rate (reference.js).
+// A real take of the source: where the source is in it, talk spurt by talk
+// spurt, and the take on the source's timeline at the take's rate
+// (reference.js).
 async function locateMessage(message) {
   const take = new Float32Array(message.take), source = new Float32Array(message.source);
-  const timeline = TF2Reference.locate(take, message.takeRate, source, message.sourceRate,
+  const timeline = TF2Reference.track(take, message.takeRate, source, message.sourceRate, message.options || {},
     (value) => self.postMessage({ type: 'progress', id: message.id, value }));
-  const aligned = TF2Reference.warp(take, message.takeRate, timeline, message.takeRate, message.length);
+  const aligned = TF2Reference.warpSegments(take, message.takeRate, timeline.segments, message.takeRate, message.length);
   self.postMessage({ type: 'located', id: message.id, timeline, aligned: aligned.buffer }, [aligned.buffer]);
 }
 

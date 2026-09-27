@@ -13,6 +13,10 @@
  *        where source time = offsetSeconds + scale * take time
  *   TF2Reference.warp(take, takeRate, timeline, outRate, length)
  *     -> the take on the source's timeline (zero where it has no audio)
+ *   TF2Reference.track(take, takeRate, source, sourceRate, { gate, micGain })
+ *     -> { segments: [{ start, end, a, b, delayMs, clockPpm }], overlap, ... }
+ *        talk spurt by talk spurt: take time = a + b * source time
+ *   TF2Reference.warpSegments(take, takeRate, segments, outRate, length)
  *   TF2Reference.compareTake(real, sim, rate) -> { bands, levelTracking, clip }
  */
 (function () {
@@ -387,6 +391,321 @@
       coarseCorrelation: timeline.medianAbsoluteCorrelation };
   }
 
+  // Where Steam's gate would send: 20 ms frames above the threshold (RMS,
+  // dBFS, after the capture gain) with the pre-roll before and the hold
+  // after. Returns talk spurts as { start, end } in seconds.
+  function gateSpurts(samples, rate, gate, gain = 1) {
+    const frame = Math.round(rate / 50), frames = Math.ceil(samples.length / frame);
+    const threshold = 10 ** (gate.thresholdDb / 20) / Math.max(1e-9, gain);
+    const preroll = Math.round(gate.prerollMs / 20), hold = Math.round(gate.holdMs / 20);
+    const sent = new Uint8Array(frames);
+    for (let f = 0; f < frames; f++) {
+      let e = 0;
+      const end = Math.min(samples.length, (f + 1) * frame);
+      for (let i = f * frame; i < end; i++) e += samples[i] * samples[i];
+      if (Math.sqrt(e / frame) > threshold) sent.fill(1, Math.max(0, f - preroll), Math.min(frames, f + hold + 1));
+    }
+    const spurts = [];
+    for (let f = 0; f < frames; f++) {
+      if (!sent[f]) continue;
+      const start = f;
+      while (f < frames && sent[f]) f++;
+      spurts.push({ start: start * frame / rate, end: Math.min(samples.length, f * frame) / rate });
+    }
+    return spurts;
+  }
+
+  // Level envelope in dB, 5 ms steps, over what the voice path passes
+  // (150 Hz-10 kHz): below that Opus's voice high-pass removes content the
+  // source still has (a sweep's first seconds), and tones of any frequency
+  // in the band count.
+  function envelope(samples, rate, step = .005) {
+    const audio = typeof TF2Audio !== 'undefined' ? TF2Audio : null;
+    let x = samples;
+    if (audio) {
+      x = audio.applyBiquad(x, audio.biquadCoefs('highpass', rate, 150, .707));
+      if (rate > 22000) x = audio.applyBiquad(audio.applyBiquad(x, audio.biquadCoefs('lowpass', rate, 10000, .707)), audio.biquadCoefs('lowpass', rate, 10000, .707));
+    }
+    const n = Math.round(rate * step), count = Math.floor(x.length / n), out = new Float32Array(count);
+    for (let k = 0; k < count; k++) {
+      let e = 0;
+      for (let i = k * n; i < (k + 1) * n; i++) e += x[i] * x[i];
+      out[k] = Math.max(-100, 10 * Math.log10(e / n + 1e-20));
+    }
+    return out;
+  }
+
+  // Talk spurt by talk spurt. TF2's receiver re-times every talk spurt, so
+  // the delay can change by hundreds of ms from one to the next, and within
+  // a spurt it trims buffered latency in 256-sample (5.8 ms) skips
+  // (tests/REFERENCE_2026.md, findings 10 and 15). One offset and clock
+  // ratio cannot follow that.
+  //
+  // track() takes the talk spurts from the gate model (options.gate, as the
+  // render's profile and settings have it; 98.7% of frames agree with
+  // Steam's) or, without a gate, treats the source as one spurt. Each spurt
+  // is placed by its broadband level envelope, which even a pure tone's
+  // onset pins down, within +-0.6 s of the running delay. Inside a spurt,
+  // 1 s windows refine the delay at 8 kHz and split it where it steps (the
+  // trims); periodic windows, where a waveform lag is ambiguous, keep the
+  // envelope's. One clock ratio serves the whole take (the recorder's
+  // clock against the game's is steady; finding 15); each segment gets its
+  // own offset. Segments map source time t to take time a + b * t.
+  function track(take, takeRate, source, sourceRate, options = {}, onProgress) {
+    if (typeof options === 'function') { onProgress = options; options = {}; }
+    const report = (v) => { if (onProgress) onProgress(v); };
+    const coarse = locate(take, takeRate, source, sourceRate, (v) => report(v * .3));
+    const sourceSeconds = source.length / sourceRate, takeSeconds = take.length / takeRate;
+    const spurts = (options.gate ? gateSpurts(source, sourceRate, options.gate, options.micGain) : [{ start: 0, end: sourceSeconds }])
+      .filter(s => s.end - s.start >= .1);
+    if (!spurts.length) throw new Error('The source has nothing loud enough for the voice gate to send.');
+    const step = .005, es = envelope(source, sourceRate, step), et = envelope(take, takeRate, step);
+    const lo = 2000, s2 = narrow(source, sourceRate, lo), t2 = narrow(take, takeRate, lo);
+    const hi = 8000, s8 = narrow(source, sourceRate, hi), t8 = narrow(take, takeRate, hi);
+    const b0 = 1 / coarse.scale;   // take seconds per source second
+    const reach = Math.round(.6 / step);
+    const segments = [];
+    let delay = coarse.offsetSeconds * -b0;   // take time minus b0 * source time
+    // Normalized correlation of the source envelope over [from, to) with
+    // the take's, shifted by `lag` bins from the running mapping.
+    // Each envelope is floored 30 dB below its own loud level (90th
+    // percentile), so digital silence in the source and game ambience in
+    // the take read alike.
+    const floored = (e, from, to) => {
+      const top = percentile(Array.from(e.subarray(Math.max(0, from), Math.min(e.length, to))), .9);
+      return (v) => Math.max(v, top - 30);
+    };
+    const envMatch = (from, to, base) => {
+      const n = to - from;
+      const fs = floored(es, from, to), ft = floored(et, base + from - reach, base + to + reach);
+      let mean = 0;
+      for (let k = from; k < to; k++) mean += fs(es[k]) / n;
+      let best = { lag: 0, value: -2 };
+      const values = new Float64Array(2 * reach + 1);
+      for (let lag = -reach; lag <= reach; lag++) {
+        let sxy = 0, sxx = 0, syy = 0, my = 0, m = 0;
+        for (let k = from; k < to; k++) { const j = base + k + lag; if (j >= 0 && j < et.length) { my += ft(et[j]); m++; } }
+        if (m < n * .8) { values[lag + reach] = -2; continue; }
+        my /= m;
+        for (let k = from; k < to; k++) {
+          const j = base + k + lag;
+          if (j < 0 || j >= et.length) continue;
+          const x = fs(es[k]) - mean, y = ft(et[j]) - my;
+          sxy += x * y; sxx += x * x; syy += y * y;
+        }
+        const r = sxx > 0 && syy > 0 ? sxy / Math.sqrt(sxx * syy) : -2;
+        values[lag + reach] = r;
+        if (r > best.value) best = { lag, value: r };
+      }
+      const i = best.lag + reach;
+      let fraction = 0;
+      if (i > 0 && i < values.length - 1 && values[i - 1] > -2 && values[i + 1] > -2) {
+        const d = values[i - 1] - 2 * values[i] + values[i + 1];
+        if (d < 0) fraction = .5 * (values[i - 1] - values[i + 1]) / d;
+      }
+      return { lag: (best.lag + fraction) * step, value: best.value };
+    };
+    // Waveform lag at 8 kHz of the source over [t0, t1) against the take at
+    // a + b0 * t, within +-L samples; null when periodic or weak.
+    const waveMatch = (t0, t1, a, L = 120) => {
+      const a8 = Math.round(t0 * hi), n8 = Math.round((t1 - t0) * hi), b8 = Math.round((a + b0 * t0) * hi);
+      if (a8 < 0 || a8 + n8 > s8.length || b8 - L < 0 || b8 + n8 + L > t8.length || n8 < hi / 10) return null;
+      let es8 = 0, periodic = 0;
+      for (let i = 0; i < n8; i++) es8 += s8[a8 + i] ** 2;
+      if (!(es8 > 0)) return null;
+      for (let lag = 16; lag <= 400; lag += 4) {
+        let sum = 0;
+        for (let i = 0; i + lag < n8; i += 2) sum += s8[a8 + i] * s8[a8 + i + lag];
+        periodic = Math.max(periodic, 2 * sum / es8);
+      }
+      if (periodic > .9) return null;
+      const values = new Float64Array(2 * L + 1);
+      let best = L, et8 = 0;
+      for (let i = 0; i < n8; i++) et8 += t8[b8 + i] ** 2;
+      const norm = Math.sqrt(es8 * et8) || 1;
+      for (let lag = -L; lag <= L; lag++) {
+        let sum = 0;
+        for (let i = 0; i < n8; i++) sum += s8[a8 + i] * t8[b8 + i + lag];
+        values[lag + L] = sum / norm;
+        if (Math.abs(values[lag + L]) > Math.abs(values[best])) best = lag + L;
+      }
+      if (Math.abs(values[best]) < .5) return null;
+      let fraction = 0;
+      if (best > 0 && best < values.length - 1) {
+        const p = Math.abs(values[best - 1]), q = Math.abs(values[best]), r = Math.abs(values[best + 1]), d = p - 2 * q + r;
+        if (d < 0) fraction = .5 * (p - r) / d;
+      }
+      return { lag: (best - L + fraction) / hi, weight: Math.abs(values[best]), sign: Math.sign(values[best]) };
+    };
+    // Normalized correlation at 8 kHz of the source over [t0, t1) with the
+    // take at exactly a + b0 * t (to the nearest 8 kHz sample).
+    const waveAt = (t0, t1, a) => {
+      const a8 = Math.round(t0 * hi), n8 = Math.round((t1 - t0) * hi), b8 = Math.round((a + b0 * t0) * hi);
+      if (a8 < 0 || a8 + n8 > s8.length || b8 < 0 || b8 + n8 > t8.length) return 0;
+      let sxy = 0, sxx = 0, syy = 0;
+      for (let i = 0; i < n8; i++) { sxy += s8[a8 + i] * t8[b8 + i]; sxx += s8[a8 + i] ** 2; syy += t8[b8 + i] ** 2; }
+      return sxx > 0 && syy > 0 ? Math.abs(sxy) / Math.sqrt(sxx * syy) : 0;
+    };
+    // A spurt's delay from its waveform: 1 s windows (up to twelve) at
+    // 2 kHz, searched +-0.6 s around `guess`; the median of two or more
+    // that agree within 2 ms, else null (tones, sweeps' onsets).
+    const coarseWave = (spurt, guess) => {
+      const W = Math.round(Math.min(1, spurt.end - spurt.start) * lo), R = Math.round(.6 * lo), found = [];
+      for (let t0 = spurt.start, k = 0; t0 + W / lo <= spurt.end + 1e-9 && k < 12; t0 += W / lo / 2, k++) {
+        const start = Math.round(t0 * lo), template = s2.subarray(start, start + W);
+        if (template.length < W || W < 100) break;
+        let e = 0, periodic = 0;
+        for (const v of template) e += v * v;
+        if (!(e > 0)) continue;
+        for (let lag = 8; lag <= 100; lag += 2) {
+          let sum = 0;
+          for (let i = 0; i + lag < W; i++) sum += template[i] * template[i + lag];
+          periodic = Math.max(periodic, sum / e);
+        }
+        if (periodic > .9) continue;
+        const predicted = Math.round((guess + b0 * t0) * lo);
+        const from = Math.max(0, predicted - R), to = Math.min(t2.length, predicted + W + R);
+        if (to - from < W + 2) continue;
+        const m = createMatcher(t2.subarray(from, to), W)(template);
+        if (m.sample !== null && Math.abs(m.correlation) >= .5) found.push((from + m.sample) / lo - b0 * t0);
+      }
+      for (const d of found) {
+        const agree = found.filter(x => Math.abs(x - d) <= 2e-3);
+        if (agree.length >= 2) return percentile(agree, .5);
+      }
+      return null;
+    };
+    let signs = 0;
+    spurts.forEach((spurt, index) => {
+      report(.3 + .6 * index / spurts.length);
+      // The spurt's envelope, with 100 ms of the silence before it, placed
+      // within +-0.6 s of the running delay.
+      const from = Math.max(0, Math.round((spurt.start - .1) / step)), to = Math.min(es.length, Math.round(Math.min(spurt.end, spurt.start + 8) / step));
+      if (to - from < 20) return;
+      const base = Math.round(delay / step + (b0 - 1) * from);
+      const env = envMatch(from, to, base);
+      const wave = coarseWave(spurt, delay);
+      if (wave === null && env.value < .5) return;
+      let a = wave !== null ? wave : delay + env.lag;
+      // Inside the spurt: 1 s windows every 0.5 s refine the delay.
+      const points = [];
+      const span = spurt.end - spurt.start, win = Math.min(1, span), hop = win / 2;
+      for (let t0 = spurt.start; t0 + win <= spurt.end + 1e-9; t0 += hop) {
+        const m = waveMatch(t0, t0 + win, a);
+        if (m) { points.push({ t: t0 + win / 2, tau: a + b0 * (t0 + win / 2) + m.lag, weight: m.weight }); signs += m.sign; }
+      }
+      // Group the points where the delay steps by more than 2 ms: two points
+      // must agree on the new delay, and the waveform must fit it clearly
+      // better than the old one (periodic music can offer a second peak).
+      // A spurt without usable windows keeps the envelope's delay.
+      const d = (p) => p.tau - b0 * p.t;
+      const groups = [];
+      let current = [];
+      points.forEach((p, k) => {
+        if (!current.length || Math.abs(d(p) - d(current[current.length - 1])) <= 2e-3) { current.push(p); return; }
+        const next = points[k + 1];
+        if (next && Math.abs(d(next) - d(p)) <= 2e-3) {
+          const old = d(current[current.length - 1]), neu = (d(p) + d(next)) / 2;
+          const cOld = (waveAt(p.t - win / 2, p.t + win / 2, old) + waveAt(next.t - win / 2, next.t + win / 2, old)) / 2;
+          const cNew = (waveAt(p.t - win / 2, p.t + win / 2, neu) + waveAt(next.t - win / 2, next.t + win / 2, neu)) / 2;
+          if (cNew >= cOld + .1) { groups.push(current); current = [p]; }
+        }
+      });
+      if (current.length) groups.push(current);
+      if (!groups.length) groups.push([]);
+      groups.forEach((list, g) => segments.push({ spurt: index, points: list,
+        a: list.length ? percentile(list.map(d), .5) : a,
+        first: list.length ? list[0].t : spurt.start, last: list.length ? list[list.length - 1].t : spurt.end,
+        spurtStart: spurt.start, spurtEnd: spurt.end, envelope: env.value }));
+      const lastGroup = groups[groups.length - 1];
+      delay = lastGroup.length ? percentile(lastGroup.map(d), .5) : a;
+    });
+    if (!segments.length) throw new Error('The take does not line up with the source closely enough to compare.');
+    // One clock ratio for the whole take from the spread inside segments
+    // (fall back to locate()'s), then each segment's offset; points far off
+    // the fit (by the median absolute deviation) are dropped first.
+    const measured = segments.filter(s => s.points.length);
+    let num = 0, den = 0;
+    for (const s of measured) {
+      const mt = s.points.reduce((x, p) => x + p.t, 0) / s.points.length, mtau = s.points.reduce((x, p) => x + p.tau, 0) / s.points.length;
+      for (const p of s.points) { num += (p.t - mt) * (p.tau - mtau); den += (p.t - mt) ** 2; }
+    }
+    const b = den > 16 ? num / den : b0;
+    const residuals = measured.flatMap(s => s.points.map(p => Math.abs(p.tau - b * p.t - percentile(s.points.map(q => q.tau - b * q.t), .5))));
+    const limit = Math.max(5e-5, 4 * 1.4826 * (percentile(residuals, .5) || 0));
+    for (const s of segments) {
+      const kept = s.points.filter(p => Math.abs(p.tau - b * p.t - percentile(s.points.map(q => q.tau - b * q.t), .5)) <= limit);
+      if (kept.length) s.a = percentile(kept.map(p => p.tau - b * p.t), .5);
+      else if (!s.points.length) s.a += (b0 - b) * (s.spurtStart + s.spurtEnd) / 2;
+      s.pointCount = kept.length;
+    }
+    // Breaks: at the silence before each spurt (midway through the gap), and
+    // inside a spurt where the next group starts to fit better (10 ms blocks).
+    const block = Math.round(.01 * hi);
+    const misfit = (s, i) => {
+      const j = Math.round((s.a + b * i / hi) * hi);
+      let e = 0;
+      for (let n = 0; n < block; n++) e += (s8[i + n] - (j + n >= 0 && j + n < t8.length ? t8[j + n] : 0)) ** 2;
+      return e;
+    };
+    for (let g = 0; g + 1 < segments.length; g++) {
+      const A = segments[g], B = segments[g + 1];
+      if (A.spurt !== B.spurt) { A.end = B.start = (A.spurtEnd + B.spurtStart) / 2; continue; }
+      const from = Math.round(A.last * hi), to = Math.round(B.first * hi);
+      let bestAt = Math.round((A.last + B.first) / 2 * hi), bestCost = Infinity;
+      if (to - from > 2 * block) {
+        const blocks = Math.floor((to - from) / block), eA = [], eB = [];
+        for (let k = 0; k < blocks; k++) { eA.push(misfit(A, from + k * block)); eB.push(misfit(B, from + k * block)); }
+        let prefix = 0, suffix = eB.reduce((x, v) => x + v, 0);
+        for (let k = 0; k <= blocks; k++) {
+          if (prefix + suffix < bestCost) { bestCost = prefix + suffix; bestAt = from + k * block; }
+          if (k < blocks) { prefix += eA[k]; suffix -= eB[k]; }
+        }
+      }
+      A.end = B.start = bestAt / hi;
+    }
+    segments[0].start = 0;
+    segments[segments.length - 1].end = sourceSeconds;
+    // No segment reaches past the take's own audio.
+    for (const s of segments) { s.start = Math.max(s.start, -s.a / b); s.end = Math.min(s.end, (takeSeconds - s.a) / b); }
+    const live = segments.filter(s => s.end > s.start);
+    report(1);
+    const weights = measured.flatMap(s => s.points.map(p => p.weight));
+    return {
+      // Delay (take time minus source time) at each segment's middle.
+      segments: live.map(s => ({ a: s.a, b, start: s.start, end: s.end, spurt: s.spurt, points: s.pointCount,
+        delayMs: (s.a + (b - 1) * (s.start + s.end) / 2) * 1000, clockPpm: (1 / b - 1) * 1e6 })),
+      spurts: spurts.length, coarse, points: weights.length,
+      overlap: { t0: live[0].start, t1: live[live.length - 1].end },
+      correlation: weights.length ? weights.reduce((x, w) => x + w, 0) / weights.length : coarse.correlation,
+      polarity: signs < 0 ? -1 : 1
+    };
+  }
+
+  // The take on the source's timeline, segment by segment (track()). Zero
+  // outside the segments.
+  function warpSegments(take, takeRate, segments, outRate, length) {
+    const out = new Float32Array(length);
+    for (const seg of segments) {
+      const step = seg.b * takeRate / outRate;
+      const { half, phases, kernels } = timelineKernels(.49 / Math.max(1, step));
+      const i0 = Math.max(0, Math.ceil(seg.start * outRate)), i1 = Math.min(length, Math.ceil(seg.end * outRate));
+      for (let i = i0; i < i1; i++) {
+        const position = (seg.a + seg.b * i / outRate) * takeRate, base = Math.floor(position), fraction = position - base;
+        if (base + half < 0 || base - half + 1 >= take.length) continue;
+        const phase = fraction * phases, lower = Math.floor(phase), blend = phase - lower;
+        const ka = kernels[lower], kb = kernels[lower + 1];
+        let value = 0;
+        for (let k = 0; k < ka.length; k++) {
+          const j = base - half + 1 + k;
+          if (j >= 0 && j < take.length) value += take[j] * (ka[k] + (kb[k] - ka[k]) * blend);
+        }
+        out[i] = value;
+      }
+    }
+    return out;
+  }
+
   // The simulation against the aligned take, both at `rate` and equally long.
   // Band spectra are level-matched at 300 Hz-3 kHz; sim minus real per band.
   function compareTake(real, sim, rate) {
@@ -403,7 +722,7 @@
   }
 
   const TF2Reference = { fft, findMatch, createMatcher, percentile, consistentTimeline, BAND_EDGES, spectrum, rmsDb,
-    describePair, clipSignature, levelTracking, sampleTimeline, warp, narrow, locate, compareTake };
+    describePair, clipSignature, levelTracking, sampleTimeline, warp, narrow, locate, gateSpurts, track, warpSegments, compareTake };
   if (typeof window !== 'undefined') window.TF2Reference = TF2Reference;
   else if (typeof self !== 'undefined') self.TF2Reference = TF2Reference;
   if (typeof module !== 'undefined' && module.exports) module.exports = TF2Reference;
