@@ -61,7 +61,7 @@ h2 {
 
 /* Source row */
 .upload-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-.source-status { flex-basis: 100%; color: #aeb8c2; font-size: 12px; line-height: 1.4; }
+.source-status { flex-basis: 100%; color: #aeb8c2; font-size: 12px; line-height: 1.4; text-wrap: pretty; }
 .source-status.error { color: #ff7777; }
 .source-status.success { color: #9ae66e; }
 progress { flex-basis: 100%; width: 100%; height: 8px; accent-color: var(--lime); }
