@@ -347,12 +347,13 @@ async function verifyAverageAndRealTake(page) {
   await page.locator('#reference summary').click();
   await page.locator('#reference-file').setInputFiles({ name: 'take.wav', mimeType: 'audio/wav', buffer: Buffer.from(wav) });
   await page.waitForFunction(() => document.querySelector('#reference-report table'), null, { timeout: 60000 });
-  const take = await page.evaluate(() => ({ offset: state.realTake.timeline.offsetSeconds, scale: state.realTake.timeline.scale,
+  const take = await page.evaluate(() => ({ segments: state.realTake.timeline.segments.length,
+    delay: state.realTake.timeline.segments[0].a, ppm: state.realTake.timeline.segments[0].clockPpm,
     status: document.getElementById('reference-status').textContent,
     bands: [...document.querySelectorAll('#reference-report tbody td')].map(td => td.textContent),
     rows: [...document.querySelectorAll('#meter-rows tr th')].map(th => th.textContent) }));
-  check(Math.abs(take.offset + .4321 * 1.0001) < .001 && Math.abs(take.scale - 1.0001) < 10e-6,
-    'a real take is found in the source and lined up (offset and clock)', `${(take.offset * 1000).toFixed(2)} ms, ${((take.scale - 1) * 1e6).toFixed(1)} ppm`);
+  check(take.segments === 1 && Math.abs(take.delay - .4321) < .001 && Math.abs(take.ppm - 100) < 10,
+    'a real take is found in the source and lined up (delay and clock)', `${take.segments} segment, ${(take.delay * 1000).toFixed(2)} ms, ${take.ppm.toFixed(1)} ppm; ${take.status}`);
   const within = take.bands.slice(0, 13).map(t => Math.abs(Number(t.replace('−', '-'))));
   check(within.every(d => d <= .3), 'the report finds the take and the render alike, band by band up to 12 kHz', take.bands.join(' '));
   check(take.rows.includes('REAL') && take.rows.includes('Δ real'), 'the meter adds the real take and wet minus real');
@@ -370,6 +371,40 @@ async function verifyAverageAndRealTake(page) {
   await page.locator('#viz-wave').click();
 }
 
+// Video in and out: the audio of an MP4 or MOV is the source, and the render
+// goes back into the video, which is copied sample for sample.
+async function verifyVideo(page) {
+  console.log('\n[Browser 3g] Video in and out');
+  const TF2Video = require('../video.js');
+  for (const name of ['vp9_opus.mp4', 'h264_pcm.mov']) {
+    const file = path.join(__dirname, 'video', name);
+    await page.locator('#file').setInputFiles(file);
+    await page.waitForFunction((n) => state.sourceName === n && !document.getElementById('process').disabled
+      && !document.getElementById('download-video').hidden, name);
+    const shown = await page.evaluate(() => ({ hidden: document.getElementById('download-video').hidden,
+      disabled: document.getElementById('download-video').disabled, label: document.getElementById('download-video').textContent }));
+    check(!shown.hidden && shown.disabled, `${name}: a video source offers the video download once rendered`, shown.label);
+    await page.locator('#process').click();
+    await page.waitForFunction(() => !document.getElementById('download-video').disabled, null, { timeout: 60000 });
+    const [download] = await Promise.all([page.waitForEvent('download'), page.locator('#download-video').click()]);
+    const bytes = new Uint8Array(fs.readFileSync(await download.path()));
+    const a = TF2Video.parse(new Uint8Array(fs.readFileSync(file))), b = TF2Video.parse(bytes);
+    const va = a.tracks.find(t => t.handler === 'vide'), vb = b.tracks.find(t => t.handler === 'vide');
+    const same = va.samples.length === vb.samples.length && va.samples.every((s, i) => {
+      const x = a.u8.subarray(s.offset, s.offset + s.size), y = b.u8.subarray(vb.samples[i].offset, vb.samples[i].offset + vb.samples[i].size);
+      return x.length === y.length && x.every((v, k) => v === y[k]);
+    });
+    const audio = b.tracks.filter(t => t.handler === 'soun');
+    const ext = name.endsWith('.mov') ? 'mov' : 'mp4';
+    check(same && audio.length === 1 && download.suggestedFilename().endsWith(`_tf2_steam.${ext}`),
+      `${name}: Download video keeps the picture byte for byte and carries the render`, `${download.suggestedFilename()}, audio ${audio[0] && audio[0].format}`);
+  }
+  // Loading plain audio hides it again.
+  await page.locator('#file').setInputFiles({ name: 'after-video.wav', mimeType: 'audio/wav', buffer: wavTone(.5) });
+  await page.waitForFunction(() => state.sourceName === 'after-video.wav');
+  check(await page.locator('#download-video').isHidden(), 'an audio source hides the video download');
+}
+
 async function verifyLiveMonitor(page) {
   console.log('\n[Browser 3f] Live monitor');
   await page.locator('#live-toggle').click();
@@ -381,6 +416,47 @@ async function verifyLiveMonitor(page) {
     'the live monitor runs the microphone through the Steam chain in real time', `${live.stats.sent} of ${live.stats.frames} frames sent, ${live.tx}`);
   const ms = Number(/^(\d+) ms/.exec(live.latency)?.[1]);
   check(ms >= 130 && ms < 600, 'the live monitor reports its latency, gate pre-roll included', live.latency);
+
+  // Low latency drops the 120 ms pre-roll from the chain.
+  await page.locator('#live-lowlat').check();
+  await page.waitForFunction(() => TF2Live.stats && TF2Live.stats.latencyMs < 20, null, { timeout: 15000 });
+  const lowMs = await page.evaluate(() => TF2Live.stats.latencyMs);
+  await page.locator('#live-lowlat').uncheck();
+  await page.waitForFunction(() => TF2Live.stats && TF2Live.stats.latencyMs > 120, null, { timeout: 15000 });
+  check(lowMs < 20, 'low-latency mode drops the gate pre-roll from the live chain', `${lowMs.toFixed(1)} ms chain delay`);
+
+  // Push-to-talk: nothing is sent until the key or the button is held.
+  await page.locator('#live-ptt').check();
+  await page.waitForFunction(() => TF2Live.stats && TF2Live.stats.talking === false, null, { timeout: 15000 });
+  await page.waitForTimeout(400);
+  const idle0 = await page.evaluate(() => TF2Live.stats.sent);
+  await page.waitForTimeout(800);
+  const idle1 = await page.evaluate(() => ({ sent: TF2Live.stats.sent, tx: document.getElementById('live-tx').textContent,
+    button: !document.getElementById('live-talk').hidden }));
+  await page.keyboard.down('v');
+  await page.waitForFunction((n) => TF2Live.stats.sent > n + 10, idle1.sent, { timeout: 15000 });
+  await page.keyboard.up('v');
+  check(idle1.sent === idle0 && idle1.button && /push-to-talk/.test(idle1.tx),
+    'push-to-talk sends nothing until V is held, then sends', `${idle1.sent - idle0} frames sent while released; ${idle1.tx}`);
+  await page.locator('#live-ptt').uncheck();
+
+  // Record: the microphone and the voice come into the app lined up.
+  await page.locator('#live-record').click();
+  await page.waitForTimeout(3000);
+  await page.locator('#live-record').click();
+  await page.waitForFunction(() => state.sourceName && state.sourceName.startsWith('live-') && state.processedBuffer, null, { timeout: 20000 });
+  const take = await page.evaluate(async () => {
+    const dry = state.decodedSource.getChannelData(0), wet = state.processedBuffer, rate = state.processedRate;
+    const render = (await TF2Audio.process(state.decodedSource, renderOptions())).samples;
+    let dot = 0, ea = 0, eb = 0;
+    for (let i = Math.round(rate * .4); i < Math.min(wet.length, render.length) - rate * .2; i++) { dot += render[i] * wet[i]; ea += render[i] ** 2; eb += wet[i] ** 2; }
+    return { seconds: dry.length / rate, same: dry.length === wet.length, r: ea > 0 && eb > 0 ? dot / Math.sqrt(ea * eb) : 0,
+      lane: !!(state.lastCodecInfo && state.lastCodecInfo.frameLog && state.lastCodecInfo.frameLog.some(c => c > 0)),
+      ab: !els.abToggle.disabled };
+  });
+  check(take.seconds > 2 && take.same && take.ab && take.lane,
+    'Record loads the live session into the app as a dry/wet pair with its codec lane', `${take.seconds.toFixed(1)} s`);
+  check(take.r > 0.8, 'the recorded voice lines up with an offline render of the recorded microphone', `r ${take.r.toFixed(3)}`);
   await page.locator('#live-toggle').click();
   await page.waitForFunction(() => !TF2Live.running);
   check(await page.locator('#live-toggle').getAttribute('aria-pressed') === 'false', 'the live monitor stops');
@@ -690,6 +766,7 @@ async function main() {
     check(parity.exact && parity.plc === 'opus' && parity.lost > 0, 'worker and main thread agree with native packet-loss concealment');
     await verifyAverageAndRealTake(page);
     await verifyLiveMonitor(page);
+    await verifyVideo(page);
 
     await page.locator('#file').setInputFiles({ name: 'long-tone.wav', mimeType: 'audio/wav', buffer: wavTone(20) });
     await page.waitForFunction(() => !document.getElementById('process').disabled);
@@ -751,10 +828,10 @@ async function main() {
     check(afterUpdate.keys.includes(SHELL_CACHE), 'current app shell cache is populated', SHELL_CACHE);
     check(await page.evaluate(async (name) => {
       const cache = await caches.open(name);
-      const needed = ['batch.js', 'formats.js', 'flac.js', 'zip.js', 'meter.js', 'reference.js', 'live.js', 'live-worker.js', 'live-worklet.js',
-        'vendor/lame/index.mjs', 'vendor/lame/lame-3.100.wasm.mjs'];
+      const needed = ['batch.js', 'formats.js', 'flac.js', 'zip.js', 'meter.js', 'reference.js', 'video.js', 'live.js', 'live-worker.js', 'live-worklet.js',
+        'vendor/lame/index.mjs', 'vendor/lame/lame-3.100.wasm.mjs', 'vendor/celt-0.11/index.mjs', 'vendor/celt-0.11/celt-0.11.wasm.mjs'];
       return (await Promise.all(needed.map(path => cache.match(new URL(path, location.href).href)))).every(Boolean);
-    }, SHELL_CACHE), 'batch, format, meter, reference, live-monitor and MP3 encoder files are cached for offline use');
+    }, SHELL_CACHE), 'batch, format, meter, reference, video, live-monitor, CELT and MP3 encoder files are cached for offline use');
     // Restore the normal registration while still online. Otherwise reloading
     // registers sw.js again and races another replacement against file loading.
     await activateServiceWorker(page, 'sw.js');

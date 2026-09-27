@@ -113,6 +113,48 @@ check('Level tracking rejects unequal lengths', true);
     near(at(short, 1.5), at(found, 4.5), 200e-6) && near(at(short, 0), at(found, 3), 500e-6) && near(at(short, 3), at(found, 6), 500e-6));
   assert.throws(() => TF2Reference.locate(Float32Array.from({ length: sr * 5 }, () => .1 * random()), sr, src, sr), /not found|line up/);
   check('Real take: unrelated audio is rejected', true);
+
+  // TF2's receiver re-times talk spurts and trims latency in 5.8 ms skips.
+  // A source with a 1.2 s pause (two talk spurts for the gate); in the take
+  // the second spurt comes 250 ms early, and 5.8 ms (256 samples at
+  // 44.1 kHz) are skipped inside it at 16 s. The take must come apart into
+  // those segments, breaks included, and line up.
+  const paused = src.map((v, i) => (i >= 6.4 * sr && i < 7.6 * sr ? 0 : v));
+  const simPaused = (await audio.process({ sampleRate: sr, length: paused.length, numberOfChannels: 1, getChannelData: () => paused }, { codec: 'steam' })).samples;
+  const skip = 256 / 44100;
+  const pieces = [{ a: -1, b: 1, start: 0, end: 7.75 }, { a: -.75, b: 1, start: 7.75, end: 16.75 }, { a: -.75 + skip, b: 1, start: 16.75, end: 20.75 }];
+  const spurts = TF2Reference.warpSegments(simPaused, sr, pieces, sr, Math.round(21 * sr)).map(v => .316 * v + 1e-4 * random());
+  const gate = { thresholdDb: -39.5, prerollMs: 120, holdMs: 440 };
+  const tracked = TF2Reference.track(spurts, sr, paused, sr, { gate });
+  const ownPaused = TF2Reference.locate(simPaused, sr, paused, sr);
+  const renderLead = -ownPaused.offsetSeconds * 1000;
+  const delays = tracked.segments.map(g => g.delayMs - renderLead);
+  check(`Real take, spurt by spurt: segments at 1000 / 750 / 744.2 ms (${delays.map(d => d.toFixed(2)).join(' / ')} ms, ${tracked.spurts} spurts)`,
+    tracked.segments.length === 3 && tracked.spurts === 2 && near(delays[0], 1000, .08) && near(delays[1], 750, .08) && near(delays[2], 750 - skip * 1000, .08));
+  const breaks = tracked.segments.slice(0, -1).map(g => g.end);
+  check(`Real take, spurt by spurt: breaks in the pause and at the trim (${breaks.map(b => b.toFixed(3)).join(', ')} s)`,
+    breaks.length === 2 && breaks[0] > 6.5 && breaks[0] < 7.5 && near(breaks[1], 16, .011));
+  // Against the construction: take time tau holds the render at
+  // piece.a + tau, which should be source time t less the render's own
+  // offset from its source.
+  let misaligned = 0;
+  for (const g of tracked.segments) {
+    for (let t = g.start + .05; t < g.end - .05; t += .1) {
+      if (t > 6.3 && t < 7.7) continue;   // the pause: silence either way
+      const tau = g.a + g.b * t, piece = pieces.find(p => tau >= p.start && tau < p.end);
+      if (!piece) continue;
+      const e = Math.abs(piece.a + tau - (t - ownPaused.offsetSeconds));
+      misaligned = Math.max(misaligned, e);
+    }
+  }
+  check(`Real take, spurt by spurt: every segment lines up to within ${(misaligned * 1e6).toFixed(0)} us`, misaligned < 150e-6);
+  // A steady tone gives no waveform lag; its spurt is placed by its onset.
+  const tone = Float32Array.from({ length: 6 * sr }, (_, i) => (i > sr && i < 5 * sr ? .1 * Math.sin(2 * Math.PI * 440 * i / sr) : 0));
+  const toneTake = new Float32Array(7 * sr);
+  toneTake.set(tone.map(v => .5 * v), Math.round(.8 * sr));
+  const toneTrack = TF2Reference.track(toneTake, sr, tone, sr, { gate });
+  check(`Real take, spurt by spurt: a pure tone is placed by its onset (${toneTrack.segments[0].delayMs.toFixed(1)} ms)`,
+    toneTrack.segments.length === 1 && near(toneTrack.segments[0].delayMs, 800, 3));
 }
 
 console.log(`\n${passed} paired-reference checks passed.`);

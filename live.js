@@ -5,7 +5,12 @@
  * over a MessageChannel, so audio never passes through this page. The chain
  * follows the settings panel while running, and the output can go to any
  * output device (a virtual cable makes it a live TF2 voice for other apps).
- * Needs script.js (state, els, renderOptions, logLine).
+ *
+ * Push-to-talk sends only while V or the Talk button is held (the gate still
+ * applies inside). Low latency drops the gate's 120 ms pre-roll. Record keeps
+ * the microphone and the voice and loads them into the app as a dry/wet
+ * pair (mountLiveTake).
+ * Needs the app/ page scripts (state, els, renderOptions, logLine, mountLiveTake).
  */
 (function () {
   'use strict';
@@ -14,11 +19,65 @@
   const ui = {
     toggle: $('live-toggle'), panel: $('live-panel'), input: $('live-input'), output: $('live-output'),
     tx: $('live-tx'), mode: $('live-mode'), rate: $('live-rate'), loss: $('live-loss'), latency: $('live-latency'),
-    inMeter: $('live-in'), outMeter: $('live-out'), note: $('live-note')
+    inMeter: $('live-in'), outMeter: $('live-out'), note: $('live-note'),
+    record: $('live-record'), ptt: $('live-ptt'), talk: $('live-talk'), lowLatency: $('live-lowlat')
   };
   if (!ui.toggle) return;
 
-  let live = null;   // { ctx, stream, source, node, worker, timer, lastOpts, stats }
+  let live = null;   // { ctx, stream, source, node, worker, timer, lastOpts, stats, talking, recording }
+  let keyHeld = false, buttonHeld = false;
+
+  // The render settings plus the live-only low-latency switch.
+  const liveOptions = () => ({ ...renderOptions(), lowLatency: !!(ui.lowLatency && ui.lowLatency.checked) });
+  const pttOn = () => !!(ui.ptt && ui.ptt.checked);
+
+  function updateTalk() {
+    const on = !pttOn() || keyHeld || buttonHeld;
+    if (ui.talk) { ui.talk.hidden = !pttOn(); ui.talk.classList.toggle('live-held', on && pttOn()); }
+    if (!live || live.talking === on) return;
+    live.talking = on;
+    live.worker.postMessage({ type: 'talk', on });
+  }
+
+  // Recording: the worker lines the microphone and the voice up and sends
+  // both when it stops (also when the monitor stops mid-recording).
+  function setRecordButton() {
+    if (!ui.record) return;
+    const rec = live && live.recording;
+    ui.record.disabled = !live || (live && live.saving);
+    ui.record.classList.toggle('live-recording', !!rec);
+    ui.record.textContent = live && live.saving ? 'Saving…' : rec
+      ? `⏹ Stop recording ${formatClock((performance.now() - rec.started) / 1000)}` : '⏺ Record';
+  }
+  const formatClock = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
+  function toggleRecording() {
+    if (!live || live.saving) return;
+    if (!live.recording) {
+      live.recording = { started: performance.now() };
+      live.worker.postMessage({ type: 'record', on: true });
+      logLine('voice_record: recording the live monitor.', 'sys');
+    } else {
+      live.recording = null;
+      live.saving = true;
+      live.worker.postMessage({ type: 'record', on: false });
+    }
+    setRecordButton();
+  }
+
+  function deliverRecording(message) {
+    if (live) { live.saving = false; live.recording = null; }
+    setRecordButton();
+    const dry = new Float32Array(message.dry);
+    if (dry.length < message.rate * 0.2) { ui.note.textContent = 'The recording was too short to keep.'; return; }
+    try {
+      mountLiveTake({ dry, wet: new Float32Array(message.wet), rate: message.rate, frameLog: new Uint8Array(message.frameLog),
+        counts: message.counts, info: message.info });
+      ui.note.textContent = `Loaded ${(dry.length / message.rate).toFixed(1)} s of the live session: A/B plays the voice against your microphone.`;
+    } catch (error) {
+      ui.note.textContent = `Could not load the recording: ${error.message}`;
+    }
+  }
 
   const dbfs = (peak) => (peak > 0 ? 20 * Math.log10(peak) : -Infinity);
   const setMeter = (el, peak) => {
@@ -49,8 +108,12 @@
     live = null;
     clearInterval(l.timer);
     try { l.node.port.postMessage({ type: 'stop' }); } catch (e) { /* closed */ }
+    // A recording in progress is finished and delivered before the worker goes.
+    const saving = !!(l.recording || l.saving);
+    try { if (l.recording) l.worker.postMessage({ type: 'record', on: false }); } catch (e) { /* closed */ }
     try { l.worker.postMessage({ type: 'stop' }); } catch (e) { /* closed */ }
-    setTimeout(() => l.worker.terminate(), 500);
+    setTimeout(() => l.worker.terminate(), saving ? 5000 : 500);
+    setRecordButton();
     l.stream.getTracks().forEach(t => t.stop());
     l.source.disconnect();
     l.node.disconnect();
@@ -83,7 +146,7 @@
       ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
       if (ui.output && ui.output.value && ctx.setSinkId) await ctx.setSinkId(ui.output.value);
       await ctx.audioWorklet.addModule('live-worklet.js');
-      const opts = renderOptions();
+      const opts = liveOptions();
       const node = new AudioWorkletNode(ctx, 'tf2-live-monitor', {
         numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1], channelCount: 2, channelCountMode: 'explicit',
         processorOptions: { block: Math.round(ctx.sampleRate / 50), channel: opts.captureChannel, prebuffer: Math.round(ctx.sampleRate * 0.04) } });
@@ -96,14 +159,20 @@
       node.connect(ctx.destination);
       if (els.audio && !els.audio.paused) els.audio.pause();
       live = { ctx, stream, source, node, worker, lastOpts: JSON.stringify(opts), channel: opts.captureChannel,
-        stats: null, worklet: null, lastBytes: 0, lastTime: performance.now() };
-      worker.onmessage = (event) => onWorker(event.data || {});
+        stats: null, worklet: null, lastBytes: 0, lastTime: performance.now(), talking: true, recording: null, saving: false };
+      worker.onmessage = (event) => {
+        const data = event.data || {};
+        if (data.type === 'recording') deliverRecording(data);
+        else onWorker(data);
+      };
+      updateTalk();
+      setRecordButton();
       worker.onerror = (event) => stopLive(`The live chain failed: ${event.message || 'worker error'}`);
       node.port.onmessage = (event) => { if (live && event.data && event.data.type === 'stats') live.worklet = event.data; };
       // Follow the settings panel (presets included) while live.
       live.timer = setInterval(() => {
         if (!live) return;
-        const now = renderOptions(), key = JSON.stringify(now);
+        const now = liveOptions(), key = JSON.stringify(now);
         if (key === live.lastOpts) return;
         live.lastOpts = key;
         if (now.captureChannel !== live.channel) { live.channel = now.captureChannel; node.port.postMessage({ type: 'channel', channel: now.captureChannel }); }
@@ -134,7 +203,7 @@
     const kbps = live.stats && seconds > 0 ? (s.bytes - live.stats.bytes) * 8 / seconds / 1000 : 0;
     live.stats = s; live.lastTime = now;
     const sending = s.gateOpen;
-    ui.tx.textContent = sending ? '● TX' : '○ gate closed';
+    ui.tx.textContent = sending ? '● TX' : s.talking === false ? '○ push-to-talk' : '○ gate closed';
     ui.tx.className = `live-tx${sending ? ' live-on' : ''}`;
     ui.mode.textContent = !sending ? '—' : { silk: 'SILK', hybrid: 'Hybrid', celt: 'CELT', dtx: 'DTX (comfort noise)' }[s.lastMode] || '—';
     ui.rate.textContent = `${kbps.toFixed(1)} kbps`;
@@ -149,7 +218,40 @@
     }
     setMeter(ui.inMeter, s.inputPeak);
     setMeter(ui.outMeter, s.outputPeak);
+    if (live.recording) {
+      // The app holds up to MAX_AUDIO_SECONDS of source.
+      if ((performance.now() - live.recording.started) / 1000 > MAX_AUDIO_SECONDS - 1) toggleRecording();
+      else setRecordButton();
+    }
   }
+
+  // Push-to-talk: V (TF2's +voicerecord default) or the on-screen button.
+  // Not while typing: text fields and selects keep V.
+  const typing = (target) => target && (target.isContentEditable || /^(TEXTAREA|SELECT)$/.test(target.tagName)
+    || (target.tagName === 'INPUT' && !/^(checkbox|radio|range|button|submit|reset|file|color)$/.test(target.type)));
+  window.addEventListener('keydown', (event) => {
+    if (event.code !== 'KeyV' || !live || !pttOn() || typing(event.target)) return;
+    event.preventDefault();
+    if (!event.repeat) { keyHeld = true; updateTalk(); }
+  });
+  window.addEventListener('keyup', (event) => {
+    if (event.code !== 'KeyV' || !keyHeld) return;
+    keyHeld = false;
+    updateTalk();
+  });
+  window.addEventListener('blur', () => { keyHeld = false; buttonHeld = false; updateTalk(); });
+  if (ui.talk) {
+    const release = () => { if (buttonHeld) { buttonHeld = false; updateTalk(); } };
+    ui.talk.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      try { ui.talk.setPointerCapture(event.pointerId); } catch (e) { /* not capturable */ }
+      buttonHeld = true;
+      updateTalk();
+    });
+    for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) ui.talk.addEventListener(type, release);
+  }
+  if (ui.ptt) ui.ptt.addEventListener('change', updateTalk);
+  if (ui.record) ui.record.addEventListener('click', toggleRecording);
 
   ui.toggle.addEventListener('click', () => (live ? stopLive() : startLive()));
   if (ui.input) ui.input.addEventListener('change', () => { if (live) { stopLive(); startLive(); } });
@@ -163,5 +265,8 @@
     });
   }
   window.addEventListener('pagehide', () => stopLive());
-  window.TF2Live = { start: startLive, stop: stopLive, get running() { return !!live; }, get stats() { return live && live.stats; } };
+  updateTalk();
+  window.TF2Live = { start: startLive, stop: stopLive, record: toggleRecording, get running() { return !!live; },
+    get stats() { return live && live.stats; }, get recording() { return !!(live && live.recording); },
+    talk(on) { buttonHeld = !!on; updateTalk(); } };
 })();

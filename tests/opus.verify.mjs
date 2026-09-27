@@ -55,6 +55,44 @@ check('Pinned real codec is repeatable', difference(high.samples, repeat.samples
 check('Steam profile encodes as VOIP with the voice signal hint', high.codecInfo.application === 'voip' && high.codecInfo.signal === 'voice');
 check('Encoder mode per packet is reported from the TOC byte',
   Object.values(high.codecInfo.modes).reduce((a, b) => a + b, 0) === high.codecInfo.frames);
+// Timing: the render keeps the source's timeline. The Steam profile runs
+// hybrid mode: its CELT layer (8-12 kHz) comes out exactly on time once the
+// encoder lookahead is trimmed; the SILK layer below leads by its own
+// frequency-dependent phase (tests/REFERENCE_2026.md, finding 19), which
+// TF2's identical libopus has too, so it is kept, not corrected.
+{
+  const r48 = 48000, n = r48 * 4;
+  let seed = 7;
+  const white = Float32Array.from({ length: n }, () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32 - .5) * .2);
+  const band = (v, lo, hi) => { let y = v; for (let k = 0; k < 3; k++) y = A.applyBiquad(A.applyBiquad(y, A.biquadCoefs('lowpass', r48, hi, .707)), A.biquadCoefs('highpass', r48, lo, .707)); return y; };
+  const lagUs = (p, q) => {
+    const v = {};
+    let best = 0;
+    for (let l = -40; l <= 40; l++) { let sum = 0; for (let i = r48; i < 3 * r48; i++) sum += p[i] * q[i + l]; v[l] = sum; if (sum > v[best]) best = l; }
+    return (best + .5 * (v[best - 1] - v[best + 1]) / (v[best - 1] - 2 * v[best] + v[best + 1])) / r48 * 1e6;
+  };
+  const rendered = (await A.process(buffer(white, r48), { ...base, volume: .5 })).samples;
+  const celt = lagUs(band(white, 8000, 11000), band(rendered, 8000, 11000));
+  const silk = lagUs(band(white, 1000, 3000), band(rendered, 1000, 3000));
+  check(`The CELT band is on time (${celt.toFixed(1)} us); the SILK band leads by Opus's own phase (${silk.toFixed(0)} us)`,
+    Math.abs(celt) < 3 && silk < -20 && silk > -120);
+}
+// vaudio_celt: the real CELT 0.11 in Source's custom mode.
+{
+  const r22 = 22050, n = r22 * 2, center = Math.round(n / 2) + 77;
+  const pulse = Float32Array.from({ length: n }, (_, i) => .3 * Math.exp(-.5 * ((i - center) / 6) ** 2));
+  const { samples, info } = await opus.celtRoundTrip(pulse, r22, { frameSize: 512, packetBytes: 64, complexity: 10 });
+  check('vaudio_celt is CELT 0.11 at 22050 Hz, 512-sample frames and 64-byte packets (22.05 kbps)',
+    info.backend === 'celt' && /CELT 0\.11/.test(info.version) && info.frameSamples === 512 && info.packetBytes === 64
+    && info.bitrate === 22050 && info.encodedBytes === info.frames * 64 && Math.abs(info.frameMs - 23.22) < .01);
+  check('CELT output keeps the source timeline (codec delay trimmed)', Math.abs(peak(samples) - center) <= 1 && samples.length === n);
+  const tone = Float32Array.from({ length: n }, (_, i) => .2 * Math.sin(2 * Math.PI * 440 * i / r22));
+  const lossy = await opus.celtRoundTrip(tone, r22, { frameSize: 512, packetBytes: 64, makeLossMask: count => Uint8Array.from({ length: count }, (_, f) => f % 5 === 2 ? 1 : 0) });
+  check('CELT conceals lost frames with its own PLC', lossy.info.lostFrames > 5 && lossy.info.plc === 'celt'
+    && energy(lossy.samples) > energy(tone) * .5 && lossy.samples.every(Number.isFinite));
+  const app = await A.process(buffer(x, rate), { ...base, codec: 'celt_22' });
+  check('The celt_22 profile renders through CELT 0.11', app.realOpus && app.codecInfo.backend === 'celt' && app.codecInfo.frames > 0);
+}
 const lost = await A.process(buffer(x, rate), { ...base, lossPct: 100 });
 check('100% loss reaches native decoder PLC', lost.codecInfo.plc === 'opus' && lost.codecInfo.lostFrames === lost.codecInfo.frames);
 check('No voice leaks through 100% loss from stream start', energy(lost.samples) < 1e-12);

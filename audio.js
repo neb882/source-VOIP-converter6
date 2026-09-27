@@ -374,6 +374,41 @@
   /* net_split frames. See tests/REFERENCE_2026.md.                      */
   /* ------------------------------------------------------------------ */
 
+  // TF2's receiver re-timing of talk spurts (tests/REFERENCE_2026.md,
+  // finding 19): after a silence of up to 0.45 s, 41% of spurts play early,
+  // by the silence less 0-130 ms (at most 350 ms); the spurt after keeps its
+  // time. Moves the decoded audio (codec rate) and the frame log in place;
+  // returns the moves as { time, shiftMs }.
+  const RETIME = { maxGap: 0.45, chance: 0.41, leftMax: 0.13, maxShift: 0.35 };
+  function retimeSpurts(samples, info, rate, rand) {
+    const log = info.frameLog, size = info.frameSamples, lookahead = info.lookahead || 0;
+    if (!log || !size) return [];
+    const spurts = [];
+    for (let f = 0; f < log.length; f++) {
+      if (!log[f]) continue;
+      const first = f;
+      while (f + 1 < log.length && log[f + 1]) f++;
+      spurts.push({ first, last: f });
+    }
+    const moves = [];
+    let early = false;
+    for (let k = 1; k < spurts.length; k++) {
+      const gap = (spurts[k].first - spurts[k - 1].last - 1) * size / rate;
+      if (early || gap > RETIME.maxGap || rand() >= RETIME.chance) { early = false; continue; }
+      const shift = Math.round(Math.min(RETIME.maxShift, gap - RETIME.leftMax * rand()) * rate);
+      const frames = Math.round(shift / size);
+      if (frames < 1) { early = false; continue; }
+      const { first, last } = spurts[k];
+      const start = Math.max(shift, first * size - lookahead), end = Math.min(samples.length, (last + 1) * size - lookahead);
+      if (end > start) { samples.copyWithin(start - shift, start, end); samples.fill(0, Math.max(start - shift, end - shift), end); }
+      log.copyWithin(first - frames, first, last + 1); log.fill(0, last + 1 - frames, last + 1);
+      if (info.frameBytes) { info.frameBytes.copyWithin(first - frames, first, last + 1); info.frameBytes.fill(0, last + 1 - frames, last + 1); }
+      moves.push({ time: start / rate, shiftMs: 1000 * shift / rate });
+      early = true;
+    }
+    return moves;
+  }
+
   function buildLossMask(nFrames, framesPerPacket, lossPct, rand, jitterMs = 0) {
     nFrames = Math.max(0, Math.floor(finiteOr(nFrames, 0)));
     framesPerPacket = Math.max(1, Math.round(finiteOr(framesPerPacket, 1)));
@@ -693,6 +728,7 @@
    *   gate:         Steam sender voice gate; null = profile default     [null]
    *   gateThresholdDb: gate opening level, frame RMS in dBFS [profile/-39.5]
    *   agc:          receiver auto-gain (false = unity gain)             [true]
+   *   retime:       TF2's early talk-spurt starts (finding 19)          [false]
    *   avgGain:      voice_avggain, mean (0) to peak (1) normalization   [0.5]
    *   maxGain:      voice_maxgain gain cap                              [10]
    *   voiceScale:   voice_scale, applied inside the auto-gain           [1]
@@ -769,19 +805,27 @@
     if (enableCodec) {
       const opus = await loadOpusModule();
       const bitrate = Math.max(6000, Math.round(codec.bitrate * bits / 16));
-      const result = await opus.roundTrip(samples, codecRate, bitrate, {
-        application: codec.application, signal: codec.signal,
-        runtime: codec.encoder?.runtime, complexity: codec.encoder?.complexity, vbr: codec.encoder?.vbr, dtx: codec.encoder?.dtx,
-        gate: gateOn ? { thresholdDb: gateDb, prerollFrames: Math.round(gateSpec.prerollMs / frameMs),
-          holdFrames: Math.round(gateSpec.holdMs / frameMs) } : null,
+      // The codec's own frame length: 20 ms for Opus, frameSize for CELT.
+      const codecFrameMs = codec.frameSize ? 1000 * codec.frameSize / codecRate : frameMs;
+      const common = {
+        gate: gateOn ? { thresholdDb: gateDb, prerollFrames: Math.round(gateSpec.prerollMs / codecFrameMs),
+          holdFrames: Math.round(gateSpec.holdMs / codecFrameMs) } : null,
         makeLossMask: count => buildLossMask(count, framesPerPacket, lossPct, rand, jitterMs),
         yieldControl: microYield,
         onProgress: f => report(0.2 + 0.5 * f)
-      });
+      };
+      const result = codec.engine === 'celt011'
+        ? await opus.celtRoundTrip(samples, codecRate, { ...common, frameSize: codec.frameSize, complexity: codec.complexity,
+          packetBytes: Math.max(8, Math.round(codec.packetBytes * bits / 16)) })
+        : await opus.roundTrip(samples, codecRate, bitrate, { ...common,
+          application: codec.application, signal: codec.signal,
+          runtime: codec.encoder?.runtime, complexity: codec.encoder?.complexity, vbr: codec.encoder?.vbr, dtx: codec.encoder?.dtx });
       samples = result.samples;
       codecInfo = { ...result.info, framesPerPacket };
       const eq = profileEq(codec);
       if (eq) samples = applyFirZeroPhase(samples, eq);
+      // The receiver's re-timing, from its own seed so loss patterns stay put.
+      if (opts.retime) codecInfo.retimed = retimeSpurts(samples, codecInfo, codecRate, mulberry32((finiteOr(opts.seed, 0xC0FFEE) ^ 0x9E3779B9) >>> 0));
     }
     report(0.72);
     await microYield();
@@ -1074,28 +1118,43 @@
     if (enableCodec) {
       const opus = await loadOpusModule();
       if (typeof opus.createVoiceStream !== 'function') throw new Error('This Opus build has no frame-by-frame interface.');
-      voice = await opus.createVoiceStream(codecRate, Math.max(6000, Math.round(codec.bitrate * bits / 16)), {
-        application: codec.application, signal: codec.signal,
-        runtime: codec.encoder?.runtime, complexity: codec.encoder?.complexity, vbr: codec.encoder?.vbr, dtx: codec.encoder?.dtx });
+      voice = codec.engine === 'celt011'
+        ? await opus.createCeltStream(codecRate, { frameSize: codec.frameSize, complexity: codec.complexity,
+          packetBytes: Math.max(8, Math.round(codec.packetBytes * bits / 16)) })
+        : await opus.createVoiceStream(codecRate, Math.max(6000, Math.round(codec.bitrate * bits / 16)), {
+          application: codec.application, signal: codec.signal,
+          runtime: codec.encoder?.runtime, complexity: codec.encoder?.complexity, vbr: codec.encoder?.vbr, dtx: codec.encoder?.dtx });
     }
-    const frameSize = codecRate / 50;
+    // 20 ms for Opus; CELT profiles have their own frame (23.2 ms for vaudio_celt).
+    const frameSize = codec.frameSize || codecRate / 50, frameSeconds = frameSize / codecRate;
     const threshold = 10 ** (gateDb / 20);
-    const preroll = gateOn ? Math.round(gateSpec.prerollMs / 20) : 0, hold = Math.round(gateSpec.holdMs / 20);
+    // opts.lowLatency (live only, not how TF2 behaves): no pre-roll, so the
+    // gate opens on the loud frame itself and 120 ms sooner.
+    const preroll = gateOn && !opts.lowLatency ? Math.round(gateSpec.prerollMs / 1000 / frameSeconds) : 0, hold = Math.round(gateSpec.holdMs / 1000 / frameSeconds);
     const lossMask = streamLossMask(framesPerPacket, lossPct, rand, jitterMs);
     let pending = new Float32Array(0);
-    const queue = [];   // frames waiting out the gate's pre-roll: { samples, sent }
+    const queue = [];   // frames waiting out the gate's pre-roll: { samples, sent, talk }
     let frameIndex = 0, holdUntil = -1, open = false, spurts = 0;
+    // Push-to-talk: frames captured while the key is up are never sent, as
+    // the game does not capture them at all.
+    let talking = true;
+    const codes = [];   // opus-codec.mjs FRAME codes of the frames since takeFrameCodes()
+    // The output is the input this many samples (at ioRate) later: the
+    // capture EQ's causal delay and the Opus lookahead, which a render trims.
+    // The pre-roll only holds output back; it does not shift it.
+    const contentDelay = Math.round(((captureEq ? (captureEq.length - 1) / 2 : 0) + (voice ? voice.lookahead : 0)) / codecRate * ioRate);
     const stats = { codec: codecKey, frames: 0, sent: 0, modes: { silk: 0, hybrid: 0, celt: 0 }, dtx: 0, lost: 0, late: 0,
-      bytes: 0, gateOpen: false, lastMode: null, inputPeak: 0, outputPeak: 0,
-      latencyMs: 1000 * (preroll * 0.02 + (captureEq ? (captureEq.length - 1) / 2 / codecRate : 0) + (voice ? voice.lookahead / codecRate : 0)) };
+      bytes: 0, gateOpen: false, lastMode: null, inputPeak: 0, outputPeak: 0, spurts: 0, talking,
+      latencyMs: 1000 * (preroll * frameSeconds + (captureEq ? (captureEq.length - 1) / 2 / codecRate : 0) + (voice ? voice.lookahead / codecRate : 0)) };
 
     async function codecFrame(frame, sent) {
       stats.frames++;
-      if (!voice) { stats.gateOpen = true; return frame; }
-      if (!sent) { open = false; stats.gateOpen = false; return new Float32Array(frameSize); }
+      if (!voice) { stats.gateOpen = sent; codes.push(sent ? 2 : 0); return sent ? frame : new Float32Array(frame.length); }
+      if (!sent) { open = false; stats.gateOpen = false; codes.push(0); return new Float32Array(frameSize); }
       if (!open) {
         if (spurts > 0) await voice.restart();
         spurts++;
+        stats.spurts = spurts;
         open = true;
       }
       stats.gateOpen = true;
@@ -1106,8 +1165,9 @@
       if (encoded.dtx) stats.dtx++;
       stats.lastMode = encoded.dtx ? 'dtx' : encoded.mode;
       const miss = lossMask();
-      if (miss === 1) { stats.lost++; return voice.conceal().slice(); }
-      if (miss === 2) { stats.late++; return new Float32Array(frameSize); }
+      if (miss === 1) { stats.lost++; codes.push(5); return voice.conceal().slice(); }
+      if (miss === 2) { stats.late++; codes.push(6); return new Float32Array(frameSize); }
+      codes.push(encoded.dtx ? 4 : { silk: 1, hybrid: 2, celt: 3 }[encoded.mode]);
       return voice.decode(encoded.packet).slice();
     }
 
@@ -1129,22 +1189,22 @@
       const decoded = [];
       for (let start = 0; start < whole; start += frameSize) {
         const frame = merged.slice(start, start + frameSize);
-        if (!gateOn) { decoded.push(await codecFrame(frame, true)); continue; }
+        if (!gateOn) { decoded.push(await codecFrame(frame, talking)); continue; }
         // Steam's gate: a frame over the threshold sends the pre-roll before
         // it and the hold after it. A frame leaves the queue once no later
         // frame's pre-roll can reach it.
         let energy = 0;
         for (const v of frame) energy += v * v;
-        const loud = Math.sqrt(energy / frameSize) > threshold;
+        const loud = talking && Math.sqrt(energy / frameSize) > threshold;
         const f = frameIndex++;
-        queue.push({ samples: frame, index: f, sent: false });
+        queue.push({ samples: frame, index: f, sent: false, talk: talking });
         if (loud) {
           holdUntil = Math.max(holdUntil, f + hold);
           for (const q of queue) if (q.index >= f - preroll) q.sent = true;
         }
         while (queue.length > preroll) {
           const q = queue.shift();
-          decoded.push(await codecFrame(q.samples, q.sent || q.index <= holdUntil));
+          decoded.push(await codecFrame(q.samples, q.talk && (q.sent || q.index <= holdUntil)));
         }
       }
       let y = new Float32Array(decoded.reduce((n, d) => n + d.length, 0));
@@ -1157,7 +1217,12 @@
       return y;
     }
 
-    return { process, stats, free() { if (voice) voice.free(); voice = null; } };
+    return { process, stats, contentDelay, codecRate, frameSize, frameSeconds, version: voice ? voice.version : null,
+      bitrate: Math.max(6000, Math.round(codec.bitrate * bits / 16)), vbr: !!codec.encoder?.vbr, dtx: !!codec.encoder?.dtx,
+      gateDb: gateOn ? gateDb : null, autoGain, voiceRate: codec.voiceRate, realOpus: !!voice,
+      setTalking(on) { talking = !!on; stats.talking = talking; },
+      takeFrameCodes() { return codes.splice(0); },
+      free() { if (voice) voice.free(); voice = null; } };
   }
 
   /* ------------------------------------------------------------------ */

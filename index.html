@@ -28,7 +28,7 @@
     <section class="panel" aria-labelledby="step-source">
       <h2 id="step-source"><span class="step" aria-hidden="true">1</span> Source</h2>
       <div class="upload-row">
-        <input id="file" type="file" accept="audio/*" multiple aria-label="Audio file to process (choose several to batch them)">
+        <input id="file" type="file" accept="audio/*,video/*,.mkv" multiple aria-label="Audio or video file to process (choose several to batch them)">
         <button id="mic" type="button" title="Record from microphone (+voicerecord)">🎤 Record</button>
         <button id="live-toggle" type="button" aria-pressed="false" title="Live monitor: hear your microphone through the TF2 voice chain in real time, with the current settings (use headphones)">🎧 Live</button>
         <div id="source-status" class="source-status" role="status" aria-live="polite">Choose or drop an audio file, or record from the microphone. Several files at once go to the batch (step 4).</div>
@@ -46,6 +46,12 @@
           <span class="live-stat" title="Microphone to speaker, including the voice gate's 120 ms pre-roll and the audio device's buffers">latency <b id="live-latency">—</b></span>
           <span class="live-meter" title="Input peak"><span class="live-meter-label">in</span><span class="live-meter-bar"><span id="live-in"></span></span></span>
           <span class="live-meter" title="Output peak"><span class="live-meter-label">out</span><span class="live-meter-bar"><span id="live-out"></span></span></span>
+        </div>
+        <div class="live-controls">
+          <button id="live-record" type="button" disabled title="Record the live session: the microphone and the TF2 voice, loaded into the app as a dry/wet pair (A/B, views, meter, download)">⏺ Record</button>
+          <label title="Send only while V (TF2's +voicerecord key) or the Talk button is held, as with push-to-talk in the game. The voice gate still applies while you hold it."><input id="live-ptt" type="checkbox"> Push-to-talk (hold <kbd>V</kbd>)</label>
+          <button id="live-talk" type="button" hidden title="Hold to talk">🎙 Hold to talk</button>
+          <label title="Skip the voice gate's 120 ms pre-roll, so the gate opens on the loud frame itself. Not how TF2 sounds: onsets lose their first 120 ms."><input id="live-lowlat" type="checkbox"> Low latency (no pre-roll)</label>
         </div>
         <p id="live-note" class="live-note"></p>
       </div>
@@ -72,8 +78,8 @@
           <select id="codec">
             <option value="steam" selected>Steam voice (Opus 24 kHz VBR, 32 kbps)</option>
             <option value="steam_48">Fullband Opus (48 kHz / 64 kbps, experimental)</option>
-            <option value="celt_22">CELT era (Opus CELT layer, 22 kbps)</option>
-            <option value="celt_44">CELT high (Opus CELT layer, 44 kbps)</option>
+            <option value="celt_22">vaudio_celt (CELT 0.11, 22 kHz, 22 kbps)</option>
+            <option value="celt_44">vaudio_celt_high (CELT 0.11, 44 kHz, unconfirmed)</option>
             <option value="speex">Narrowband (Opus SILK, 8 kbps)</option>
           </select>
         </div>
@@ -173,6 +179,13 @@
             </select>
           </div>
           <div class="control">
+            <label for="retime" title="TF2's receiver starts some talk spurts early after a short silence (measured; which ones is random). Off keeps the source's timing for A/B.">Talk-spurt timing <code class="cvar">voice_retime</code></label>
+            <select id="retime">
+              <option value="0" selected>Source timing</option>
+              <option value="1">TF2 re-timing (random)</option>
+            </select>
+          </div>
+          <div class="control">
             <label for="avggain">Mean → peak normalize <code class="cvar">voice_avggain</code></label>
             <input id="avggain" type="number" value="0.5" min="0" max="1" step="0.05">
           </div>
@@ -262,6 +275,7 @@
           <option value="flac">FLAC · lossless, ~½ size</option>
           <option value="mp3">MP3 · V0, ~⅕ size</option>
         </select>
+        <button id="download-video" type="button" hidden disabled title="The source video with its audio replaced by the render. The video is copied as is, not re-encoded; the audio is AAC where the browser can encode it, otherwise Opus (MP4) or PCM (MOV).">Download video</button>
         <button id="ab-toggle" class="preset-btn ab-button" type="button" disabled title="Switch playback between processed (Wet) and original (Dry). Shortcut: B; Space plays and pauses">A/B: Wet</button>
         <button id="ab-match" class="preset-btn ab-button" type="button" disabled aria-pressed="false" title="Loudness-matched A/B: plays the louder version quieter by the difference in integrated loudness (LUFS), so the comparison is about sound, not level">Match loudness</button>
         <progress id="process-progress" max="100" value="0" hidden aria-label="Audio processing progress"></progress>
@@ -409,7 +423,16 @@
   <script src="zip.js"></script>
   <script src="meter.js"></script>
   <script src="reference.js"></script>
-  <script src="script.js"></script>
+  <script src="video.js"></script>
+  <script src="app/core.js"></script>
+  <script src="app/console.js"></script>
+  <script src="app/source.js"></script>
+  <script src="app/render.js"></script>
+  <script src="app/meter.js"></script>
+  <script src="app/realtake.js"></script>
+  <script src="app/visualizer.js"></script>
+  <script src="app/netgraph.js"></script>
+  <script src="app/boot.js"></script>
   <script src="live.js"></script>
   <script src="batch.js"></script>
   <script>

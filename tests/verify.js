@@ -307,15 +307,17 @@ async function main() {
   console.log('\n[5] Real codec modes per profile');
   {
     const src = musicLike(1, SR, 3);
-    const expect = { steam: ['hybrid', 32000], steam_48: ['hybrid', 64000], celt_22: ['celt', 22000], celt_44: ['celt', 44000], speex: ['silk', 8000] };
+    const expect = { steam: ['hybrid', 32000], steam_48: ['hybrid', 64000], celt_22: ['celt', 22050], celt_44: ['celt', 165375], speex: ['silk', 8000] };
     for (const [codec, [mode, bitrate]] of Object.entries(expect)) {
       const r = await TF2Audio.process(mkBuffer(src, SR), { codec });
       const m = r.codecInfo.modes;
       const total = m.silk + m.hybrid + m.celt;
-      check(`${codec}: libopus runs in ${mode} mode at ${bitrate / 1000} kbps`,
-        r.codecInfo.backend === 'libopus' && r.codecInfo.bitrate === bitrate && m[mode] / total > 0.8, JSON.stringify(m));
-      // The Steam profiles run the libopus release Steam's packets match; the stand-ins keep 1.6.1.
-      const release = codec.startsWith('steam') ? 'libopus 1.1.5' : 'libopus 1.6.1';
+      // The engine CELT profiles run CELT 0.11 itself, in fixed-size packets.
+      const celt = codec.startsWith('celt');
+      check(`${codec}: ${celt ? 'CELT 0.11' : `libopus runs in ${mode} mode`} at ${bitrate / 1000} kbps`,
+        r.codecInfo.backend === (celt ? 'celt' : 'libopus') && r.codecInfo.bitrate === bitrate && m[mode] / total > 0.8, JSON.stringify(m));
+      // The Steam profiles run the libopus release Steam's packets match; speex keeps 1.6.1.
+      const release = celt ? 'CELT 0.11 (celt-0.11.0)' : codec.startsWith('steam') ? 'libopus 1.1.5' : 'libopus 1.6.1';
       check(`${codec}: encodes and decodes with ${release}`, r.codecInfo.version === release, r.codecInfo.version);
       check(`${codec}: finite output`, !hasBadValues(r.samples) && r.samples.length === Math.round(src.length * r.sampleRate / SR));
     }
@@ -567,6 +569,33 @@ async function main() {
     check('live chain holds back the gate pre-roll (120 ms) and reports its delay',
       offline.length - live.length >= 0.12 * SR && Math.abs(chain.stats.latencyMs - (120 + 1000 * 283 / 24000)) < 0.5,
       `${chain.stats.latencyMs.toFixed(1)} ms; ${chain.stats.sent} of ${chain.stats.frames} frames sent`);
+  }
+
+  console.log('\n[10c] Receiver talk-spurt re-timing (voice_retime)');
+  {
+    // Noise bursts 0.6 s long with 0.8 s between them: the gate's 440 ms hold
+    // leaves about 0.24 s of silence, short enough for TF2 to start early.
+    const src = new Float32Array(SR * 12);
+    let seed = 11;
+    for (let b = 0; b < 8; b++) for (let i = 0; i < SR * .6; i++) {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      src[Math.round((.3 + b * 1.4) * SR) + i] = ((seed / 2 ** 32) - .5) * .3;
+    }
+    const plain = await TF2Audio.process(mkBuffer(src, SR), { codec: 'steam' });
+    const moved = await TF2Audio.process(mkBuffer(src, SR), { codec: 'steam', retime: true, seed: 3 });
+    const again = await TF2Audio.process(mkBuffer(src, SR), { codec: 'steam', retime: true, seed: 3 });
+    const moves = moved.codecInfo.retimed || [];
+    check('re-timing starts some spurts early, never the one after an early start, and never by more than the silence',
+      moves.length > 0 && moves.length < 7 && moves.every(m => m.shiftMs > 0 && m.shiftMs <= 350)
+      && moves.every((m, i) => i === 0 || m.time - moves[i - 1].time > 2), moves.map(m => `${m.time.toFixed(2)} s −${m.shiftMs.toFixed(0)} ms`).join(', '));
+    check('re-timing is repeatable for a seed and keeps the length', moved.samples.length === plain.samples.length
+      && moved.samples.every((v, i) => v === again.samples[i]));
+    // The moved burst is the same audio, earlier.
+    const m = moves[0], shift = Math.round(m.shiftMs / 1000 * plain.sampleRate), at = Math.round((m.time + .1) * plain.sampleRate);
+    let dot = 0, ea = 0, eb = 0;
+    for (let i = at; i < at + plain.sampleRate * .3; i++) { dot += plain.samples[i] * moved.samples[i - shift]; ea += plain.samples[i] ** 2; eb += moved.samples[i - shift] ** 2; }
+    check('a re-timed spurt is the same audio, earlier', dot / Math.sqrt(ea * eb) > .9, `r ${(dot / Math.sqrt(ea * eb)).toFixed(3)}`);
+    check('off by default: the render keeps the source timing', !plain.codecInfo.retimed);
   }
 
   console.log('\n[11] WAV encoding');

@@ -1,0 +1,46 @@
+{
+  "about": "Real TF2 takes (tests/REFERENCE_2026.md) and the settings each was recorded with. The recordings are not committed; tests/accuracy.mjs looks for them by file name in a local folder. Settings are the app's render options; anything not given keeps the app's default (the modern preset). Sources under tests/testsignal/ come from its scripts.",
+  "takes": [
+    { "name": "take1_default", "set": "B", "take": ["take1_default.flac", "take1_default_-_voice_maxgain_10.flac"],
+      "source": "tests/testsignal/tf2_voice_testsignal_v1.wav", "settings": { "volume": 0.15 } },
+    { "name": "take2_voice_scale_0.5", "set": "B", "take": ["take2_voice_scale_0.5.flac"],
+      "source": "tests/testsignal/tf2_voice_testsignal_v1.wav", "settings": { "volume": 0.15, "voiceScale": 0.5 } },
+    { "name": "take3_voice_maxgain_1", "set": "B", "take": ["take3_voice_maxgain_1.flac"],
+      "source": "tests/testsignal/tf2_voice_testsignal_v1.wav", "settings": { "volume": 0.15, "maxGain": 1 } },
+    { "name": "take3_voice_avggain_0.25", "set": "B", "take": ["take3_voice_avggain_0.25.flac"],
+      "source": "tests/testsignal/tf2_voice_testsignal_v1.wav", "settings": { "volume": 0.15, "avgGain": 0.25 } },
+    { "name": "take4_my_own_speech", "set": "B", "take": ["take4_my_own_speech.flac"],
+      "source": "my_own_speech_raw_from_audacity.wav", "settings": { "volume": 0.15 } },
+
+    { "name": "net_baseline", "set": "C", "take": ["baseline.flac"],
+      "source": "tests/testsignal/tf2_voice_nettest_v1.wav", "settings": { "volume": 0.15 } },
+    { "name": "net_loss5", "set": "C", "take": ["loss5.flac"], "random": true,
+      "source": "tests/testsignal/tf2_voice_nettest_v1.wav", "settings": { "volume": 0.15, "lossPct": 22 } },
+    { "name": "net_loss15", "set": "C", "take": ["loss15.flac"], "random": true,
+      "source": "tests/testsignal/tf2_voice_nettest_v1.wav", "settings": { "volume": 0.15, "lossPct": 64 } },
+    { "name": "net_jitter", "set": "C", "take": ["jitter.flac"], "random": true,
+      "source": "tests/testsignal/tf2_voice_nettest_v1.wav", "settings": { "volume": 0.15, "jitterMs": 50 } },
+    { "name": "net_combined", "set": "C", "take": ["combined.flac"], "random": true,
+      "source": "tests/testsignal/tf2_voice_nettest_v1.wav", "settings": { "volume": 0.15, "lossPct": 45, "jitterMs": 50 } },
+    { "name": "speech_loss10", "set": "C", "take": ["speech_loss10.flac"], "random": true,
+      "source": "my_own_speech_raw_from_audacity.wav", "settings": { "volume": 0.15, "lossPct": 45 } },
+
+    { "name": "sender_A", "set": "D", "take": ["user_A_recording.flac"],
+      "source": "tests/testsignal/tf2_voice_testsignal_v1.wav", "settings": { "volume": 0.15 } },
+    { "name": "listener_B", "set": "D", "take": ["user_B_recording.flac"],
+      "source": "tests/testsignal/tf2_voice_testsignal_v1.wav", "settings": { "volume": 0.077 } },
+
+    { "name": "river_artifact", "set": "E", "take": ["artifact_real.wav"],
+      "source": "river_clip_unmodified.wav", "settings": { "volume": 0.15 } },
+
+    { "name": "lowtone_default", "set": "F", "take": ["default.flac"],
+      "source": "tests/testsignal/tf2_voice_lowtone_v1.wav", "settings": { "volume": 0.15 } },
+    { "name": "lowtone_maxgain_1", "set": "F", "take": ["maxgain_1.flac"],
+      "source": "tests/testsignal/tf2_voice_lowtone_v1.wav", "settings": { "volume": 0.15, "maxGain": 1 } },
+
+    { "name": "music_river", "set": "A", "take": ["tf2 VOIP test 2026 pure.mp3"], "takeSeconds": [0, 70],
+      "source": "Joni Mitchell - River.mp3", "settings": { "volume": 0.15 } },
+    { "name": "music_take_it_off", "set": "A", "take": ["tf2 VOIP test 2026 pure.mp3"], "takeSeconds": [70, 170.76],
+      "source": "Ke$ha - Take It Off.mp3", "settings": { "volume": 0.15 } }
+  ]
+}
