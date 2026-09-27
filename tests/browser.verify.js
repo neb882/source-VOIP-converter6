@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
 const { createStaticServer } = require('./static-server');
@@ -107,6 +108,184 @@ async function verifySampleRateMatrix(browser, base) {
       check(errors.length === 0, `${decodeRate} Hz browser: no page errors`, errors.join('; '));
     } finally { await context.close(); }
   }
+}
+
+// Visualizer zoom, scales, meter and loudness-matched A/B, on the last render.
+async function verifyVisualizerTools(page) {
+  console.log('\n[Browser 3c] Zoom, scales, meter, and loudness-matched A/B');
+  const view = () => page.evaluate(() => document.getElementById('visualizer').dataset.view || '');
+  const span = (v) => { const m = /:([\d.]+)-([\d.]+)$/.exec(v); return m ? Number(m[2]) - Number(m[1]) : NaN; };
+  await page.locator('#viz-wave').click();
+  await page.waitForFunction(() => (document.getElementById('visualizer').dataset.view || '').startsWith('wave'));
+  const full = span(await view());
+  await page.locator('#viz-zoom-in').click();
+  await page.locator('#viz-zoom-in').click();
+  await page.waitForFunction((f) => {
+    const m = /:([\d.]+)-([\d.]+)$/.exec(document.getElementById('visualizer').dataset.view || '');
+    return m && Number(m[2]) - Number(m[1]) < f * 0.3;
+  }, full);
+  check(Math.abs(span(await view()) - full / 4) < 0.01, 'two zoom steps show a quarter of the file', `${span(await view()).toFixed(3)} of ${full.toFixed(3)} s`);
+  await page.locator('#visualizer').focus();
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('0');
+  await page.waitForFunction((f) => {
+    const m = /:([\d.]+)-([\d.]+)$/.exec(document.getElementById('visualizer').dataset.view || '');
+    return m && Math.abs(Number(m[2]) - Number(m[1]) - f) < 1e-3;
+  }, full);
+  check(true, 'keyboard pans and 0 returns to the whole file');
+  const box = await page.locator('#visualizer').boundingBox();
+  await page.mouse.click(box.x + box.width * 0.75, box.y + box.height * 0.5);
+  const seeked = await page.evaluate(() => document.getElementById('preview').currentTime / document.getElementById('preview').duration);
+  check(Math.abs(seeked - 0.75) < 0.02, 'a click on the waveform seeks the player', seeked.toFixed(3));
+  await page.locator('#viz-log').click();
+  check(await page.locator('#viz-log').getAttribute('aria-pressed') === 'true' && !(await page.locator('#viz-range').isHidden()),
+    'WAVE switches to a dBFS amplitude scale with a selectable range');
+  await page.locator('#viz-log').click();
+  await page.locator('#viz-spec').click();
+  const wasLog = await page.locator('#viz-log').getAttribute('aria-pressed') === 'true';
+  if (!wasLog) await page.locator('#viz-log').click();
+  await page.waitForFunction(() => (document.getElementById('visualizer').dataset.view || '').startsWith('spec:log'));
+  check(true, 'SPEC renders a log-frequency spectrogram');
+  const range = await page.locator('#viz-range').textContent();
+  await page.locator('#viz-range').click();
+  check(await page.locator('#viz-range').textContent() !== range, 'the dynamic range button cycles');
+  await page.locator('#viz-range').click(); await page.locator('#viz-range').click(); await page.locator('#viz-range').click();
+  if (!wasLog) await page.locator('#viz-log').click();
+  await page.locator('#viz-wave').click();
+
+  await page.waitForFunction(() => document.querySelectorAll('#meter-rows tr').length >= 2
+    && !document.getElementById('meter-rows').textContent.includes('…'), null, { timeout: 60000 });
+  const meter = await page.evaluate(() => [...document.querySelectorAll('#meter-rows tr')].map(r => [...r.children].map(c => c.textContent)));
+  const lufs = (row) => Number(row[1].replace('−', '-'));
+  check(meter[0][0] === 'WET' && meter[1][0] === 'DRY' && Number.isFinite(lufs(meter[0])) && Number.isFinite(lufs(meter[1])),
+    'meter lists integrated loudness for the render and the source', `${meter[0][1]} / ${meter[1][1]} LUFS`);
+  await page.locator('#ab-match').click();
+  const matched = await page.locator('#ab-match').textContent();
+  const gains = await page.evaluate(() => ({ louder: state.abLouder, offset: state.abOffsetDb }));
+  check(/^Matched: (wet|dry) −?\d+\.\d dB$/.test(matched) && gains.offset <= 0
+    && Math.abs(Math.abs(gains.offset) - Math.abs(lufs(meter[0]) - lufs(meter[1]))) < 0.11,
+    'loudness matching lowers the louder version by the LUFS difference', matched);
+  await page.locator('#ab-match').click();
+  await page.locator('h1').click();
+  const before = await page.locator('#ab-toggle').textContent();
+  await page.keyboard.press('b');
+  check(await page.locator('#ab-toggle').textContent() !== before, 'the B key switches A/B');
+  await page.keyboard.press('b');
+}
+
+// A minimal reader for the stored ZIPs the batch writes.
+function readZip(buffer) {
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  const end = buffer.length - 22;
+  if (view.getUint32(end, true) !== 0x06054b50) throw new Error('no end of central directory');
+  const count = view.getUint16(end + 10, true);
+  let at = view.getUint32(end + 16, true);
+  const files = [];
+  for (let i = 0; i < count; i++) {
+    const nameLength = view.getUint16(at + 28, true), size = view.getUint32(at + 24, true), offset = view.getUint32(at + 42, true);
+    const name = buffer.subarray(at + 46, at + 46 + nameLength).toString('utf8');
+    const local = view.getUint16(offset + 26, true);
+    files.push({ name, data: buffer.subarray(offset + 30 + local, offset + 30 + local + size), crc: view.getUint32(at + 16, true) });
+    at += 46 + nameLength;
+  }
+  return files;
+}
+
+async function verifyBatchAndFormats(browser, base) {
+  console.log('\n[Browser 6] Batch queue, drag and drop, and download formats');
+  const context = await browser.newContext({ serviceWorkers: 'block', acceptDownloads: true });
+  try {
+    const page = await context.newPage();
+    page.setDefaultTimeout(30000);
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.goto(base, { waitUntil: 'domcontentloaded' });
+    const summary = () => page.locator('#batch-summary').textContent();
+    await page.locator('#batch-files').setInputFiles([
+      { name: 'b-song.wav', mimeType: 'audio/wav', buffer: wavTone(0.6, 48000, 330) },
+      { name: 'a-song.wav', mimeType: 'audio/wav', buffer: wavTone(0.5, 44100, 440) },
+      { name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('not audio') }
+    ]);
+    check((await summary()).includes('2 files') && (await summary()).includes('skipped 1 file'), 'batch adds audio files and skips others', await summary());
+    check(JSON.stringify(await page.locator('.batch-item .bi-name').allTextContents()) === '["a-song.wav","b-song.wav"]', 'batch sorts files by name');
+    // A multi-file choice in step 1 and a drop on the batch panel both queue files.
+    await page.locator('#file').setInputFiles([
+      { name: 'c-song.wav', mimeType: 'audio/wav', buffer: wavTone(0.4, 48000, 550) },
+      { name: 'd-song.wav', mimeType: 'audio/wav', buffer: wavTone(0.3, 48000, 660) }]);
+    await page.evaluate(async (bytes) => {
+      const data = new DataTransfer();
+      data.items.add(new File([new Uint8Array(bytes)], 'e-song.wav', { type: 'audio/wav' }));
+      document.getElementById('batch-list').dispatchEvent(new DragEvent('drop', { dataTransfer: data, bubbles: true, cancelable: true }));
+    }, [...wavTone(0.3, 48000, 770)]);
+    await page.waitForFunction(() => document.querySelectorAll('.batch-item').length === 5);
+    check(true, 'step 1 multi-select and a drop on the batch panel add to the queue');
+    // A single file dropped elsewhere loads as the source instead.
+    await page.evaluate(async (bytes) => {
+      const data = new DataTransfer();
+      data.items.add(new File([new Uint8Array(bytes)], 'dropped-source.wav', { type: 'audio/wav' }));
+      document.querySelector('h1').dispatchEvent(new DragEvent('drop', { dataTransfer: data, bubbles: true, cancelable: true }));
+    }, [...wavTone(0.3)]);
+    await page.waitForFunction(() => state.sourceName === 'dropped-source.wav');
+    check(true, 'one file dropped outside the batch loads as the source');
+    for (const name of ['c-song.wav', 'd-song.wav', 'e-song.wav']) {
+      await page.locator('.batch-item', { hasText: name }).locator('.bi-remove').click();
+    }
+    await page.locator('#batch-run').click();
+    await page.waitForFunction(() => /2 rendered/.test(document.getElementById('batch-summary').textContent), null, { timeout: 120000 });
+    const statuses = await page.locator('.batch-item .bi-status').allTextContents();
+    check(statuses.every(text => /^Done · 0:01 · −\d+\.\d LUFS · −\d+\.\d dBTP/.test(text)), 'rendered items report loudness and true peak', statuses.join(' | '));
+
+    const zips = {};
+    for (const format of ['wav', 'flac', 'mp3']) {
+      await page.locator('#format').selectOption(format);
+      check((await page.locator('#batch-zip').textContent()).includes(format.toUpperCase()), `ZIP button names ${format.toUpperCase()}`);
+      const [download] = await Promise.all([page.waitForEvent('download', { timeout: 60000 }), page.locator('#batch-zip').click()]);
+      const buffer = fs.readFileSync(await download.path());
+      zips[format] = readZip(buffer);
+      const names = zips[format].map(f => f.name).join(', ');
+      check(download.suggestedFilename() === `tf2_voice_steam_2_${format}.zip` && names === `a-song_tf2_steam.${format}, b-song_tf2_steam.${format}`,
+        `${format.toUpperCase()} ZIP holds both renders`, names);
+    }
+    check(zips.wav.every(f => f.data.subarray(0, 4).toString() === 'RIFF') && zips.flac.every(f => f.data.subarray(0, 4).toString() === 'fLaC')
+      && zips.mp3.every(f => f.data.subarray(0, 700).includes('Xing') && f.data.subarray(0, 700).includes('LAME3.100')),
+      'ZIP entries are WAV, FLAC and MP3 (LAME VBR) files');
+    // The browser's own decoders: FLAC must give back the WAV's samples exactly.
+    const decoded = await page.evaluate(async ({ wav, flac, mp3 }) => {
+      const decode = async (bytes) => {
+        const probe = new DataView(new Uint8Array(wav).buffer);
+        const context = new OfflineAudioContext(1, 1, probe.getUint32(24, true));
+        return (await context.decodeAudioData(new Uint8Array(bytes).buffer)).getChannelData(0);
+      };
+      const [a, b, c] = await Promise.all([decode(wav), decode(flac), decode(mp3)]);
+      let same = a.length === b.length;
+      for (let i = 0; same && i < a.length; i++) same = a[i] === b[i];
+      return { same, wav: a.length, mp3: c.length };
+    }, { wav: [...zips.wav[0].data], flac: [...zips.flac[0].data], mp3: [...zips.mp3[0].data] });
+    check(decoded.same, 'FLAC decodes to exactly the WAV samples in the browser', `${decoded.wav} samples`);
+    check(Math.abs(decoded.mp3 - decoded.wav) <= 1152, 'MP3 decodes to the WAV duration in the browser', `${decoded.mp3} vs ${decoded.wav}`);
+
+    await page.locator('#advanced-toggle').click();
+    await page.locator('#volume').fill('0.3');
+    await page.locator('#volume').dispatchEvent('change');
+    check((await summary()).includes('2 with older settings') && (await page.locator('.batch-item[data-state="stale"]').count()) === 2,
+      'changing a setting marks earlier renders as older');
+    await page.locator('#batch-clear').click();
+    check((await summary()) === 'No files queued.' && (await page.locator('.batch-item').count()) === 0, 'Clear empties the queue');
+
+    // Single render saved as FLAC through the format picker.
+    await page.locator('#file').setInputFiles({ name: 'solo.wav', mimeType: 'audio/wav', buffer: wavTone(0.4) });
+    await page.waitForFunction(() => !document.getElementById('process').disabled);
+    await page.locator('#process').click();
+    await page.waitForFunction(() => !document.getElementById('download').disabled, null, { timeout: 60000 });
+    await page.locator('#format').selectOption('flac');
+    check(await page.locator('#download').textContent() === 'Download FLAC', 'download button follows the format');
+    const [single] = await Promise.all([page.waitForEvent('download', { timeout: 60000 }), page.locator('#download').click()]);
+    check(single.suggestedFilename() === 'solo_tf2_steam.flac'
+      && fs.readFileSync(await single.path()).subarray(0, 4).toString() === 'fLaC', 'single render downloads as FLAC');
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    check(await page.locator('#format').inputValue() === 'flac', 'the chosen format is remembered');
+    check(errors.length === 0, 'batch and formats run without page errors', errors.join('; '));
+  } finally { await context.close(); }
 }
 
 async function activateServiceWorker(page, scriptPath) {
@@ -244,8 +423,11 @@ async function main() {
     for (const mode of ['wave', 'bars', 'spec']) {
       await page.locator(`#viz-${mode}`).click();
       check(await page.locator(`#viz-${mode}`).getAttribute('aria-pressed') === 'true', `${mode.toUpperCase()} view is selected`);
+      // WAVE and SPEC images are computed for the visible range; wait for the finished one.
+      if (mode !== 'bars') await page.waitForFunction((m) => (document.getElementById('visualizer').dataset.view || '').startsWith(m), mode);
       check(await painted() > 0.02, `${mode.toUpperCase()} view paints the rendered audio`);
     }
+    await verifyVisualizerTools(page);
     await page.locator('#viz-wave').click();
     await page.locator('#loss').fill('12');
     await page.locator('#loss').dispatchEvent('change');
@@ -350,7 +532,12 @@ async function main() {
       'worker replacement preserves the loaded audio without reloading');
     check(afterUpdate.processEnabled, 'worker replacement leaves Process Audio enabled');
     check(afterUpdate.keys.includes('unrelated-test-cache'), 'activation preserves unrelated origin caches');
-    check(afterUpdate.keys.includes('tf2ve-v11'), 'current app shell cache is populated');
+    check(afterUpdate.keys.includes('tf2ve-v12'), 'current app shell cache is populated');
+    check(await page.evaluate(async () => {
+      const cache = await caches.open('tf2ve-v12');
+      const needed = ['batch.js', 'formats.js', 'flac.js', 'zip.js', 'meter.js', 'vendor/lame/index.mjs', 'vendor/lame/lame-3.100.wasm.mjs'];
+      return (await Promise.all(needed.map(path => cache.match(new URL(path, location.href).href)))).every(Boolean);
+    }), 'batch, format, meter and MP3 encoder files are cached for offline use');
     // Restore the normal registration while still online. Otherwise reloading
     // registers sw.js again and races another replacement against file loading.
     await activateServiceWorker(page, 'sw.js');
@@ -367,6 +554,7 @@ async function main() {
     await context.setOffline(false);
     check(pageErrors.length === 0, 'complete conversion and recording flow has no page errors', pageErrors.join('; '));
 
+    await verifyBatchAndFormats(browser, base);
     await verifySampleRateMatrix(browser, base);
 
     console.log(`\n${passed} browser checks passed`);

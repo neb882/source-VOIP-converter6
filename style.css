@@ -179,18 +179,65 @@ select { cursor: pointer; }
 /* Render & listen */
 .action-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 .action-row .ab-button { flex: 0 0 auto; min-width: 130px; padding: 12px 16px; font-size: 14px; }
+.format-select { width: auto; flex: 0 0 auto; padding: 11px 8px; }
+.button-quiet { flex-grow: 0; background: var(--btn-bg); }
+
+/* Meter */
+.meter { margin-top: 10px; overflow-x: auto; }
+.meter table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+.meter caption { caption-side: bottom; text-align: left; padding-top: 5px; font-size: 10.5px; color: var(--muted); }
+.meter th, .meter td { padding: 4px 8px; text-align: right; white-space: nowrap; border-bottom: 1px solid #26303a; }
+.meter thead th { font-size: 10px; letter-spacing: 0.5px; text-transform: uppercase; color: var(--accent); font-weight: 700; cursor: help; }
+.meter tbody th { text-align: left; color: #dfe7ee; font-size: 11px; letter-spacing: 1px; }
+.meter td { color: #c9d6e2; }
+.meter .meter-delta td, .meter .meter-delta th { color: var(--amber); border-bottom: none; }
+.meter td.meter-warn { color: var(--amber); cursor: help; }
+.meter td.meter-bad { color: #ff6b6b; font-weight: bold; cursor: help; }
+.ab-button.active { border: 1px solid var(--lime); background: linear-gradient(to bottom, #36571b, #25391a); }
+
+/* Batch */
+.panel-hint { margin: 0 0 12px; font-size: 12.5px; color: var(--muted); line-height: 1.45; }
+.batch-list { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.batch-list:empty { display: none; }
+.batch-item {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 10px; align-items: center;
+  padding: 8px 10px; background: #1f2a36; border: 1px solid var(--border); border-radius: 4px;
+}
+.batch-item.previewing { border-color: var(--accent); }
+.bi-name { font-size: 13px; color: #dfe7ee; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bi-status { grid-column: 1; font-size: 11.5px; color: var(--muted); }
+.batch-item[data-state="done"] .bi-status { color: #9ae66e; }
+.batch-item[data-state="stale"] .bi-status { color: var(--amber); }
+.batch-item[data-state="error"] .bi-status { color: #ff7777; }
+.bi-actions { grid-column: 2; grid-row: 1 / span 2; display: flex; gap: 6px; }
+.bi-actions button {
+  flex: 0 0 auto; min-width: 36px; padding: 6px 10px; font-size: 13px;
+  background: var(--btn-bg); box-shadow: none;
+}
+.bi-progress { grid-column: 1 / -1; height: 4px; }
+#batch-preview:not([hidden]) { display: block; }
+body.dragging::after {
+  content: 'Drop audio: one file loads as the source; several files or a folder go to the batch';
+  position: fixed; inset: 12px; z-index: 50; pointer-events: none;
+  display: grid; place-items: center; padding: 24px; text-align: center;
+  background: rgba(14, 18, 24, 0.82); border: 3px dashed var(--accent); border-radius: 10px;
+  color: #fff; font-size: 18px; font-weight: bold;
+}
 
 .viz-container {
-  position: relative; width: 100%; height: 180px;
+  position: relative; width: 100%; height: 180px; min-height: 140px; max-height: 85vh;
   background: #000; border-radius: 6px; border: 1px solid #444;
-  overflow: hidden; margin-top: 14px;
+  overflow: hidden; margin-top: 14px; resize: vertical;
   box-shadow: inset 0 0 20px rgba(0,0,0,0.8);
 }
 canvas { width: 100%; height: 100%; display: block; }
 
 /* Visualizer mode switch (segmented control, active side lit) */
-.viz-modes {
+.viz-toolbar {
   position: absolute; top: 6px; right: 6px; z-index: 3;
+  display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; max-width: calc(100% - 12px);
+}
+.viz-modes {
   display: flex; border: 1px solid var(--border); border-radius: 4px;
   overflow: hidden; background: rgba(14, 18, 24, 0.85);
 }
@@ -202,6 +249,10 @@ canvas { width: 100%; height: 100%; display: block; }
 .viz-mode + .viz-mode { border-left: 1px solid var(--border); }
 .viz-mode:hover:not(.active) { color: #fff; background: rgba(62, 76, 92, 0.5); }
 .viz-mode.active { background: linear-gradient(to bottom, var(--lime) 5%, #536904 95%); color: #fff; cursor: default; }
+#viz-log.active, #viz-tall[aria-pressed="true"] { cursor: pointer; }
+.viz-mode:disabled { background: transparent; color: #4a535d; box-shadow: none; }
+#visualizer { touch-action: pan-y; cursor: crosshair; }
+#visualizer:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 /* CRT scanline effect */
 .scanlines {
@@ -300,6 +351,7 @@ audio { width: 100%; margin-top: 12px; height: 40px; filter: invert(0.9) hue-rot
 button, .button, select { touch-action: manipulation; }
 
 footer { margin-top: 22px; font-size: 11px; color: #5d6873; border-top: 1px solid #2c333b; padding-top: 14px; text-align: center; }
+footer a { color: #7d8b98; }
 
 @media (prefers-reduced-motion: reduce) {
   #mic.recording { animation: none; }
@@ -324,10 +376,18 @@ footer { margin-top: 22px; font-size: 11px; color: #5d6873; border-top: 1px soli
   .mode-row span { line-height: 1.45; }
   .upload-row button, .action-row button { min-height: 44px; }
   .action-row .ab-button { flex: 1 1 100%; }
+  .format-select { flex: 1 1 100%; }
+  .bi-actions button { min-height: 40px; min-width: 44px; }
   .signal-chain { grid-template-columns: 1fr; gap: 4px; }
   .signal-chain li + li::before { display: none; }
-  .viz-mode { min-height: 44px; min-width: 52px; }
-  .viz-modes { top: 4px; right: 4px; }
+  .viz-mode { min-height: 40px; min-width: 44px; padding: 4px 8px; }
+  /* The toolbar gets its own strip above the view instead of covering it. */
+  .viz-container { display: flex; flex-direction: column; height: 250px; }
+  .viz-toolbar { position: static; order: -1; flex: 0 0 auto; max-width: none; justify-content: space-between;
+    gap: 4px; padding: 4px; background: #0b0e12; border-bottom: 1px solid #2c333b; }
+  #visualizer { flex: 1 1 auto; min-height: 0; height: auto; }
+  /* Pinch zooms on touch screens; the step buttons would crowd the view. */
+  .viz-zoom-step { display: none; }
   audio { height: 36px; }
   /* 16px inputs stop iOS Safari from zooming the page on focus */
   input[type=number], select, #console-input { font-size: 16px; }

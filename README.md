@@ -15,11 +15,28 @@ pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-For GitHub Pages, enable Pages from the root of your publishing branch; no build is required. **Keep `.nojekyll`, `vendor/` (both codec folders), `opus-codec.mjs`, `audio-worker.js` and `mic-capture.js`** alongside the HTML, CSS, other scripts and icons. `node_modules/` is not needed on the website.
+For GitHub Pages, enable Pages from the root of your publishing branch; no build is required. **Keep `.nojekyll`, `vendor/` (all three codec folders), `opus-codec.mjs`, `audio-worker.js` and `mic-capture.js`** alongside the HTML, CSS, other scripts and icons. `node_modules/` is not needed on the website.
 
 Use HTTPS or localhost. Opening `index.html` as a local file does not reliably support codec modules or microphone capture. After the app and its service worker load, conversion works offline. Background cache updates never reload the page or discard loaded audio; refresh when you are ready to use updated page code.
 
-Choose a file or record, pick a preset, process, and download the mono 16-bit PCM WAV. Microphone capture uses uncompressed PCM, so the only lossy pass is the emulated codec. Limits: 100 MB / 10 minutes for files, 5 minutes for recording. Supported upload formats depend on the browser.
+Choose a file or record, pick a preset, process, and download. Microphone capture uses uncompressed PCM, so the only lossy pass is the emulated codec. Limits: 100 MB / 10 minutes per file, 5 minutes for recording. Supported upload formats depend on the browser.
+
+## Downloads and batches
+
+Renders are mono 16-bit. The format picker next to Download sets the format for single files and batches:
+
+| Format | Size (typical render) | Notes |
+| --- | --- | --- |
+| **WAV** | 100% | the render itself |
+| **FLAC** | about 45% | lossless: decodes to exactly the WAV's samples |
+| **MP3** | about 15–20% | LAME 3.100 at `-V 0`, LAME's highest VBR quality. Level and waveform are kept (gain within 0.1%). The LAME tag carries the encoder delay, so players return exactly the render's length. |
+
+FLAC and MP3 are made from the WAV when a file is saved. MP3 is lossy on top of the emulated codec. It is meant for sharing; keep WAV or FLAC for further processing.
+
+**Batch** (step 4) renders many files with the current settings and saves them one by one or as one ZIP.
+- **Adding files:** use the batch file picker, choose several files in step 1, or drop files or whole folders anywhere on the page. A single file dropped outside the batch loads as the source.
+- **Rendering:** runs two files at a time on machines with four or more cores. Each row reports length, integrated loudness and true peak, and has preview, save and remove buttons.
+- **Changed settings:** changing a setting marks earlier renders as older; "Render" redoes them. The tab title shows progress.
 
 ## The voice path
 
@@ -97,12 +114,35 @@ Some controls behave differently from their names:
 
 The developer console supports Source-style `;` chaining, `alias`, `toggle`, `find`, history, and Tab completion. Tab completes to the longest common prefix, then lists matching commands with their current values. `writeconfig` copies a share URL; `preset_save/load/list/delete` manage local presets. `net_graph 1–4` overlays a Source-style HUD whose packet rate, payload rate and loss come from the last render. The background game-event feed (kills, chat, joins and drops) can be stopped with `sv_simulate_events 0`.
 
-The visualizer has three views:
-- **WAVE:** peak and RMS envelope.
-- **BARS:** a log-frequency spectrum in dBFS; live while playing, computed at the playhead when paused.
-- **SPEC:** a whole-file linear-frequency spectrogram, where the 12 kHz Opus edge and the post-clip shelf are visible.
+## Visualizer and meter
 
-All three follow the A/B toggle.
+The visualizer has three views. All three follow the A/B toggle.
+- **WAVE:** peak and RMS envelope, down to individual samples. **dB** switches to a dBFS amplitude scale for quiet detail: fades, the gate's tails, DTX comfort noise and noise floors. Full-scale samples are marked red.
+- **BARS:** a log-frequency spectrum from 20 Hz, 8192-point, in dBFS; live while playing, computed at the playhead when paused. The version you are not hearing (dry or wet) is drawn over it as a line.
+- **SPEC:** a spectrogram with a dB colour scale.
+  - **LIN** shows the 12 kHz Opus edge and the post-clip shelf as lines.
+  - **LOG** runs from 20 Hz. Below 400 Hz it analyses a 16× decimated signal with a 1024-point FFT, for about 3 Hz resolution there. Its levels are per Hz, so noise reads the same across the split.
+
+**Navigating** WAVE and SPEC:
+- Zoom in time with Ctrl/⌘ + wheel, a trackpad or touch pinch, the − and + buttons or the + and − keys.
+- Pan by dragging, with Shift + wheel or with the arrow keys; FIT or 0 shows the whole file.
+- Click to seek. While playing zoomed in, the view pages along with the playhead.
+
+Only the visible range is analysed, at the display's full pixel resolution. The range button sets how many dB the colours (or the dB waveform) span. TALL, or dragging the bottom-right corner, makes the view taller. Hovering reads out time, frequency and level.
+
+**Meter.** Under the visualizer, the meter lists for the wet render and the dry source:
+- integrated loudness and maximum short-term and momentary loudness (ITU-R BS.1770-4, gated)
+- loudness range (EBU Tech 3342)
+- true peak (4× oversampled), sample peak and RMS
+- peak-to-loudness ratio and DC offset
+
+A Δ row gives wet minus dry. Values are measured as one channel; played as dual mono they read 3 dB higher.
+
+**Match loudness** makes the A/B comparison fair: the louder version plays quieter by the difference in integrated loudness, so neither wins just by being louder.
+
+**Shortcuts:** Space plays and pauses, B switches A/B.
+
+The meter shows a real codec property: libopus 1.1.x adds a DC offset to strong, sustained content below about 60 Hz. See finding 18 in [REFERENCE_2026.md](tests/REFERENCE_2026.md).
 
 ## Reference recordings
 
@@ -133,11 +173,32 @@ pnpm test:all
 - **`tests/verify.js`:** resampler passband/stopband/alignment, the profile FIR, and the auto-gain law. The law checks cover the measured sine overdrive at `voice_avggain` 0.5 and 0.25, the cap, the int16 clamp, silence hold, step timing and the `voice_scale` sawtooth and truncation. Also the voice gate (threshold, pre-roll, hold, talk spurts, DTX comfort noise on steady tones, send/skip accounting), stereo capture, real codec modes per profile, all room presets 0–29, the measured loss bursts and late-frame jitter with PLC, option robustness and WAV structure.
 - **`tests/opus.verify.mjs`:** frame timing and boundary pulses, exact lengths, bitrates and packet sizes, TOC mode reporting, native concealment, silence, mute, determinism, the sender gate inside the round trip (pre-roll, hold, talk spurts), opt-in DTX, leveling and cap behavior, output-volume linearity, pre-encoder filtering, and codec-failure reporting. Also the libopus 1.1.5 build: its packets are bit-identical to a native build of the release, and its DTX differs from 1.6.1's as Steam's does.
 - **`tests/reference.verify.mjs`:** alignment, clock drift, polarity, fractional delay, clip-signature and level-tracking metrics.
-- **Chromium checks:** worker parity, cancellation, PCM recording, offline conversion, every visualizer mode, the chain strip, presets, console completion, `net_graph`, accessibility, mobile layout, and the 44.1/48 kHz file × decode-rate matrix. Set `CHROMIUM_EXECUTABLE` to use a preinstalled browser whose build differs from Playwright's pin.
+- **`tests/formats.verify.mjs`:** download formats and ZIPs.
+  - FLAC decodes bit-exact with valid frame CRCs, through an independent decoder in the test.
+  - The MP3 module matches its documented build. Its files are byte-identical to a native gcc build of LAME 3.100. Decoded with mpg123, they keep level and waveform, and their LAME tag accounts for every sample.
+  - Rates MP3 cannot carry are resampled.
+  - The WAV reader works, and ZIP archives have correct headers and CRC-32.
+- **`tests/meter.verify.mjs`:** the meter against BS.1770-4 and EBU Tech 3342:
+  - K-weighting coefficients
+  - −3.01 LUFS for a full-scale 997 Hz sine, and −23 LUFS at −20 dBFS
+  - both gates
+  - LRA 10 LU on the two-level case
+  - true peak 0 dBTP on the fs/4, 45° sine
+- **Chromium checks:**
+  - worker parity, cancellation, PCM recording and offline conversion
+  - every visualizer mode, zoom, pan, seek, keys and scales
+  - the meter, loudness-matched A/B and shortcuts
+  - batch queueing: picker, step 1 multi-select, drop on the batch panel, single-file drop as source
+  - batch rendering with loudness per file, and ZIPs in all three formats, with FLAC decoded in the browser to exactly the WAV's samples
+  - stale-render marking and remembered format
+  - the chain strip, presets, console completion, `net_graph`, accessibility and mobile layout
+  - the 44.1/48 kHz file × decode-rate matrix
+
+  Set `CHROMIUM_EXECUTABLE` to use a preinstalled browser whose build differs from Playwright's pin.
 
 These tests establish implementation behavior; the accuracy claims rest on the paired comparison above. CI runs Node 22 and Chromium.
 
-`pnpm vendor:opus` copies the pinned 1.6.1 runtime and notices verbatim. `pnpm build:opus11` rebuilds the libopus 1.1.5 module from the tagged sources; it needs clang with the wasm32 target and wasm-ld. `pnpm test:vendor` checks the 1.6.1 files against the installed dependency and the 1.1.5 module against its recorded hash. The runtimes and licenses are required distribution files.
+`pnpm vendor:opus` copies the pinned 1.6.1 runtime and notices verbatim. `pnpm build:opus11` rebuilds the libopus 1.1.5 module from the tagged sources. `pnpm build:lame` rebuilds the LAME 3.100 module from the release tarball, checked against its SHA-256. Both need clang with the wasm32 target and wasm-ld. `pnpm test:vendor` checks the 1.6.1 files against the installed dependency and the 1.1.5 module against its recorded hash. The runtimes and licenses are required distribution files.
 
 ## Files and licensing
 
@@ -147,11 +208,15 @@ These tests establish implementation behavior; the accuracy claims rest on the p
 | `opus-codec.mjs` | packets, modes and delay; picks the libopus runtime |
 | `vendor/libopus-1.1/` | libopus 1.1.5 WebAssembly for the Steam profile |
 | `vendor/libopus/` | libopus 1.6.1 (libopus-wasm) for the other profiles |
-| `audio-worker.js` | cancellable background processing |
+| `vendor/lame/` | LAME 3.100 WebAssembly, the MP3 encoder |
+| `audio-worker.js` | cancellable background rendering, format conversion and metering |
 | `mic-capture.js` | PCM recording |
 | `constants.js` | presets, codec profiles, receiver model, room data |
-| `script.js` | interface, visualizer and console |
+| `script.js` | interface, visualizer, meter and console |
+| `batch.js` | batch queue, drag and drop, ZIP downloads |
+| `formats.js`, `flac.js`, `zip.js` | download formats: WAV reader, FLAC encoder, stored ZIP |
+| `meter.js` | loudness and level measurement |
 
 Tests and local tooling are under `tests/`.
 
-Application code: MIT. Codec notices: `vendor/libopus/LICENSE`, `COPYING.opus` and `THIRD_PARTY_NOTICES.md`, and `vendor/libopus-1.1/COPYING.opus` (libopus, BSD) and `COPYRIGHT.musl` (musl libm, MIT). TF2, Source and Steam are Valve trademarks. This independent tool is not affiliated with Valve.
+Application code: MIT. Codec notices: `vendor/libopus/LICENSE`, `COPYING.opus` and `THIRD_PARTY_NOTICES.md`, and `vendor/libopus-1.1/COPYING.opus` (libopus, BSD) and `COPYRIGHT.musl` (musl libm, MIT). The MP3 encoder is LAME 3.100, unmodified, under the GNU LGPL version 2 (`vendor/lame/COPYING.lame`). It is a separate module that loads only when an MP3 is saved and can be rebuilt or replaced with `tests/lame/build.mjs`; see `vendor/lame/README.md`. TF2, Source and Steam are Valve trademarks. This independent tool is not affiliated with Valve.

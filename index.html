@@ -28,9 +28,9 @@
     <section class="panel" aria-labelledby="step-source">
       <h2 id="step-source"><span class="step" aria-hidden="true">1</span> Source</h2>
       <div class="upload-row">
-        <input id="file" type="file" accept="audio/*" aria-label="Audio file to process">
+        <input id="file" type="file" accept="audio/*" multiple aria-label="Audio file to process (choose several to batch them)">
         <button id="mic" type="button" title="Record from microphone (+voicerecord)">🎤 Record</button>
-        <div id="source-status" class="source-status" role="status" aria-live="polite">Choose an audio file or record from the microphone.</div>
+        <div id="source-status" class="source-status" role="status" aria-live="polite">Choose or drop an audio file, or record from the microphone. Several files at once go to the batch (step 4).</div>
       </div>
     </section>
 
@@ -240,17 +240,33 @@
         <button id="process" type="button" disabled>Process Audio</button>
         <button id="cancel-process" class="button-secondary" type="button" hidden>Cancel</button>
         <button id="download" type="button" disabled>Download WAV</button>
-        <button id="ab-toggle" class="preset-btn ab-button" type="button" disabled title="Switch playback between processed (Wet) and original (Dry)">A/B: Wet</button>
+        <select id="format" class="format-select" aria-label="Download format" title="File format for downloads, here and in the batch">
+          <option value="wav">WAV · lossless</option>
+          <option value="flac">FLAC · lossless, ~½ size</option>
+          <option value="mp3">MP3 · V0, ~⅕ size</option>
+        </select>
+        <button id="ab-toggle" class="preset-btn ab-button" type="button" disabled title="Switch playback between processed (Wet) and original (Dry). Shortcut: B; Space plays and pauses">A/B: Wet</button>
+        <button id="ab-match" class="preset-btn ab-button" type="button" disabled aria-pressed="false" title="Loudness-matched A/B: plays the louder version quieter by the difference in integrated loudness (LUFS), so the comparison is about sound, not level">Match loudness</button>
         <progress id="process-progress" max="100" value="0" hidden aria-label="Audio processing progress"></progress>
       </div>
 
       <div class="viz-container">
         <div class="scanlines"></div>
-        <canvas id="visualizer" aria-label="Audio visualizer"></canvas>
-        <div class="viz-modes" role="group" aria-label="Visualizer mode">
-          <button id="viz-wave" class="viz-mode active" type="button" aria-pressed="true" title="Waveform: peak and RMS envelope">WAVE</button>
-          <button id="viz-bars" class="viz-mode" type="button" aria-pressed="false" title="Log-frequency spectrum in dBFS">BARS</button>
-          <button id="viz-spec" class="viz-mode" type="button" aria-pressed="false" title="Whole-file spectrogram, linear frequency">SPEC</button>
+        <canvas id="visualizer" tabindex="0" aria-label="Audio visualizer. In WAVE and SPEC: Ctrl or Command plus wheel, or pinch, zooms in time; drag or Shift plus wheel pans; click seeks. Keys: plus and minus zoom, arrows pan, 0 shows the whole file."></canvas>
+        <div class="viz-toolbar">
+          <div class="viz-modes" role="group" aria-label="Zoom and scale">
+            <button id="viz-log" class="viz-mode" type="button" aria-pressed="false" title="Spectrogram frequency axis: log from 20 Hz, with ~3 Hz resolution below 400 Hz">LOG</button>
+            <button id="viz-zoom-out" class="viz-mode viz-zoom-step" type="button" title="Zoom out (−). Ctrl/⌘ + wheel or pinch zooms around the pointer" aria-label="Zoom out">−</button>
+            <button id="viz-zoom-in" class="viz-mode viz-zoom-step" type="button" title="Zoom in (+). Drag or Shift + wheel pans; click seeks" aria-label="Zoom in">+</button>
+            <button id="viz-fit" class="viz-mode" type="button" title="Show the whole file (0)">FIT</button>
+            <button id="viz-range" class="viz-mode" type="button" hidden title="Displayed dynamic range: how far below the loudest level the colours (or the dB waveform) reach">72 dB</button>
+            <button id="viz-tall" class="viz-mode" type="button" aria-pressed="false" title="Taller view (or drag the bottom-right corner)">TALL</button>
+          </div>
+          <div class="viz-modes" role="group" aria-label="Visualizer mode">
+            <button id="viz-wave" class="viz-mode active" type="button" aria-pressed="true" title="Waveform: peak and RMS envelope; single samples when zoomed in">WAVE</button>
+            <button id="viz-bars" class="viz-mode" type="button" aria-pressed="false" title="Log-frequency spectrum in dBFS">BARS</button>
+            <button id="viz-spec" class="viz-mode" type="button" aria-pressed="false" title="Spectrogram; LOG for detail below 100 Hz">SPEC</button>
+          </div>
         </div>
         <!-- Source-style net_graph HUD: voice numbers come from the last render -->
         <div id="net-graph" class="ng-level-0" aria-hidden="true">
@@ -264,10 +280,47 @@
         </div>
       </div>
 
+      <div id="meter" class="meter" hidden>
+        <table>
+          <caption>Loudness and levels · ITU-R BS.1770-4 / EBU R128, measured as one channel</caption>
+          <thead>
+            <tr>
+              <th scope="col"></th>
+              <th scope="col" title="Integrated loudness, gated (LUFS)">Integrated</th>
+              <th scope="col" title="Loudness range, EBU Tech 3342 (LU)">LRA</th>
+              <th scope="col" title="Maximum short-term (3 s) loudness (LUFS)">Max S</th>
+              <th scope="col" title="Maximum momentary (400 ms) loudness (LUFS)">Max M</th>
+              <th scope="col" title="True peak, 4× oversampled (dBTP)">True peak</th>
+              <th scope="col" title="Sample peak (dBFS)">Peak</th>
+              <th scope="col" title="RMS level (dBFS)">RMS</th>
+              <th scope="col" title="Peak-to-loudness ratio: true peak minus integrated loudness (dB)">PLR</th>
+              <th scope="col" title="DC offset (% of full scale)">DC %</th>
+            </tr>
+          </thead>
+          <tbody id="meter-rows"></tbody>
+        </table>
+      </div>
+
       <audio id="preview" controls aria-label="Processed audio preview"></audio>
       <!-- Hidden dry twin: plays muted in sync with the main player so the
            A/B toggle is an instant unmute instead of a src swap. -->
       <audio id="preview-dry" hidden></audio>
+    </section>
+
+    <section class="panel" id="batch-panel" aria-labelledby="step-batch">
+      <h2 id="step-batch"><span class="step" aria-hidden="true">4</span> Batch</h2>
+      <p class="panel-hint">Render many files with the settings above, then save them one by one or as a ZIP in the format chosen in step 3. Add files here, choose several in step 1, or drop files or folders anywhere on the page.</p>
+      <div class="action-row">
+        <input id="batch-files" type="file" accept="audio/*" multiple aria-label="Audio files to add to the batch">
+        <button id="batch-run" type="button" disabled>Render all</button>
+        <button id="batch-cancel" class="button-secondary" type="button" hidden>Cancel</button>
+        <button id="batch-zip" type="button" disabled>Save as WAV (.zip)</button>
+        <button id="batch-clear" class="button-quiet" type="button" disabled>Clear</button>
+        <div id="batch-summary" class="source-status" role="status" aria-live="polite">No files queued.</div>
+        <progress id="batch-progress" max="100" value="0" hidden aria-label="Batch progress"></progress>
+      </div>
+      <ol id="batch-list" class="batch-list" aria-label="Batch files"></ol>
+      <audio id="batch-preview" controls hidden aria-label="Batch preview"></audio>
     </section>
 
     <details class="console-details" id="console-details">
@@ -285,13 +338,18 @@
     </details>
 
     <footer>
-      Runs entirely in your browser · Opus via bundled libopus · Not affiliated with Valve
+      Runs entirely in your browser · Opus via bundled libopus · MP3 via <a href="https://lame.sourceforge.io">LAME</a> (LGPL) · Not affiliated with Valve
     </footer>
   </main>
 
   <script src="constants.js"></script>
   <script src="audio.js"></script>
+  <script src="flac.js"></script>
+  <script src="formats.js"></script>
+  <script src="zip.js"></script>
+  <script src="meter.js"></script>
   <script src="script.js"></script>
+  <script src="batch.js"></script>
   <script>
     // Offline/PWA support — only meaningful over http(s), not file://
     if ('serviceWorker' in navigator && location.protocol.indexOf('http') === 0) {
