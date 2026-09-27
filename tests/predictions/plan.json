@@ -1,0 +1,260 @@
+{
+  "about": "Takes not yet recorded, and the settings the app renders them with. `node tests/accuracy.mjs --write-predictions` renders every hypothesis in headless Chromium and writes predictions.json; `--score-predictions --takes <folder>` scores recorded takes against it. Each take is the v1 test signal (tests/testsignal) played as for Set B, recorded losslessly. The C entries are controls: takes recorded before the predictions, scored the same way to show what the tolerances mean.",
+  "signal": "tests/testsignal/tf2_voice_testsignal_v1.wav",
+  "segments": "tests/testsignal/tf2_voice_testsignal_v1.json",
+  "tolerances": {
+    "levelDb": 1.0,
+    "clipPoints": 5,
+    "clipNote": "Share of a segment's samples within 10% (0.9 dB) of the clamp, in percentage points; tested where either side is over 0.5%. 10% rather than 5% because game sound riding on clipped stretches pushes samples out of a narrower window: stand-in takes (--simulate-takes: a render plus the game sound of a real take, so the model is exact) lost up to 6 points at 5%.",
+    "bandDb": 1.5,
+    "bandHz": [
+      120,
+      10000
+    ],
+    "scorableAboveAmbienceDb": 10,
+    "levelNote": "Levels are measured in each segment's band (reference.js segmentBand: 30 Hz either side of a steady tone or 1 kHz sine, 150 Hz-10 kHz for noise, sweeps, clicks and the vowel) over its middle 60%. A segment predicted at least scorableAboveAmbienceDb over the take's ambience in that band (median of its quiet segments of 1 s or more) must come within levelDb. One predicted lower passes if the take is below that line plus levelDb (the ambience adds to it).",
+    "holds": {
+      "segmentShare": 0.9,
+      "bandsMissed": 1,
+      "ceilingDb": 0.5
+    },
+    "holdsNote": "A hypothesis holds for a take if at least segmentShare of its scored segments are within tolerance, at most bandsMissed spectrum bands are not, and the clamp is within ceilingDb.",
+    "decisive": {
+      "minSegments": 3,
+      "winnerShare": 0.67,
+      "loserShare": 0.34
+    },
+    "decisiveNote": "Between two hypotheses, the discriminating segments are those where no measurement can pass both: level predictions more than twice levelDb apart, or one predicting a level more than levelDb over the line the other's 'nothing audible' allows. A verdict is decisive when there are at least minSegments of them, and the better hypothesis passes at least winnerShare of them and the other at most loserShare.",
+    "dtxSensitive": [
+      "sine1k_-36dB",
+      "sine1k_-30dB",
+      "tone_7000Hz_-20dB",
+      "tone_7500Hz_-20dB",
+      "tone_8000Hz_-20dB",
+      "tone_8500Hz_-20dB",
+      "tone_10000Hz_-20dB",
+      "tone_11000Hz_-20dB",
+      "tone_11500Hz_-20dB",
+      "tone_12000Hz_-20dB",
+      "tone_13000Hz_-20dB"
+    ],
+    "dtxSensitiveNote": "Steady signals that Opus DTX can take over, in Steam's encoder or the model's, where the two differ: the tones from 7 kHz up (REFERENCE_2026.md, findings 13 and 14), and the segments the model sends as DTX in 25% or more of the frames of their middle 60% (the 1 kHz sines at -36 and -30 dBFS: 97% and 35%; the 8, 8.5, 11 and 12 kHz tones). Scored apart for Opus hypotheses, in full for CELT.",
+    "notScored": [
+      "sync_start",
+      "sync_end"
+    ],
+    "notScoredNote": "Alignment markers, one at each end of the signal. Each is the first voice after a long pause (before the signal, or 10 s: pink_quiet_-50dB stays under Steam's gate, then silence_end), so its level depends on the receiver's gain state from before; the controls miss them by up to 1.8 dB."
+  },
+  "takes": [
+    {
+      "id": "C1_default",
+      "control": true,
+      "file": [
+        "take1_default.flac",
+        "take1_default_-_voice_maxgain_10.flac"
+      ],
+      "console": "(Set B, recorded 2026)",
+      "question": "Control: Set B default take, recorded before these predictions.",
+      "hypotheses": [
+        {
+          "id": "model",
+          "primary": true,
+          "label": "defaults",
+          "settings": {
+            "codec": "steam",
+            "volume": 0.15
+          }
+        }
+      ]
+    },
+    {
+      "id": "C2_voice_scale_0.5",
+      "control": true,
+      "file": [
+        "take2_voice_scale_0.5.flac"
+      ],
+      "console": "(Set B)",
+      "question": "Control: Set B voice_scale 0.5.",
+      "hypotheses": [
+        {
+          "id": "model",
+          "primary": true,
+          "label": "voice_scale 0.5",
+          "settings": {
+            "codec": "steam",
+            "volume": 0.15,
+            "voiceScale": 0.5
+          }
+        }
+      ]
+    },
+    {
+      "id": "C3_voice_maxgain_1",
+      "control": true,
+      "file": [
+        "take3_voice_maxgain_1.flac"
+      ],
+      "console": "(Set B)",
+      "question": "Control: Set B voice_maxgain 1.",
+      "hypotheses": [
+        {
+          "id": "model",
+          "primary": true,
+          "label": "voice_maxgain 1",
+          "settings": {
+            "codec": "steam",
+            "volume": 0.15,
+            "maxGain": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "C4_voice_avggain_0.25",
+      "control": true,
+      "file": [
+        "take3_voice_avggain_0.25.flac"
+      ],
+      "console": "(Set B)",
+      "question": "Control: Set B voice_avggain 0.25.",
+      "hypotheses": [
+        {
+          "id": "model",
+          "primary": true,
+          "label": "voice_avggain 0.25",
+          "settings": {
+            "codec": "steam",
+            "volume": 0.15,
+            "avgGain": 0.25
+          }
+        }
+      ]
+    },
+    {
+      "id": "P1_vaudio_celt",
+      "file": "P1_vaudio_celt.flac",
+      "console": "sv_voicecodec vaudio_celt; changelevel <map>; voice_loopback 1; volume 0.15",
+      "question": "Does the real engine CELT codec match CELT 0.11 at 22050 Hz / 512 samples / 64-byte packets, and does Steam's voice gate still apply with a legacy codec?",
+      "hypotheses": [
+        {
+          "id": "no_gate",
+          "primary": true,
+          "label": "as shipped: continuous transmission, auto-gain at 22.05 kHz",
+          "settings": {
+            "codec": "celt_22",
+            "volume": 0.15,
+            "gate": false
+          }
+        },
+        {
+          "id": "steam_gate",
+          "label": "Steam's gate (-39.5 dBFS, 120 ms pre-roll, 440 ms hold) before CELT",
+          "settings": {
+            "codec": "celt_22",
+            "volume": 0.15,
+            "gate": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "P2_vaudio_celt_high",
+      "file": "P2_vaudio_celt_high.flac",
+      "console": "sv_voicecodec vaudio_celt_high; changelevel <map>; voice_loopback 1; volume 0.15",
+      "question": "120-byte packets (165 kbps, one public source) or 32-byte packets (the '44 kbps' of Valve's wiki)?",
+      "hypotheses": [
+        {
+          "id": "bytes_120",
+          "primary": true,
+          "label": "as shipped: 44100 Hz, 256-sample frames, 120-byte packets",
+          "settings": {
+            "codec": "celt_44",
+            "volume": 0.15,
+            "gate": false
+          }
+        },
+        {
+          "id": "bytes_32",
+          "label": "32-byte packets (44 kbps)",
+          "settings": {
+            "codec": "celt_44",
+            "volume": 0.15,
+            "gate": false,
+            "bits": 4.266666666666667
+          }
+        }
+      ]
+    },
+    {
+      "id": "P3_voice_scale_2",
+      "file": "P3_voice_scale_2.flac",
+      "console": "voice_scale 2; voice_loopback 1; volume 0.15",
+      "question": "voice_scale above 1: the gain ramp starts at s squared times the target and climbs toward s times it (finding 4), so 2 should push far more samples into the clamp.",
+      "hypotheses": [
+        {
+          "id": "model",
+          "primary": true,
+          "label": "finding 4's update, s = 2",
+          "settings": {
+            "codec": "steam",
+            "volume": 0.15,
+            "voiceScale": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "P4_voice_avggain_1",
+      "file": "P4_voice_avggain_1.flac",
+      "console": "voice_avggain 1; voice_loopback 1; volume 0.15",
+      "question": "voice_avggain 1 normalizes each block's peak (not a mean/peak blend) to full scale: less clipping than the default.",
+      "hypotheses": [
+        {
+          "id": "model",
+          "primary": true,
+          "label": "finding 3's law, avggain 1",
+          "settings": {
+            "codec": "steam",
+            "volume": 0.15,
+            "avgGain": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "P5_voice_maxgain_3",
+      "file": "P5_voice_maxgain_3.flac",
+      "console": "voice_maxgain 3; voice_loopback 1; volume 0.15",
+      "question": "A lower gain cap: quiet segments come up at most 9.5 dB instead of 20 dB.",
+      "hypotheses": [
+        {
+          "id": "model",
+          "primary": true,
+          "label": "finding 3's law, cap 3",
+          "settings": {
+            "codec": "steam",
+            "volume": 0.15,
+            "maxGain": 3
+          }
+        }
+      ]
+    },
+    {
+      "id": "P6_volume_1",
+      "file": "P6_volume_1.flac",
+      "console": "volume 1; voice_loopback 1",
+      "question": "The output ceiling is int16 full scale times volume (finding 1): at volume 1 the clamp sits at 0 dBFS.",
+      "hypotheses": [
+        {
+          "id": "model",
+          "primary": true,
+          "label": "defaults, volume 1",
+          "settings": {
+            "codec": "steam",
+            "volume": 1
+          }
+        }
+      ]
+    }
+  ]
+}

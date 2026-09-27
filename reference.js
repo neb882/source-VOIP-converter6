@@ -862,8 +862,98 @@
     return out;
   }
 
+  // Per-segment measures on the test signal's timeline (its JSON segment
+  // map): RMS level and peak over the middle 60% of each segment of at least
+  // 0.5 s, and the share of those samples within 10% of `ceiling` (the
+  // file's clamp, linear; wide enough that game sound riding on a clipped
+  // stretch does not push its samples out). Gaps and silences are measured too: they give the
+  // recording's ambience.
+  //
+  // Each segment also gets a band level (bandDb) in the band its content
+  // occupies: 30 Hz either side of a steady tone or 1 kHz sine (the analysis
+  // window's main lobe is 23 Hz wide each way), half an octave around 1 kHz
+  // for the short sync beeps, 150 Hz-10 kHz for the rest. A recording's game
+  // sound is broadband, so a tone stays measurable in its band 20 dB or more
+  // below the recording's broadband level.
+  function segmentBand(name) {
+    const tone = /^tone_(\d+)Hz/.exec(name);
+    if (tone) return [+tone[1] - 30, +tone[1] + 30];
+    if (/^(sine1k|step_sine)/.test(name)) return [970, 1030];
+    if (/^sync/.test(name)) return [707, 1414];
+    return [150, 10000];
+  }
+  // Mean-square level (dB) of [a, b) in [lo, hi) Hz: Hann-windowed 4096-point
+  // frames, half overlapping, scaled so a sine reads its RMS level.
+  function bandLevelDb(samples, rate, a, b, lo, hi) {
+    const size = 4096, re = new Float64Array(size), im = new Float64Array(size);
+    let w2 = 0;
+    for (let i = 0; i < size; i++) w2 += (.5 - .5 * Math.cos(2 * Math.PI * i / size)) ** 2;
+    const k0 = Math.max(1, Math.ceil(lo * size / rate)), k1 = Math.min(size / 2 - 1, Math.floor(hi * size / rate));
+    let total = 0, frames = 0;
+    for (let start = a; start + size <= b; start += size / 2) {
+      for (let i = 0; i < size; i++) { re[i] = samples[start + i] * (.5 - .5 * Math.cos(2 * Math.PI * i / size)); im[i] = 0; }
+      fft(re, im);
+      let e = 0;
+      for (let k = k0; k <= k1; k++) e += re[k] * re[k] + im[k] * im[k];
+      total += 2 * e / (size * w2);
+      frames++;
+    }
+    return frames ? db(total / frames) : null;
+  }
+  function segmentStats(samples, rate, segments, ceiling) {
+    return segments.filter(s => s.dur_s >= .5).map(s => {
+      const a = Math.max(0, Math.round((s.start_s + .2 * s.dur_s) * rate));
+      const b = Math.min(samples.length, Math.round((s.start_s + .8 * s.dur_s) * rate));
+      let sum = 0, peak = 0, near = 0;
+      for (let i = a; i < b; i++) {
+        const m = Math.abs(samples[i]);
+        sum += m * m; peak = Math.max(peak, m);
+        if (ceiling > 0 && m > .9 * ceiling) near++;
+      }
+      const n = Math.max(1, b - a), band = segmentBand(s.name);
+      return { name: s.name, start: s.start_s, end: s.start_s + s.dur_s, quiet: /^(gap|silence)/.test(s.name),
+        levelDb: b > a ? db(sum / n) : null, peakDb: b > a && peak > 0 ? 20 * Math.log10(peak) : -Infinity, clipPct: 100 * near / n,
+        band, bandDb: b > a ? bandLevelDb(samples, rate, a, b, band[0], band[1]) : null };
+    });
+  }
+
+  // The clamp a take or render sits at (linear): the most populated 0.05 dB
+  // step within 6 dB of the loudest sample, where clipped samples pile up.
+  // The output filter overshoots square edges by up to about 0.5 dB, which
+  // throws a percentile off, and game sound riding on clipped stretches can
+  // put a take's loudest sample 2 dB over the clamp. The step counts as a
+  // plateau if it holds 0.2% of the samples or more and twice the mean of
+  // the steps 0.5-1 dB below it; if not, the 99.5th percentile as in clipSignature.
+  function clampLevel(samples) {
+    let max = 0;
+    for (const v of samples) { const m = v < 0 ? -v : v; if (m > max) max = m; }
+    if (!(max > 0)) return 0;
+    const bins = new Float64Array(140);
+    for (const v of samples) {
+      const m = v < 0 ? -v : v;
+      if (m <= 0) continue;
+      const k = Math.floor(20 * Math.log10(max / m) / .05);
+      if (k < bins.length) bins[k]++;
+    }
+    let best = 0;
+    for (let k = 1; k < 120; k++) if (bins[k] > bins[best]) best = k;
+    let below = 0;
+    for (let k = best + 10; k < best + 20; k++) below += bins[k] / 10;
+    if (bins[best] >= samples.length * .002 && bins[best] >= 2 * below) return max / 10 ** (best * .05 / 20);
+    return 10 ** (clipSignature(samples, 48000).ceilingDbfs / 20);
+  }
+
+  // Band levels (BAND_EDGES) in dB relative to the 300 Hz-3 kHz anchor that
+  // describePair level-matches on.
+  function bandProfile(samples, rate) {
+    const a = spectrum(samples, rate), anchor = a[4] + a[5] + a[6] + a[7];
+    if (!(anchor > 1e-15)) throw new Error('Not enough signal at 300 Hz-3 kHz for a band profile.');
+    return Array.from(a, (v, i) => ({ hz: `${BAND_EDGES[i]}-${BAND_EDGES[i + 1]}`,
+      db: BAND_EDGES[i] < rate / 2 && v > 1e-20 ? db(v / anchor) : null }));
+  }
+
   const TF2Reference = { fft, findMatch, createMatcher, percentile, consistentTimeline, BAND_EDGES, spectrum, rmsDb,
-    describePair, clipSignature, levelTracking, sampleTimeline, warp, narrow, locate, gateSpurts, track, warpSegments, compareTake };
+    describePair, clipSignature, levelTracking, sampleTimeline, warp, narrow, locate, gateSpurts, track, warpSegments, compareTake, segmentStats, segmentBand, bandLevelDb, bandProfile, clampLevel };
   if (typeof window !== 'undefined') window.TF2Reference = TF2Reference;
   else if (typeof self !== 'undefined') self.TF2Reference = TF2Reference;
   if (typeof module !== 'undefined' && module.exports) module.exports = TF2Reference;
