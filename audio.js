@@ -871,6 +871,296 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* Live chain: process() one block at a time                          */
+  /*                                                                    */
+  /* The same stages and settings as process(), each keeping its state  */
+  /* between blocks, for the live monitor. Where process() can look     */
+  /* ahead, the live chain waits instead: the zero-phase FIRs become    */
+  /* linear-phase (half their length late), and the voice gate holds    */
+  /* frames back for its pre-roll (120 ms), as the sender must. Rooms   */
+  /* (dsp_room) are not applied.                                        */
+  /* ------------------------------------------------------------------ */
+
+  // resampleSinc, a block at a time: the same kernel and output positions,
+  // so the concatenated output equals resampleSinc of the concatenated input.
+  function streamResampleSinc(inRate, outRate) {
+    inRate = Math.round(inRate); outRate = Math.round(outRate);
+    if (inRate === outRate) return (x) => x;
+    const g = gcd(inRate, outRate), up = outRate / g, down = inRate / g;
+    const { h, half } = resampleKernel(up, down);
+    let buf = new Float32Array(0), start = 0, total = 0, next = 0;
+    return (x) => {
+      const merged = new Float32Array(buf.length + x.length);
+      merged.set(buf); merged.set(x, buf.length);
+      buf = merged; total += x.length;
+      // Output i needs inputs up to (i * down + half) / up.
+      const count = Math.max(0, Math.floor((total * up - 1 - half) / down) + 1 - next);
+      const out = new Float32Array(count);
+      for (let o = 0; o < count; o++, next++) {
+        const t = next * down;
+        let j = Math.max(0, Math.ceil((t - half) / up));
+        const jEnd = Math.floor((t + half) / up);
+        let k = half + t - j * up, acc = 0;
+        for (; j <= jEnd; j++, k -= up) acc += buf[j - start] * h[k];
+        out[o] = acc;
+      }
+      const keep = Math.max(start, Math.ceil((next * down - half) / up));
+      if (keep > start) { buf = buf.slice(keep - start); start = keep; }
+      return out;
+    };
+  }
+
+  // resampleLinear, a block at a time.
+  function streamResampleLinear(inRate, outRate) {
+    if (inRate === outRate) return (x) => x;
+    const ratio = inRate / outRate;
+    let buf = new Float32Array(0), start = 0, total = 0, next = 0;
+    return (x) => {
+      const merged = new Float32Array(buf.length + x.length);
+      merged.set(buf); merged.set(x, buf.length);
+      buf = merged; total += x.length;
+      const out = [];
+      for (;;) {
+        const pos = next * ratio, i0 = pos | 0;
+        if (i0 + 1 > total - 1) break;
+        const frac = pos - i0;
+        out.push(buf[i0 - start] * (1 - frac) + buf[i0 + 1 - start] * frac);
+        next++;
+      }
+      const keep = Math.floor(next * ratio);
+      if (keep > start) { buf = buf.slice(keep - start); start = keep; }
+      return Float32Array.from(out);
+    };
+  }
+
+  function streamBiquad(c) {
+    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    return (x) => {
+      const out = new Float32Array(x.length);
+      for (let i = 0; i < x.length; i++) {
+        const xi = x[i], y = c.b0 * xi + c.b1 * x1 + c.b2 * x2 - c.a1 * y1 - c.a2 * y2;
+        out[i] = y; x2 = x1; x1 = xi; y2 = y1; y1 = y;
+      }
+      return out;
+    };
+  }
+
+  // A symmetric FIR run causally: applyFirZeroPhase's output, (taps - 1) / 2 late.
+  function streamFir(taps) {
+    const m = taps.length, history = new Float32Array(m - 1);
+    return (x) => {
+      const out = new Float32Array(x.length);
+      for (let i = 0; i < x.length; i++) {
+        let acc = taps[0] * x[i];
+        for (let k = 1; k < m; k++) acc += taps[k] * (i - k >= 0 ? x[i - k] : history[m - 1 + i - k]);
+        out[i] = acc;
+      }
+      if (x.length >= m - 1) history.set(x.subarray(x.length - (m - 1)));
+      else { history.copyWithin(0, x.length); history.set(x, m - 1 - x.length); }
+      return out;
+    };
+  }
+
+  // receiverAutoGain, a block at a time: whole 128-sample blocks as they fill.
+  function streamAutoGain(options) {
+    const block = Math.max(1, Math.round(finiteOr(options.blockSize, 128)));
+    const avgGain = Math.max(0, finiteOr(options.avgGain, 0.5));
+    const maxGain = Math.max(0, finiteOr(options.maxGain, 10));
+    const scale = Math.max(0, finiteOr(options.scale, 1));
+    let fixed = Math.trunc(scale * 128), step = 0, prevTarget = 1;
+    let pending = new Float32Array(0);
+    return (x) => {
+      const merged = new Float32Array(pending.length + x.length);
+      merged.set(pending); merged.set(x, pending.length);
+      const whole = Math.floor(merged.length / block) * block;
+      const out = new Float32Array(whole);
+      for (let start = 0; start < whole; start += block) {
+        let total = 0, peak = 0;
+        for (let i = start, j = 0; i < start + block; i++, j++) {
+          const v = clamp(Math.round(merged[i] * 32768), -32768, 32767);
+          const a = v < 0 ? -v : v;
+          total += a;
+          if (a > peak) peak = a;
+          const y = Math.floor(v * (fixed + j * step) / 128);
+          out[i] = (y > 32767 ? 32767 : (y < -32768 ? -32768 : y)) / 32768;
+        }
+        if (peak === 0) { fixed += block * step; step = 0; continue; }
+        const mean = total / block;
+        const target = Math.min(maxGain, 32767 / (mean + avgGain * (peak - mean)));
+        const current = prevTarget * scale;
+        fixed = Math.trunc(current * scale * 128);
+        step = Math.trunc((target - current) / block * scale * 128);
+        prevTarget = target;
+      }
+      pending = merged.slice(whole);
+      return out;
+    };
+  }
+
+  // buildLossMask, a frame at a time, with the same random sequence.
+  function streamLossMask(framesPerPacket, lossPct, rand, jitterMs = 0) {
+    framesPerPacket = Math.max(1, Math.round(finiteOr(framesPerPacket, 1)));
+    const net = VOICE_ENGINE.network;
+    const p = clamp(finiteOr(lossPct, 0) / 100, 0, 1);
+    const late = clamp(net.lateFramesAt50ms * finiteOr(jitterMs, 0) / 50, 0, 0.5);
+    if (p <= 0 && late <= 0) return () => 0;
+    if (p >= 1) return () => 1;
+    const meanBurst = Math.max(1, net.burstMeanFrames / framesPerPacket);
+    const pBG = p > 0 ? Math.min(1 / meanBurst, 0.98 * (1 - p) / p) : 1;
+    const pGB = p > 0 ? pBG * p / (1 - p) : 0;
+    let bad = rand() < p, frame = 0, packet = [];
+    return () => {
+      if (frame % framesPerPacket === 0) {
+        packet = new Uint8Array(framesPerPacket);
+        if (bad) packet.fill(1);
+        else if (late > 0) for (let i = 0; i < framesPerPacket; i++) if (rand() < late) packet[i] = rand() < net.underrunShare ? 2 : 1;
+        bad = bad ? (rand() >= pBG) : (rand() < pGB);
+      }
+      return packet[frame++ % framesPerPacket];
+    };
+  }
+
+  // The live chain for `opts` (process()'s options) at the audio device's
+  // rate. process(block) takes and returns Float32Arrays at ioRate (the
+  // output a little shorter or longer as the resamplers work); `stats`
+  // counts what the codec did.
+  async function createLiveChain(opts = {}, ioRate = 48000) {
+    const codecKey = Object.hasOwn(CODEC_PROFILES, opts.codec) ? opts.codec : 'steam';
+    const codec = CODEC_PROFILES[codecKey];
+    const engine = VOICE_ENGINE;
+    const listenerCfg = opts.listenerPos ? LISTENER_POSITIONS[opts.listenerPos] : null;
+    const codecRate = codec.codecRate;
+    const micGain = clamp(finiteOr(opts.micGain, 1), 0, 20);
+    const hp = clamp(finiteOr(opts.hp, 0), 0, codecRate * 0.45);
+    const lp = clamp(finiteOr(opts.lp, codecRate / 2), 100, codecRate / 2);
+    const bits = clamp(finiteOr(opts.bits, 16), 2, 32);
+    const lossPct = clamp(finiteOr(opts.lossPct, 0), 0, 100);
+    const jitterMs = clamp(finiteOr(opts.jitterMs, 0), 0, 500);
+    const enableCodec = opts.enableWarble !== false;
+    const autoGain = opts.agc !== false;
+    const gateSpec = codec.senderGate || DEFAULT_SENDER_GATE;
+    const gateOn = enableCodec && (opts.gate == null ? !!codec.senderGate : !!opts.gate);
+    const gateDb = clamp(finiteOr(opts.gateThresholdDb, gateSpec.thresholdDb), -90, 0);
+    const avgGain = clamp(finiteOr(opts.avgGain, engine.autoGain.avgGain), 0, 2);
+    const maxGain = clamp(finiteOr(opts.maxGain, engine.autoGain.maxGain), 1, 100);
+    const voiceScale = clamp(finiteOr(opts.voiceScale, 1), 0, 4);
+    const volume = clamp(finiteOr(opts.volume, engine.volume), 0, 1);
+    const framesPerPacket = clamp(Math.round(finiteOr(opts.frameMs, 20) / 20), 1, 10);
+    const rand = mulberry32(finiteOr(opts.seed, 0xC0FFEE) >>> 0);
+    const mixRate = engine.mixRate;
+
+    const toCodec = streamResampleSinc(ioRate, codecRate);
+    const filters = [];
+    if (hp > 10) filters.push(streamBiquad(biquadCoefs('highpass', codecRate, hp, 0.707)));
+    if (lp < codecRate * 0.45) {
+      filters.push(streamBiquad(biquadCoefs('lowpass', codecRate, lp, 0.707)), streamBiquad(biquadCoefs('lowpass', codecRate, lp, 0.707)));
+    }
+    const captureEq = enableCodec ? profileEq(codec, 'captureEq') : null;
+    if (captureEq) filters.push(streamFir(captureEq));
+    const decoderEq = enableCodec ? profileEq(codec) : null;
+    const after = [];
+    if (decoderEq) after.push(streamFir(decoderEq));
+    after.push(streamResampleSinc(codecRate, codec.voiceRate));
+    if (autoGain) after.push(streamAutoGain({ blockSize: engine.autoGain.blockSize, avgGain, maxGain, scale: voiceScale }));
+    else after.push((x) => hardClip(x.map(v => v * voiceScale), INT16_FULL_SCALE));
+    after.push(codec.mixer === 'linear' ? streamResampleLinear(codec.voiceRate, mixRate) : streamResampleSinc(codec.voiceRate, mixRate));
+    if (listenerCfg && listenerCfg.extraLpf) after.push(streamBiquad(biquadCoefs('lowpass', mixRate, listenerCfg.extraLpf, 0.8)));
+    if (engine.outputFir) after.push(streamFir(engine.outputFir));
+    after.push((x) => { if (volume !== 1) for (let i = 0; i < x.length; i++) x[i] *= volume; return x; });
+    after.push(streamResampleSinc(mixRate, ioRate));
+    after.push((x) => softLimit(x, 0.98));
+
+    let voice = null;
+    if (enableCodec) {
+      const opus = await loadOpusModule();
+      if (typeof opus.createVoiceStream !== 'function') throw new Error('This Opus build has no frame-by-frame interface.');
+      voice = await opus.createVoiceStream(codecRate, Math.max(6000, Math.round(codec.bitrate * bits / 16)), {
+        application: codec.application, signal: codec.signal,
+        runtime: codec.encoder?.runtime, complexity: codec.encoder?.complexity, vbr: codec.encoder?.vbr, dtx: codec.encoder?.dtx });
+    }
+    const frameSize = codecRate / 50;
+    const threshold = 10 ** (gateDb / 20);
+    const preroll = gateOn ? Math.round(gateSpec.prerollMs / 20) : 0, hold = Math.round(gateSpec.holdMs / 20);
+    const lossMask = streamLossMask(framesPerPacket, lossPct, rand, jitterMs);
+    let pending = new Float32Array(0);
+    const queue = [];   // frames waiting out the gate's pre-roll: { samples, sent }
+    let frameIndex = 0, holdUntil = -1, open = false, spurts = 0;
+    const stats = { codec: codecKey, frames: 0, sent: 0, modes: { silk: 0, hybrid: 0, celt: 0 }, dtx: 0, lost: 0, late: 0,
+      bytes: 0, gateOpen: false, lastMode: null, inputPeak: 0, outputPeak: 0,
+      latencyMs: 1000 * (preroll * 0.02 + (captureEq ? (captureEq.length - 1) / 2 / codecRate : 0) + (voice ? voice.lookahead / codecRate : 0)) };
+
+    async function codecFrame(frame, sent) {
+      stats.frames++;
+      if (!voice) { stats.gateOpen = true; return frame; }
+      if (!sent) { open = false; stats.gateOpen = false; return new Float32Array(frameSize); }
+      if (!open) {
+        if (spurts > 0) await voice.restart();
+        spurts++;
+        open = true;
+      }
+      stats.gateOpen = true;
+      stats.sent++;
+      const encoded = voice.encode(frame);
+      stats.bytes += encoded.bytes;
+      stats.modes[encoded.mode]++;
+      if (encoded.dtx) stats.dtx++;
+      stats.lastMode = encoded.dtx ? 'dtx' : encoded.mode;
+      const miss = lossMask();
+      if (miss === 1) { stats.lost++; return voice.conceal().slice(); }
+      if (miss === 2) { stats.late++; return new Float32Array(frameSize); }
+      return voice.decode(encoded.packet).slice();
+    }
+
+    async function process(block) {
+      let x = Float32Array.from(block);
+      let peak = 0;
+      for (let i = 0; i < x.length; i++) {
+        const v = clamp(x[i] * micGain, -INT16_FULL_SCALE, INT16_FULL_SCALE);
+        x[i] = v;
+        if (Math.abs(v) > peak) peak = Math.abs(v);
+      }
+      stats.inputPeak = Math.max(stats.inputPeak, peak);
+      x = toCodec(x);
+      for (const f of filters) x = f(x);
+      const merged = new Float32Array(pending.length + x.length);
+      merged.set(pending); merged.set(x, pending.length);
+      const whole = Math.floor(merged.length / frameSize) * frameSize;
+      pending = merged.slice(whole);
+      const decoded = [];
+      for (let start = 0; start < whole; start += frameSize) {
+        const frame = merged.slice(start, start + frameSize);
+        if (!gateOn) { decoded.push(await codecFrame(frame, true)); continue; }
+        // Steam's gate: a frame over the threshold sends the pre-roll before
+        // it and the hold after it. A frame leaves the queue once no later
+        // frame's pre-roll can reach it.
+        let energy = 0;
+        for (const v of frame) energy += v * v;
+        const loud = Math.sqrt(energy / frameSize) > threshold;
+        const f = frameIndex++;
+        queue.push({ samples: frame, index: f, sent: false });
+        if (loud) {
+          holdUntil = Math.max(holdUntil, f + hold);
+          for (const q of queue) if (q.index >= f - preroll) q.sent = true;
+        }
+        while (queue.length > preroll) {
+          const q = queue.shift();
+          decoded.push(await codecFrame(q.samples, q.sent || q.index <= holdUntil));
+        }
+      }
+      let y = new Float32Array(decoded.reduce((n, d) => n + d.length, 0));
+      let offset = 0;
+      for (const d of decoded) { y.set(d, offset); offset += d.length; }
+      for (const f of after) y = f(y);
+      let outPeak = 0;
+      for (const v of y) if (Math.abs(v) > outPeak) outPeak = Math.abs(v);
+      stats.outputPeak = Math.max(stats.outputPeak, outPeak);
+      return y;
+    }
+
+    return { process, stats, free() { if (voice) voice.free(); voice = null; } };
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Public surface                                                     */
   /* ------------------------------------------------------------------ */
 
@@ -892,7 +1182,12 @@
     mulberry32,
     buildLossMask,
     runDspChain,
-    realOpusRoundTrip
+    realOpusRoundTrip,
+    createLiveChain,
+    streamResampleSinc,
+    streamFir,
+    streamAutoGain,
+    streamLossMask
   };
 
   if (typeof window !== 'undefined') window.TF2Audio = TF2Audio;

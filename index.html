@@ -30,7 +30,24 @@
       <div class="upload-row">
         <input id="file" type="file" accept="audio/*" multiple aria-label="Audio file to process (choose several to batch them)">
         <button id="mic" type="button" title="Record from microphone (+voicerecord)">🎤 Record</button>
+        <button id="live-toggle" type="button" aria-pressed="false" title="Live monitor: hear your microphone through the TF2 voice chain in real time, with the current settings (use headphones)">🎧 Live</button>
         <div id="source-status" class="source-status" role="status" aria-live="polite">Choose or drop an audio file, or record from the microphone. Several files at once go to the batch (step 4).</div>
+      </div>
+      <div id="live-panel" class="live-panel" hidden>
+        <div class="live-devices">
+          <label>Microphone <select id="live-input" aria-label="Live monitor microphone"><option value="">Default microphone</option></select></label>
+          <label>Output <select id="live-output" aria-label="Live monitor output device" title="Pick a virtual audio cable to use the TF2 voice in other apps"><option value="">Default output</option></select></label>
+        </div>
+        <div class="live-status" aria-live="off">
+          <span id="live-tx" class="live-tx">○ off</span>
+          <span class="live-stat" title="Opus coding mode of the frames being sent">mode <b id="live-mode">—</b></span>
+          <span class="live-stat" title="Payload bitrate of the frames being sent">rate <b id="live-rate">—</b></span>
+          <span class="live-stat" title="Frames lost (concealed) and late (silence) by the network settings">net <b id="live-loss">—</b></span>
+          <span class="live-stat" title="Microphone to speaker, including the voice gate's 120 ms pre-roll and the audio device's buffers">latency <b id="live-latency">—</b></span>
+          <span class="live-meter" title="Input peak"><span class="live-meter-label">in</span><span class="live-meter-bar"><span id="live-in"></span></span></span>
+          <span class="live-meter" title="Output peak"><span class="live-meter-label">out</span><span class="live-meter-bar"><span id="live-out"></span></span></span>
+        </div>
+        <p id="live-note" class="live-note"></p>
       </div>
     </section>
 
@@ -259,6 +276,7 @@
           </div>
           <div class="viz-modes" role="group" aria-label="Scale and resolution">
             <button id="viz-log" class="viz-mode viz-toggle" type="button" aria-pressed="false" title="Spectrogram frequency axis: log from 20 Hz">LOG</button>
+            <button id="viz-avg" class="viz-mode viz-toggle" type="button" hidden aria-pressed="false" title="Average spectrum of the render and the source over the selection (or the whole file), loudness-matched, with their difference: the chain's tonal footprint">AVG</button>
             <select id="viz-res" class="viz-select" hidden aria-label="Spectrogram resolution" title="Spectrogram FFT size. AUTO follows the zoom: shorter windows when zoomed in on time, longer when zoomed in on frequency and for the low octaves. A fixed size is in samples at the file's rate">
               <option value="auto">RES AUTO</option>
               <option value="256">256</option>
@@ -329,6 +347,24 @@
       <!-- Hidden dry twin: plays muted in sync with the main player so the
            A/B toggle is an instant unmute instead of a src swap. -->
       <audio id="preview-dry" hidden></audio>
+      <!-- Hidden real-take twin, likewise, once a take is loaded and aligned. -->
+      <audio id="preview-real" hidden></audio>
+
+      <details id="reference" class="reference" hidden>
+        <summary>Compare with a real TF2 take</summary>
+        <p class="reference-help">Record this source through TF2 with <code>voice_loopback 1</code> (steps in <a href="https://github.com/neb882/source-VOIP-converter6/blob/main/tests/testsignal/README.md" target="_blank" rel="noopener">tests/testsignal</a>) and load the recording here. The source is found in it and the take is lined up automatically, offset and clock drift corrected. It then plays as a third A/B version and appears in the views and the meter. Render with the settings it was recorded with (<code>volume</code>, <code>voice_scale</code>, …) for a fair comparison.</p>
+        <div class="reference-controls">
+          <input id="reference-file" type="file" accept="audio/*" aria-label="Real TF2 recording of this source">
+          <select id="reference-channel" class="format-select" aria-label="Channel of the take to use" title="Channel of the take to use">
+            <option value="mix">Mix</option>
+            <option value="left">Left</option>
+            <option value="right">Right</option>
+          </select>
+          <button id="reference-clear" class="button-secondary" type="button" hidden>Remove take</button>
+        </div>
+        <p id="reference-status" class="reference-status" role="status"></p>
+        <div id="reference-report" class="reference-report" hidden></div>
+      </details>
     </section>
 
     <section class="panel" id="batch-panel" aria-labelledby="step-batch">
@@ -372,7 +408,9 @@
   <script src="formats.js"></script>
   <script src="zip.js"></script>
   <script src="meter.js"></script>
+  <script src="reference.js"></script>
   <script src="script.js"></script>
+  <script src="live.js"></script>
   <script src="batch.js"></script>
   <script>
     // Offline/PWA support — only meaningful over http(s), not file://

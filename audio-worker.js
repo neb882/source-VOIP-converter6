@@ -1,8 +1,9 @@
 /* Dedicated worker wrapper for the pure TF2Audio DSP core, for turning a
- * rendered WAV into the chosen download format, and for metering. */
+ * rendered WAV into the chosen download format, for metering, and for
+ * lining up and comparing a real take. */
 'use strict';
 
-importScripts('constants.js', 'audio.js', 'flac.js', 'formats.js', 'zip.js', 'meter.js');
+importScripts('constants.js', 'audio.js', 'flac.js', 'formats.js', 'zip.js', 'meter.js', 'reference.js');
 
 async function processMessage(message) {
   const id = message.id;
@@ -45,7 +46,23 @@ async function analyzeMessage(message) {
   self.postMessage({ type: 'analyzed', id: message.id, stats });
 }
 
-const HANDLERS = { process: processMessage, export: exportMessage, analyze: analyzeMessage };
+// A real take of the source: where the source is in it, and the take on the
+// source's timeline at the take's rate (reference.js).
+async function locateMessage(message) {
+  const take = new Float32Array(message.take), source = new Float32Array(message.source);
+  const timeline = TF2Reference.locate(take, message.takeRate, source, message.sourceRate,
+    (value) => self.postMessage({ type: 'progress', id: message.id, value }));
+  const aligned = TF2Reference.warp(take, message.takeRate, timeline, message.takeRate, message.length);
+  self.postMessage({ type: 'located', id: message.id, timeline, aligned: aligned.buffer }, [aligned.buffer]);
+}
+
+// The render against the aligned take.
+async function compareTakeMessage(message) {
+  const report = TF2Reference.compareTake(new Float32Array(message.real), new Float32Array(message.sim), message.rate);
+  self.postMessage({ type: 'compared', id: message.id, report });
+}
+
+const HANDLERS = { process: processMessage, export: exportMessage, analyze: analyzeMessage, locate: locateMessage, compareTake: compareTakeMessage };
 
 self.addEventListener('message', async (event) => {
   const message = event.data || {};

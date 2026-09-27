@@ -15,7 +15,7 @@ pnpm install --frozen-lockfile
 pnpm dev
 ```
 
-For GitHub Pages, enable Pages from the root of your publishing branch; no build is required. **Keep `.nojekyll`, `vendor/` (all three codec folders), `opus-codec.mjs`, `audio-worker.js` and `mic-capture.js`** alongside the HTML, CSS, other scripts and icons. `node_modules/` is not needed on the website.
+For GitHub Pages, enable Pages from the root of your publishing branch; no build is required. **Keep `.nojekyll`, `vendor/` (all three codec folders), `opus-codec.mjs`, `audio-worker.js`, `mic-capture.js`, `live-worker.js` and `live-worklet.js`** alongside the HTML, CSS, other scripts and icons. `node_modules/` is not needed on the website.
 
 Use HTTPS or localhost. Opening `index.html` as a local file does not reliably support codec modules or microphone capture. After the app and its service worker load, conversion works offline. Background cache updates never reload the page or discard loaded audio; refresh when you are ready to use updated page code.
 
@@ -67,7 +67,26 @@ The quick presets reset every control. The live chain strip under the controls s
 | `celt_44` | Opus CELT layer, 48 kHz, 44 kbps | auto-gain at 44.1 kHz | Modeled |
 | `speex` | Opus SILK, 8 kHz, 8 kbps (stand-in for vaudio_speex) | auto-gain at 11.025 kHz, linear-interpolation mixer | Modeled |
 
-Every profile runs real libopus; nothing is a hand-made approximation. The Steam profiles use **libopus 1.1.5**, built to WebAssembly by `tests/libopus11/build.mjs`. The others use **libopus 1.6.1 via libopus-wasm 0.4.0**. The status line and console report the Opus modes the encoder actually chose (SILK / hybrid / CELT, from each packet's TOC byte). The legacy profiles are stand-ins built on the modern codec: CELT 0.x and Speex bitstreams are not reproduced.
+Every profile runs real libopus; nothing is a hand-made approximation. The Steam profiles use **libopus 1.1.5**, built to WebAssembly by `tests/libopus11/build.mjs`. The others use **libopus 1.6.1 via libopus-wasm 0.4.0**. The status line and console report the Opus modes the encoder actually chose (SILK / hybrid / CELT, from each packet's TOC byte). The legacy profiles are stand-ins built on the modern codec: CELT 0.x and Speex bitstreams are not reproduced. [tests/LEGACY_CODECS.md](tests/LEGACY_CODECS.md) collects what public sources say about the real codecs (vaudio_celt is CELT 0.11 at 22050 Hz, 512-sample frames and 64-byte packets) and which takes would settle the rest.
+
+## Live monitor
+
+**🎧 Live** (step 1) plays your microphone through the TF2 voice chain in real time, with the current settings. It uses the same stages and parameters as a render:
+- capture gain and int16 clip
+- Steam's gate
+- libopus 1.1.5, frame by frame, with the loss and jitter model
+- the receiver auto-gain and the output
+
+The Node tests check each streaming stage against its offline counterpart sample for sample, and the whole chain against a render (r 0.99, within 0.1 dB).
+
+**Latency.** About 230 ms from microphone to speaker. The largest part is authentic: Steam's gate sends the 120 ms before a word, so it has to hold that much back. The rest is the capture filter, Opus lookahead, a 40 ms jitter buffer and the audio device.
+
+**While it runs:**
+- **Settings:** changes apply as you make them, presets included.
+- **Status:** the panel shows whether the gate is sending, the Opus mode, the bitrate, lost and late frames, input and output levels, and the latency.
+- **Output device:** choose a virtual audio cable here to use the TF2 voice in other apps, such as Discord or OBS. Chrome and Edge can pick output devices; other browsers play on the default output.
+
+Rooms (`dsp_room`) are not applied live. Use headphones: speakers feed the output back into the microphone.
 
 ## Accuracy
 
@@ -118,7 +137,8 @@ The developer console supports Source-style `;` chaining, `alias`, `toggle`, `fi
 
 The visualizer has three views. All three follow the A/B toggle.
 - **WAVE:** peak and RMS envelope, down to individual samples. **dB** switches to a dBFS amplitude scale for quiet detail: fades, the gate's tails, DTX comfort noise and noise floors. Full-scale samples are marked red.
-- **BARS:** a log-frequency spectrum from 20 Hz, 8192-point, in dBFS; live while playing, computed at the playhead when paused. The version you are not hearing (dry or wet) is drawn over it as a line.
+- **BARS:** a log-frequency spectrum from 20 Hz, 8192-point, in dBFS; live while playing, computed at the playhead when paused. The version you are not hearing is drawn over it as a line. With a real take loaded, that is the take when you hear the render, and the render otherwise.
+  - **AVG** switches to the long-term average spectrum of the render against the source, or against a real take once one is loaded. It covers the selection or the whole file, with 1/6-octave smoothing and silent windows skipped. The reference is shifted to the render's loudness, and a lane below shows the difference in dB: the chain's tonal footprint at a glance.
 - **SPEC:** a spectrogram with a dB colour scale, on a linear axis or, with **LOG**, from 20 Hz. The ruler marks the 12 kHz Opus band edge in amber.
 
 **Spectrogram resolution.** The visible band is analysed in tiers. Each tier reads the signal decimated as far as its top frequency allows (by up to 64), so a low band gets long windows cheaply. **RES AUTO** sizes the FFT to the zoom, as iZotope RX's auto-adjust does. A Blackman window of T seconds blurs about 0.4 T in time and 2.35 / T in frequency. AUTO picks T = 3.4 · √(seconds per column / Hz per row), which blurs about twice as many pixels in time as in frequency, so tones, harmonics and hum stay sharp.
@@ -158,7 +178,35 @@ A Δ row gives wet minus dry. Values are measured as one channel; played as dual
 
 **Shortcuts:** Space plays and pauses, B switches A/B, L loops. With the view focused: + − 0 and the arrows navigate, Z zooms to the selection and Esc clears it.
 
+With a real take loaded, the meter adds a REAL row and a "Δ real" row (wet minus real), and loudness matching plays every version at the level of the quietest.
+
 The meter shows a real codec property. When DTX replaces a steady tone below about 60 Hz, libopus 1.1.x's comfort noise is nearly DC, and TF2 plays it as is. See finding 18 in [REFERENCE_2026.md](tests/REFERENCE_2026.md).
+
+## Checking against your own take
+
+**Compare with a real TF2 take** (under the player) checks the simulation against a recording of the same source through TF2. Record it with `voice_loopback 1` as in [tests/testsignal/README.md](tests/testsignal/README.md), load the source, render it with the settings you recorded with, and load the take.
+
+**Alignment.** The source is found in the take by the same method as the Node tool below (`reference.js`, in a worker):
+- **Coarse:** cross-correlation of templates at 2 kHz, with three or more agreeing matches fitting the offset and the clock ratio.
+- **Fine:** a refinement at 8 kHz in up to eight windows with outlier rejection, which aligns long takes to a few microseconds.
+- **Short takes:** under about 4 s the clock drift cannot be measured, and alignment is within a fraction of a millisecond.
+
+The aligned take then:
+- plays as a third A/B version (B cycles wet, dry, real)
+- shows in WAVE, SPEC, the loudness lane and AVG
+- joins the meter
+
+**The report** compares the render with the take where they overlap:
+- sim minus take per band from 40 Hz to 19 kHz, level-matched at 300 Hz–3 kHz
+- short-term level tracking in 0.5 s blocks
+- the receiver's clipping signature for both
+
+For the clip from the "whoosh" investigation (a river recording and its TF2 take), rendered at `volume 0.15`:
+- the bands agree within ±0.4 dB from 80 Hz to 16 kHz
+- levels track within 0.2 dB rms (r 0.98)
+- the clip ceilings are −16.5 and −16.4 dBFS
+
+The render itself sits about 0.1 ms ahead of its source: the codec path's actual delay is slightly shorter than the lookahead the app trims. It is inaudible, and spectra and levels are unaffected.
 
 ## Reference recordings
 
@@ -186,9 +234,9 @@ pnpm exec playwright install chromium
 pnpm test:all
 ```
 
-- **`tests/verify.js`:** resampler passband/stopband/alignment, the profile FIR, and the auto-gain law. The law checks cover the measured sine overdrive at `voice_avggain` 0.5 and 0.25, the cap, the int16 clamp, silence hold, step timing and the `voice_scale` sawtooth and truncation. Also the voice gate (threshold, pre-roll, hold, talk spurts, DTX comfort noise on steady tones, send/skip accounting), stereo capture, real codec modes per profile, all room presets 0–29, the measured loss bursts and late-frame jitter with PLC, option robustness and WAV structure.
+- **`tests/verify.js`:** resampler passband/stopband/alignment, the profile FIR, and the auto-gain law. Also the live chain: each streaming stage (resamplers, FIR, auto-gain, loss model) equals its offline counterpart sample for sample, and the whole chain reproduces a render. The law checks cover the measured sine overdrive at `voice_avggain` 0.5 and 0.25, the cap, the int16 clamp, silence hold, step timing and the `voice_scale` sawtooth and truncation. Also the voice gate (threshold, pre-roll, hold, talk spurts, DTX comfort noise on steady tones, send/skip accounting), stereo capture, real codec modes per profile, all room presets 0–29, the measured loss bursts and late-frame jitter with PLC, option robustness and WAV structure.
 - **`tests/opus.verify.mjs`:** frame timing and boundary pulses, exact lengths, bitrates and packet sizes, TOC mode reporting, native concealment, silence, mute, determinism, the sender gate inside the round trip (pre-roll, hold, talk spurts), opt-in DTX, the per-frame log behind the codec lane, leveling and cap behavior, output-volume linearity, pre-encoder filtering, and codec-failure reporting. Also the libopus 1.1.5 build: its packets are bit-identical to a native build of the release, and its DTX differs from 1.6.1's as Steam's does.
-- **`tests/reference.verify.mjs`:** alignment, clock drift, polarity, fractional delay, clip-signature and level-tracking metrics.
+- **`tests/reference.verify.mjs`:** alignment, clock drift, polarity, fractional delay, clip-signature and level-tracking metrics. Also the in-page real-take check. A take made from a render (delayed, clock-skewed, quieter) is lined up with its source to within 10 µs and 0.2 ppm, and compares as identical. Short excerpts are found, and unrelated audio is rejected.
 - **`tests/formats.verify.mjs`:** download formats and ZIPs.
   - FLAC decodes bit-exact with valid frame CRCs, through an independent decoder in the test.
   - The MP3 module matches its documented build. Its files are byte-identical to a native gcc build of LAME 3.100. Decoded with mpg123, they keep level and waveform, and their LAME tag accounts for every sample.
@@ -205,6 +253,8 @@ pnpm test:all
   - worker parity, cancellation, PCM recording and offline conversion
   - every visualizer mode, zoom, pan, seek, keys and scales
   - the codec and loudness lanes, frequency zoom, AUTO and fixed resolution, selection statistics, zoom to selection and loop
+  - BARS AVG, and the real-take comparison: alignment of a synthetic take, the band report, A/B/C, the meter's REAL rows and removal
+  - the live monitor with a fake microphone: frames sent, modes, reported latency, stop
   - the meter, loudness-matched A/B and shortcuts
   - batch queueing: picker, step 1 multi-select, drop on the batch panel, single-file drop as source
   - batch rendering with loudness per file, and ZIPs in all three formats, with FLAC decoded in the browser to exactly the WAV's samples
@@ -234,6 +284,8 @@ These tests establish implementation behavior; the accuracy claims rest on the p
 | `batch.js` | batch queue, drag and drop, ZIP downloads |
 | `formats.js`, `flac.js`, `zip.js` | download formats: WAV reader, FLAC encoder, stored ZIP |
 | `meter.js` | loudness and level measurement |
+| `reference.js` | finding a source in a real take, aligning it, and the comparison measures (page, worker and Node tools) |
+| `live.js`, `live-worker.js`, `live-worklet.js` | live monitor: interface, the streaming chain in a worker, capture and playback on the audio thread |
 
 Tests and local tooling are under `tests/`.
 

@@ -30,6 +30,30 @@ function wavTone(seconds, rate = 48000, frequency = 440) {
   return buffer;
 }
 
+// Speech-like test audio: gliding harmonics in syllables, with pauses, so
+// alignment has something to lock onto (a steady tone would not do).
+function wavSpeech(seconds, rate = 48000) {
+  const length = Math.round(seconds * rate), buffer = Buffer.alloc(44 + length * 2);
+  buffer.write('RIFF', 0); buffer.writeUInt32LE(36 + length * 2, 4);
+  buffer.write('WAVEfmt ', 8); buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20); buffer.writeUInt16LE(1, 22);
+  buffer.writeUInt32LE(rate, 24); buffer.writeUInt32LE(rate * 2, 28);
+  buffer.writeUInt16LE(2, 32); buffer.writeUInt16LE(16, 34);
+  buffer.write('data', 36); buffer.writeUInt32LE(length * 2, 40);
+  let seed = 11, noise = 0;
+  for (let i = 0; i < length; i++) {
+    const t = i / rate, syllable = Math.floor(t / .23);
+    const env = (syllable * 7919) % 5 ? Math.sin(Math.PI * ((t / .23) % 1)) ** 2 : 0;
+    const f0 = 110 + 40 * Math.sin(t * 1.3) + 15 * (syllable % 4);
+    seed = (seed * 1103515245 + 12345) >>> 0;
+    noise += .3 * (seed / 4294967296 * 2 - 1 - noise);
+    let v = .25 * noise;
+    for (let h = 1; h <= 12; h++) v += Math.sin(2 * Math.PI * f0 * h * t + h) / (h + 1);
+    buffer.writeInt16LE(Math.round(Math.max(-1, Math.min(1, .12 * env * v)) * 0x7fff), 44 + i * 2);
+  }
+  return buffer;
+}
+
 async function readRenderedWav(page) {
   return page.evaluate(async () => {
     const response = await fetch(document.getElementById('preview').src);
@@ -298,6 +322,68 @@ async function verifyLanesAndSelection(page) {
   check(await page.locator('#viz-loop').getAttribute('aria-pressed') === 'false' && !(await page.evaluate(() => document.getElementById('preview').loop)), 'L turns the loop off');
   await page.locator('#viz-lufs').click();
   await page.locator('#viz-fit').click();
+}
+
+async function verifyAverageAndRealTake(page) {
+  console.log('\n[Browser 3e] Average spectrum and the real-take comparison');
+  const view = () => page.evaluate(() => document.getElementById('visualizer').dataset.view || '');
+  await page.locator('#file').setInputFiles({ name: 'speech.wav', mimeType: 'audio/wav', buffer: wavSpeech(6) });
+  await page.waitForFunction(() => state.sourceName === 'speech.wav' && !document.getElementById('process').disabled);
+  await page.locator('#process').click();
+  await page.waitForFunction(() => !document.getElementById('download').disabled, null, { timeout: 60000 });
+  await page.locator('#viz-bars').click();
+  if (await page.locator('#viz-avg').getAttribute('aria-pressed') !== 'true') await page.locator('#viz-avg').click();
+  await page.waitForFunction(() => (document.getElementById('visualizer').dataset.view || '').startsWith('avg:dry'), null, { timeout: 60000 });
+  check((await view()).startsWith('avg:dry:0.0000-6.0000'), 'BARS AVG shows the average spectrum of the render against the source', await view());
+
+  // A take made from the render: 0.4321 s late, its clock 100 ppm fast,
+  // 6 dB down, recorded at 44.1 kHz.
+  const wav = await page.evaluate(async () => {
+    const sim = state.processedBuffer, rate = state.processedRate, k = 1.0001;
+    const take = TF2Reference.warp(sim, rate, { offsetSeconds: .4321, scale: 1 / k }, rate, sim.length + rate);
+    const at44 = TF2Audio.resampleSinc(take.map(v => v * .5), rate, 44100);
+    return [...new Uint8Array(await TF2Audio.encodeWav(at44, 44100).arrayBuffer())];
+  });
+  await page.locator('#reference summary').click();
+  await page.locator('#reference-file').setInputFiles({ name: 'take.wav', mimeType: 'audio/wav', buffer: Buffer.from(wav) });
+  await page.waitForFunction(() => document.querySelector('#reference-report table'), null, { timeout: 60000 });
+  const take = await page.evaluate(() => ({ offset: state.realTake.timeline.offsetSeconds, scale: state.realTake.timeline.scale,
+    status: document.getElementById('reference-status').textContent,
+    bands: [...document.querySelectorAll('#reference-report tbody td')].map(td => td.textContent),
+    rows: [...document.querySelectorAll('#meter-rows tr th')].map(th => th.textContent) }));
+  check(Math.abs(take.offset + .4321 * 1.0001) < .001 && Math.abs(take.scale - 1.0001) < 10e-6,
+    'a real take is found in the source and lined up (offset and clock)', `${(take.offset * 1000).toFixed(2)} ms, ${((take.scale - 1) * 1e6).toFixed(1)} ppm`);
+  const within = take.bands.slice(0, 13).map(t => Math.abs(Number(t.replace('−', '-'))));
+  check(within.every(d => d <= .3), 'the report finds the take and the render alike, band by band up to 12 kHz', take.bands.join(' '));
+  check(take.rows.includes('REAL') && take.rows.includes('Δ real'), 'the meter adds the real take and wet minus real');
+  await page.locator('#ab-toggle').click();
+  await page.locator('#ab-toggle').click();
+  check(await page.locator('#ab-toggle').textContent() === 'A/B: Real' && await page.evaluate(() => audibleBuffer().label) === 'REAL',
+    'A/B cycles to the real take');
+  await page.waitForFunction(() => (document.getElementById('visualizer').dataset.view || '').startsWith('avg:real'), null, { timeout: 60000 });
+  check(true, 'AVG compares the render with the real take once one is loaded');
+  await page.locator('#reference-clear').click();
+  check(await page.evaluate(() => !state.realTake) && await page.locator('#ab-toggle').textContent() === 'A/B: Wet'
+    && !(await page.evaluate(() => [...document.querySelectorAll('#meter-rows tr th')].some(th => th.textContent === 'REAL'))),
+    'removing the take restores wet/dry A/B and the meter');
+  await page.locator('#viz-avg').click();
+  await page.locator('#viz-wave').click();
+}
+
+async function verifyLiveMonitor(page) {
+  console.log('\n[Browser 3f] Live monitor');
+  await page.locator('#live-toggle').click();
+  await page.waitForFunction(() => window.TF2Live && TF2Live.stats && TF2Live.stats.frames > 40, null, { timeout: 30000 });
+  await page.waitForTimeout(600);
+  const live = await page.evaluate(() => ({ stats: TF2Live.stats, latency: document.getElementById('live-latency').textContent,
+    tx: document.getElementById('live-tx').textContent, pressed: document.getElementById('live-toggle').getAttribute('aria-pressed') }));
+  check(live.pressed === 'true' && live.stats.sent > 0 && live.stats.modes.hybrid > 0,
+    'the live monitor runs the microphone through the Steam chain in real time', `${live.stats.sent} of ${live.stats.frames} frames sent, ${live.tx}`);
+  const ms = Number(/^(\d+) ms/.exec(live.latency)?.[1]);
+  check(ms >= 130 && ms < 600, 'the live monitor reports its latency, gate pre-roll included', live.latency);
+  await page.locator('#live-toggle').click();
+  await page.waitForFunction(() => !TF2Live.running);
+  check(await page.locator('#live-toggle').getAttribute('aria-pressed') === 'false', 'the live monitor stops');
 }
 
 // A minimal reader for the stored ZIPs the batch writes.
@@ -602,6 +688,8 @@ async function main() {
       } finally { worker.terminate(); }
     });
     check(parity.exact && parity.plc === 'opus' && parity.lost > 0, 'worker and main thread agree with native packet-loss concealment');
+    await verifyAverageAndRealTake(page);
+    await verifyLiveMonitor(page);
 
     await page.locator('#file').setInputFiles({ name: 'long-tone.wav', mimeType: 'audio/wav', buffer: wavTone(20) });
     await page.waitForFunction(() => !document.getElementById('process').disabled);
@@ -663,9 +751,10 @@ async function main() {
     check(afterUpdate.keys.includes(SHELL_CACHE), 'current app shell cache is populated', SHELL_CACHE);
     check(await page.evaluate(async (name) => {
       const cache = await caches.open(name);
-      const needed = ['batch.js', 'formats.js', 'flac.js', 'zip.js', 'meter.js', 'vendor/lame/index.mjs', 'vendor/lame/lame-3.100.wasm.mjs'];
+      const needed = ['batch.js', 'formats.js', 'flac.js', 'zip.js', 'meter.js', 'reference.js', 'live.js', 'live-worker.js', 'live-worklet.js',
+        'vendor/lame/index.mjs', 'vendor/lame/lame-3.100.wasm.mjs'];
       return (await Promise.all(needed.map(path => cache.match(new URL(path, location.href).href)))).every(Boolean);
-    }, SHELL_CACHE), 'batch, format, meter and MP3 encoder files are cached for offline use');
+    }, SHELL_CACHE), 'batch, format, meter, reference, live-monitor and MP3 encoder files are cached for offline use');
     // Restore the normal registration while still online. Otherwise reloading
     // registers sw.js again and races another replacement against file loading.
     await activateServiceWorker(page, 'sw.js');

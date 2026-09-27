@@ -519,6 +519,56 @@ async function main() {
     check('invalid source is rejected clearly', rejected);
   }
 
+  console.log('\n[10b] Live chain: process() a block at a time');
+  {
+    // Each streaming stage, fed uneven blocks, equals its offline counterpart.
+    let seed = 3;
+    const rnd = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 4294967296) * 2 - 1;
+    const x = Float32Array.from({ length: 24000 }, (_, i) => 0.3 * Math.sin(i * 0.013 + 1e-5 * i * i) + 0.05 * rnd());
+    const inBlocks = (stage) => {
+      const parts = [], sizes = [100, 960, 7, 1234, 480];
+      for (let o = 0, k = 0; o < x.length; k++) { const n = Math.min(sizes[k % sizes.length], x.length - o); parts.push(stage(x.subarray(o, o + n))); o += n; }
+      const out = new Float32Array(parts.reduce((t, p) => t + p.length, 0));
+      parts.reduce((o, p) => { out.set(p, o); return o + p.length; }, 0);
+      return out;
+    };
+    const maxDiff = (a, b, n, shift = 0) => { let d = 0; for (let i = 0; i < n; i++) d = Math.max(d, Math.abs(a[i] - b[i + shift])); return d; };
+    for (const [from, to] of [[48000, 24000], [44100, 24000], [24000, 44100], [44100, 48000]]) {
+      const offline = TF2Audio.resampleSinc(x, from, to), live = inBlocks(TF2Audio.streamResampleSinc(from, to));
+      check(`streaming ${from} -> ${to} Hz resampler equals resampleSinc`, maxDiff(offline, live, Math.min(offline.length, live.length) - 100) === 0,
+        `${live.length} of ${offline.length} samples out`);
+    }
+    const taps = TF2Audio.firwin2(255, [0, 11000, 12000], [0, 0, -8.5], 24000);
+    check('streaming FIR equals the zero-phase FIR, 127 samples late',
+      maxDiff(TF2Audio.applyFirZeroPhase(x, taps), inBlocks(TF2Audio.streamFir(taps)), x.length - 300, 127) === 0);
+    const agc = { blockSize: 128, avgGain: 0.5, maxGain: 10, scale: 1 };
+    const agcLive = inBlocks(TF2Audio.streamAutoGain(agc));
+    check('streaming auto-gain equals receiverAutoGain', maxDiff(TF2Audio.receiverAutoGain(x, agc), agcLive, agcLive.length) === 0);
+    const mask = TF2Audio.buildLossMask(600, 2, 18, TF2Audio.mulberry32(5), 50), next = TF2Audio.streamLossMask(2, 18, TF2Audio.mulberry32(5), 50);
+    check('streaming loss model draws the same frames as buildLossMask', mask.every(v => v === next()));
+
+    // The whole chain, 20 ms at a time, against a render of the same audio:
+    // the same level, and the same waveform once the live chain's own delay
+    // (capture EQ 127 samples at 24 kHz, Opus lookahead) is allowed for.
+    const src = speechLike(3, SR, -20);
+    const opts = { codec: 'steam', volume: 1 };
+    const chain = await TF2Audio.createLiveChain(opts, SR);
+    const parts = [];
+    for (let o = 0; o < src.length; o += SR / 50) parts.push(await chain.process(src.subarray(o, o + SR / 50)));
+    const live = new Float32Array(parts.reduce((t, p) => t + p.length, 0));
+    parts.reduce((o, p) => { live.set(p, o); return o + p.length; }, 0);
+    chain.free();
+    const offline = (await TF2Audio.process(mkBuffer(src, SR), opts)).samples;
+    const shift = Math.round((127 / 24000 + 156 / 24000) * SR);
+    let dot = 0, ea = 0, eb = 0;
+    for (let i = SR / 2; i < live.length - shift - SR / 2; i++) { dot += offline[i] * live[i + shift]; ea += offline[i] ** 2; eb += live[i + shift] ** 2; }
+    const r = dot / Math.sqrt(ea * eb), levelDb = 10 * Math.log10(eb / ea);
+    check('live chain reproduces the render (waveform and level)', r > 0.9 && Math.abs(levelDb) < 0.5, `r ${r.toFixed(3)}, ${levelDb.toFixed(2)} dB`);
+    check('live chain holds back the gate pre-roll (120 ms) and reports its delay',
+      offline.length - live.length >= 0.12 * SR && Math.abs(chain.stats.latencyMs - (120 + 1000 * 283 / 24000)) < 0.5,
+      `${chain.stats.latencyMs.toFixed(1)} ms; ${chain.stats.sent} of ${chain.stats.frames} frames sent`);
+  }
+
   console.log('\n[11] WAV encoding');
   {
     const src = tone(440, 0.5, SR, 0.25);

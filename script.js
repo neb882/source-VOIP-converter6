@@ -911,6 +911,8 @@ function mountSource(mono, sampleRate, name, left = null) {
   els.audio.removeAttribute('src');
   els.audio.load();
   if (els.audioDry) { els.audioDry.pause(); els.audioDry.removeAttribute('src'); els.audioDry.load(); }
+  clearReferenceTake();
+  if (els.reference) els.reference.hidden = false;
   els.abToggle.disabled = true;
   els.abToggle.textContent = 'A/B: Wet';
   state.abMode = 'wet';
@@ -1434,6 +1436,7 @@ function presentRender({ samples, sampleRate, blob, realOpus, codecInfo, stats }
     els.audioDry.muted = true;
     els.audioDry.volume = els.audio.volume;
   }
+  if (els.audioReal) els.audioReal.muted = true;
   state.lastCodecKey = codecKey;
   els.dl.disabled = false;
 
@@ -1442,6 +1445,7 @@ function presentRender({ samples, sampleRate, blob, realOpus, codecInfo, stats }
   // A re-render of the same source keeps the view, band and selection.
   refreshVisualizer();
   updateMeter();
+  updateReferenceReport();
   const method = realOpus ? `Real Opus · ${codecInfo.bitrate / 1000} kbps` : 'Codec bypassed';
   setStatus(`Ready · ${method} · ${(took / 1000).toFixed(1)}s render · ${sampleRate.toLocaleString()} Hz`, 'success');
   logLine(`ChangeLevel: rendered ${samples.length} samples @ ${sampleRate}Hz in ${took}ms`, 'sys');
@@ -1537,31 +1541,39 @@ els.process.addEventListener('click', async () => {
 /* A/B toggle                                                         */
 /* ------------------------------------------------------------------ */
 
+// A/B cycles wet, dry and, with a real take loaded, real. All versions play
+// in sync; switching is an instant mute swap, with no re-buffering.
+const AB_LABELS = { wet: 'A/B: Wet', dry: 'A/B: Dry', real: 'A/B: Real' };
+function setAbMutes() {
+  els.audio.muted = state.abMode !== 'wet';
+  if (els.audioDry) els.audioDry.muted = state.abMode !== 'dry';
+  if (els.audioReal) els.audioReal.muted = state.abMode !== 'real';
+}
 els.abToggle.addEventListener('click', () => {
   if (!state.lastBlob || !state.dryBlob || !els.audioDry) return;
-  state.abMode = (state.abMode === 'wet') ? 'dry' : 'wet';
-  const wetAudible = state.abMode === 'wet';
-  // Both elements play in sync; A/B is an instant mute swap — no re-buffering.
-  els.audio.muted = !wetAudible;
-  els.audioDry.muted = wetAudible;
-  syncDry(true);
-  els.abToggle.textContent = wetAudible ? 'A/B: Wet' : 'A/B: Dry';
+  const modes = ['wet', 'dry', ...(state.realTake && els.audioReal ? ['real'] : [])];
+  state.abMode = modes[(modes.indexOf(state.abMode) + 1) % modes.length];
+  setAbMutes();
+  syncTwins(true);
+  els.abToggle.textContent = AB_LABELS[state.abMode];
   refreshVisualizer();
 });
 
-// Keep the hidden dry twin locked to the main (wet) transport.
-function syncDry(force = false) {
-  if (!els.audioDry || !els.audioDry.src) return;
-  const d = els.audioDry.duration;
-  const t = Math.min(els.audio.currentTime,
-    isFinite(d) && d > 0 ? Math.max(0, d - 0.01) : els.audio.currentTime);
-  try {
-    if (force || Math.abs(els.audioDry.currentTime - t) > 0.02) els.audioDry.currentTime = t;
-  } catch (e) { /* metadata not ready yet */ }
+// The hidden twins of the main (wet) player: the dry source and the real take.
+const twins = () => [els.audioDry, els.audioReal].filter(el => el && el.src);
+// Keep the twins locked to the main transport.
+function syncTwins(force = false) {
+  for (const el of twins()) {
+    const d = el.duration;
+    const t = Math.min(els.audio.currentTime, isFinite(d) && d > 0 ? Math.max(0, d - 0.01) : els.audio.currentTime);
+    try {
+      if (force || Math.abs(el.currentTime - t) > 0.02) el.currentTime = t;
+    } catch (e) { /* metadata not ready yet */ }
+  }
 }
 
-els.audio.addEventListener('volumechange', () => { if (els.audioDry) els.audioDry.volume = els.audio.volume; });
-els.audio.addEventListener('ratechange', () => { if (els.audioDry) els.audioDry.playbackRate = els.audio.playbackRate; });
+els.audio.addEventListener('volumechange', () => { for (const el of [els.audioDry, els.audioReal]) if (el) el.volume = els.audio.volume; });
+els.audio.addEventListener('ratechange', () => { for (const el of [els.audioDry, els.audioReal]) if (el) el.playbackRate = els.audio.playbackRate; });
 
 /* ------------------------------------------------------------------ */
 /* Meter and loudness-matched A/B (meter.js)                          */
@@ -1623,6 +1635,7 @@ function meterSources() {
   const out = [];
   if (state.processedBuffer) out.push({ label: 'WET', samples: state.processedBuffer, rate: state.processedRate });
   if (state.decodedSource) out.push({ label: 'DRY', samples: state.decodedSource.getChannelData(0), rate: state.decodedSource.sampleRate });
+  if (state.realTake) out.push({ label: 'REAL', samples: state.realTake.samples, rate: state.realTake.rate });
   return out;
 }
 
@@ -1690,8 +1703,8 @@ async function updateMeter() {
   const whole = await Promise.all(sources.map(src => measure(src.samples, src.rate).catch(() => null)));
   if (generation !== meterGeneration) return;
   const hadStats = !!state.meterStats;
-  state.meterStats = { wet: whole[0] && sources[0].label === 'WET' ? whole[0] : null,
-    dry: whole[sources.length - 1] && sources[sources.length - 1].label === 'DRY' ? whole[sources.length - 1] : null };
+  const statsFor = (label) => whole[sources.findIndex(src => src.label === label)] || null;
+  state.meterStats = { wet: statsFor('WET'), dry: statsFor('DRY'), real: statsFor('REAL') };
   applyAbMatch();
   // The loudness lane draws from these.
   if (!hadStats && state.showLufs) refreshVisualizer();
@@ -1700,42 +1713,57 @@ async function updateMeter() {
     : whole;
   if (generation !== meterGeneration) return;
   const rows = sources.map((src, i) => row(src.label, METER_COLUMNS.map(([key]) => (results[i] ? meterCell(key, results[i][key]) : 'error')), '', results[i]));
-  if (results.length === 2 && results[0] && results[1]) {
-    // Wet minus dry, for the columns where a difference means something.
-    const diff = new Set(['integrated', 'truePeak', 'samplePeak', 'rms', 'plr', 'lra']);
-    rows.push(row('Δ', METER_COLUMNS.map(([key]) => {
-      const a = results[0][key], b = results[1][key];
-      if (!diff.has(key) || a === null || b === null || !Number.isFinite(a) || !Number.isFinite(b)) return '';
-      const d = a - b;
+  // Wet minus dry (Δ) and wet minus the real take (Δ real), for the columns
+  // where a difference means something.
+  const diff = new Set(['integrated', 'truePeak', 'samplePeak', 'rms', 'plr', 'lra']);
+  const byLabel = (label) => results[sources.findIndex(src => src.label === label)] || null;
+  for (const [label, other, title] of [['Δ', 'DRY', 'wet minus dry'], ['Δ real', 'REAL', 'wet minus the real take']]) {
+    const a = byLabel('WET'), b = byLabel(other);
+    if (!a || !b) continue;
+    const tr = row(label, METER_COLUMNS.map(([key]) => {
+      if (!diff.has(key) || a[key] === null || b[key] === null || !Number.isFinite(a[key]) || !Number.isFinite(b[key])) return '';
+      const d = a[key] - b[key];
       return `${d > 0 ? '+' : d < 0 ? '−' : '±'}${Math.abs(d).toFixed(1)}`;
-    }), 'meter-delta'));
+    }), 'meter-delta');
+    tr.title = title;
+    rows.push(tr);
   }
   els.meterRows.replaceChildren(...rows);
 }
 if (els.meterSelZoom) els.meterSelZoom.addEventListener('click', () => zoomToSelection());
 if (els.meterSelClear) els.meterSelClear.addEventListener('click', () => { setSelection(null); refreshVisualizer(); });
 
-// A/B gain (dB) for 'WET' or 'DRY'; 0 unless matching is on.
+// A/B gain (dB) for 'WET', 'DRY' or 'REAL'; 0 unless matching is on.
 function abGainDb(label) {
-  return state.abMatch && state.abLouder === label ? state.abOffsetDb : 0;
+  return state.abMatch ? (state.abGains && state.abGains[label]) || 0 : 0;
 }
 
+// Every version plays at the integrated loudness of the quietest.
 function applyAbMatch() {
   const stats = state.meterStats || {};
-  const wet = stats.wet && stats.wet.integrated, dry = stats.dry && stats.dry.integrated;
-  const known = state.processedBuffer && state.decodedSource && Number.isFinite(wet) && Number.isFinite(dry);
-  state.abLouder = known ? (wet > dry ? 'WET' : 'DRY') : null;
-  state.abOffsetDb = known ? -Math.abs(wet - dry) : 0;
+  const level = (s) => (s && Number.isFinite(s.integrated) ? s.integrated : null);
+  const levels = {};
+  if (state.processedBuffer && level(stats.wet) !== null) levels.WET = level(stats.wet);
+  if (state.decodedSource && level(stats.dry) !== null) levels.DRY = level(stats.dry);
+  if (state.realTake && level(stats.real) !== null) levels.REAL = level(stats.real);
+  const known = 'WET' in levels && 'DRY' in levels;
+  const quietest = known ? Math.min(...Object.values(levels)) : 0;
+  state.abGains = known ? Object.fromEntries(Object.entries(levels).map(([label, value]) => [label, quietest - value])) : {};
+  state.abLouder = known ? (levels.WET > levels.DRY ? 'WET' : 'DRY') : null;
+  state.abOffsetDb = known ? -Math.abs(levels.WET - levels.DRY) : 0;
   const now = state.audioCtx ? state.audioCtx.currentTime : 0;
   if (state.wetGain) state.wetGain.gain.setTargetAtTime(Math.pow(10, abGainDb('WET') / 20), now, 0.01);
   if (state.dryGain) state.dryGain.gain.setTargetAtTime(Math.pow(10, abGainDb('DRY') / 20), now, 0.01);
+  if (state.realGain) state.realGain.gain.setTargetAtTime(Math.pow(10, abGainDb('REAL') / 20), now, 0.01);
   if (els.abMatch) {
     els.abMatch.disabled = !state.lastBlob || !state.dryBlob;
     els.abMatch.setAttribute('aria-pressed', String(state.abMatch));
     els.abMatch.classList.toggle('active', state.abMatch);
-    els.abMatch.textContent = state.abMatch && state.abLouder
-      ? `Matched: ${state.abLouder.toLowerCase()} ${state.abOffsetDb.toFixed(1).replace('-', '−')} dB`
-      : 'Match loudness';
+    const lowered = Object.entries(state.abGains).filter(([, g]) => g < -0.05)
+      .map(([label, g]) => `${label.toLowerCase()} ${g.toFixed(1).replace('-', '−')}`);
+    els.abMatch.textContent = !state.abMatch || !state.abLouder ? 'Match loudness'
+      : 'REAL' in levels ? `Matched: ${lowered.join(', ') || 'all equal'} dB`
+        : `Matched: ${state.abLouder.toLowerCase()} ${state.abOffsetDb.toFixed(1).replace('-', '−')} dB`;
   }
 }
 
@@ -1763,6 +1791,201 @@ document.addEventListener('keydown', (event) => {
     toggleLoop();
   }
 });
+
+/* ------------------------------------------------------------------ */
+/* Real take (reference.js)                                           */
+/*                                                                    */
+/* A real TF2 recording of the loaded source (voice_loopback) is      */
+/* found in the source and put on its timeline, offset and clock      */
+/* drift corrected. It becomes the third version of A/B, joins the    */
+/* views and the meter, and a report compares it with the render:     */
+/* level-matched band spectra, short-term level tracking and the      */
+/* receiver's clipping signature.                                     */
+/* ------------------------------------------------------------------ */
+
+els.reference = document.getElementById('reference');
+els.referenceFile = document.getElementById('reference-file');
+els.referenceChannel = document.getElementById('reference-channel');
+els.referenceClear = document.getElementById('reference-clear');
+els.referenceStatus = document.getElementById('reference-status');
+els.referenceReport = document.getElementById('reference-report');
+els.audioReal = document.getElementById('preview-real');
+state.realTake = null;   // { name, samples, rate, timeline, overlap: { t0, t1 }, blob }
+let referenceJob = 0, reportJob = 0, referenceDecoded = null;
+const REFERENCE_HELP = 'Load a voice_loopback recording of this source to check the simulation against it.';
+
+function setReferenceStatus(text, level = '') {
+  if (!els.referenceStatus) return;
+  els.referenceStatus.textContent = text;
+  els.referenceStatus.className = `reference-status${level ? ` ${level}` : ''}`;
+}
+
+function takeChannel(decoded, channel) {
+  if (decoded.numberOfChannels < 2 || channel === 'mix') return TF2Audio.bufferToMono(decoded);
+  return decoded.getChannelData(channel === 'right' ? 1 : 0).slice();
+}
+
+// The search and the warp, in a worker when there is one. The aligned take
+// keeps the take's sample rate and runs the length of the source.
+function locateTake(take, takeRate, source, sourceRate, onProgress) {
+  const length = Math.round(source.length / sourceRate * takeRate);
+  if (canUseWorker()) {
+    const t = take.slice(), s = source.slice();
+    return startWorker({ type: 'locate', take: t.buffer, takeRate, source: s.buffer, sourceRate, length }, [t.buffer, s.buffer], onProgress)
+      .promise.then(reply => ({ timeline: reply.timeline, aligned: new Float32Array(reply.aligned) }));
+  }
+  return new Promise((resolve, reject) => setTimeout(() => {
+    try {
+      const timeline = TF2Reference.locate(take, takeRate, source, sourceRate);
+      resolve({ timeline, aligned: TF2Reference.warp(take, takeRate, timeline, takeRate, length) });
+    } catch (error) { reject(error); }
+  }, 0));
+}
+
+function compareTakeJob(real, sim, rate) {
+  if (canUseWorker()) {
+    const r = real.slice(), s = sim.slice();
+    return startWorker({ type: 'compareTake', real: r.buffer, sim: s.buffer, rate }, [r.buffer, s.buffer]).promise.then(reply => reply.report);
+  }
+  return new Promise(resolve => setTimeout(() => resolve(TF2Reference.compareTake(real, sim, rate)), 0));
+}
+
+async function loadReferenceTake(file) {
+  if (!file || !state.decodedSource) return;
+  const job = ++referenceJob;
+  try {
+    setReferenceStatus(`Decoding ${file.name}…`);
+    if (!state.decodeCtx) state.decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const decoded = await state.decodeCtx.decodeAudioData(await file.arrayBuffer());
+    if (job !== referenceJob) return;
+    if (decoded.duration > MAX_AUDIO_SECONDS * 1.5) throw new Error('takes are limited to 15 minutes');
+    referenceDecoded = { decoded, name: file.name };
+    await alignReferenceTake(job);
+  } catch (error) {
+    if (job === referenceJob) setReferenceStatus(`Could not use ${file.name}: ${error.message}`, 'reference-bad');
+  }
+}
+
+async function alignReferenceTake(job = ++referenceJob) {
+  if (!referenceDecoded || !state.decodedSource) return;
+  const { decoded, name } = referenceDecoded;
+  const take = takeChannel(decoded, els.referenceChannel ? els.referenceChannel.value : 'mix'), rate = decoded.sampleRate;
+  const source = state.decodedSource.getChannelData(0), sourceRate = state.decodedSource.sampleRate;
+  setReferenceStatus(`Finding the source in ${name}…`);
+  try {
+    const { timeline, aligned } = await locateTake(take, rate, source, sourceRate,
+      (value) => { if (job === referenceJob) setReferenceStatus(`Finding the source in ${name}… ${Math.round(value * 100)}%`); });
+    if (job !== referenceJob) return;
+    clearReferenceTake(false);
+    const sourceSeconds = source.length / sourceRate;
+    const overlap = { t0: Math.max(0, timeline.offsetSeconds),
+      t1: Math.min(sourceSeconds, timeline.offsetSeconds + timeline.scale * take.length / rate) };
+    const blob = URL.createObjectURL(TF2Audio.encodeWav(aligned, rate));
+    state.realTake = { name, samples: aligned, rate, timeline, overlap, blob };
+    if (els.audioReal) {
+      els.audioReal.src = blob;
+      els.audioReal.muted = state.abMode !== 'real';
+      els.audioReal.volume = els.audio.volume;
+      els.audioReal.playbackRate = els.audio.playbackRate;
+      syncTwins(true);
+      if (!els.audio.paused) els.audioReal.play().catch(() => {});
+    }
+    if (els.referenceClear) els.referenceClear.hidden = false;
+    const t = timeline, fmt = (s) => formatTime(Math.abs(s), 3);
+    const where = t.offsetSeconds >= 0 ? `the take starts ${fmt(t.offsetSeconds)} into the source`
+      : `the source starts ${fmt(-t.offsetSeconds / t.scale)} into the take`;
+    const ppm = (t.scale - 1) * 1e6;
+    setReferenceStatus(`${name}: ${where}, clock ${ppm >= 0 ? '+' : '−'}${Math.abs(ppm).toFixed(0)} ppm, correlation ${t.correlation.toFixed(2)}`
+      + `${t.polarity < 0 ? ', polarity inverted' : ''}. It plays as the third A/B version (B cycles wet, dry, real).`, 'reference-good');
+    logLine(`Reference: aligned "${name}" (offset ${(t.offsetSeconds * 1000).toFixed(2)} ms, clock ${ppm.toFixed(1)} ppm, ${t.windows} windows, r ${t.correlation.toFixed(3)})`, 'sys');
+    updateReferenceReport();
+    updateMeter();
+    refreshVisualizer();
+  } catch (error) {
+    if (job === referenceJob) setReferenceStatus(`Could not align ${name}: ${error.message}`, 'reference-bad');
+  }
+}
+
+// Remove the aligned take (and, unless keepFile, forget the decoded file).
+function clearReferenceTake(forget = true) {
+  if (state.realTake) URL.revokeObjectURL(state.realTake.blob);
+  const had = !!state.realTake;
+  state.realTake = null;
+  if (els.audioReal) { els.audioReal.pause(); els.audioReal.removeAttribute('src'); els.audioReal.load(); }
+  if (state.abMode === 'real') {
+    state.abMode = 'wet';
+    setAbMutes();
+    els.abToggle.textContent = AB_LABELS.wet;
+  }
+  if (els.referenceReport) { els.referenceReport.hidden = true; els.referenceReport.replaceChildren(); }
+  if (forget) {
+    ++referenceJob;
+    referenceDecoded = null;
+    if (els.referenceFile) els.referenceFile.value = '';
+    if (els.referenceClear) els.referenceClear.hidden = true;
+    setReferenceStatus(REFERENCE_HELP);
+    if (had) { updateMeter(); refreshVisualizer(); }
+  }
+}
+
+const BAND_LABELS = ['40–80', '80–120', '120–200', '200–300', '300–500', '0.5–1k', '1–2k', '2–3k', '3–5k', '5–8k', '8–10k', '10–11k', '11–12k', '12–16k', '16–19k'];
+
+// The simulation against the take over the part of the source the take covers.
+async function updateReferenceReport() {
+  const take = state.realTake, box = els.referenceReport;
+  if (!box) return;
+  box.hidden = !take;
+  if (!take) return;
+  const note = (text) => { const p = document.createElement('p'); p.textContent = text; return p; };
+  if (!state.processedBuffer) { box.replaceChildren(note('Render the source to compare the simulation with the take.')); return; }
+  const job = ++reportJob;
+  box.replaceChildren(note('Comparing the render with the take…'));
+  const sim = state.processedBuffer, rate = state.processedRate;
+  const real = take.rate === rate ? take.samples : TF2Audio.resampleSinc(take.samples, take.rate, rate);
+  const from = Math.max(0, Math.round(take.overlap.t0 * rate)), to = Math.min(sim.length, real.length, Math.round(take.overlap.t1 * rate));
+  let report;
+  try {
+    if (to - from < rate) throw new Error('the take overlaps the source by less than a second');
+    report = await compareTakeJob(real.subarray(from, to), sim.subarray(from, to), rate);
+  } catch (error) {
+    if (job === reportJob) box.replaceChildren(note(`Could not compare: ${error.message}`));
+    return;
+  }
+  if (job !== reportJob || take !== state.realTake) return;
+  const table = document.createElement('table');
+  table.className = 'reference-bands';
+  const caption = document.createElement('caption');
+  caption.textContent = `Simulation minus take per band, dB, with the two level-matched at 300 Hz–3 kHz (${formatTime(take.overlap.t0, 1)}–${formatTime(take.overlap.t1, 1)})`;
+  const head = document.createElement('tr'), body = document.createElement('tr');
+  const cell = (tag, text, cls = '', title = '') => { const c = document.createElement(tag); c.textContent = text; if (cls) c.className = cls; if (title) c.title = title; return c; };
+  head.append(cell('th', 'Hz'));
+  body.append(cell('th', 'Δ', '', 'simulation minus take'));
+  (report.bands || []).forEach((band, i) => {
+    head.append(cell('th', BAND_LABELS[i] || band.hz));
+    const d = band.simMinusRealDb;
+    body.append(d === null ? cell('td', '—') : cell('td', `${d >= 0 ? '+' : '−'}${Math.abs(d).toFixed(1)}`,
+      Math.abs(d) <= 1.5 ? 'ref-good' : Math.abs(d) <= 3 ? 'ref-warn' : 'ref-bad'));
+  });
+  const thead = document.createElement('thead'), tbody = document.createElement('tbody');
+  thead.append(head); tbody.append(body);
+  table.append(caption, thead, tbody);
+  const parts = [];
+  const lt = report.levelTracking;
+  if (lt) parts.push(`Short-term level: ${lt.rmsDeviationDb.toFixed(1)} dB rms apart, worst ${lt.worstDeviationDb.toFixed(1)} dB, r ${lt.correlation === null ? '—' : lt.correlation.toFixed(2)} (${lt.blocks} blocks of 0.5 s).`);
+  const clip = report.clip || {};
+  const sig = (s) => `ceiling ${s.ceilingDbfs.toFixed(1)} dBFS, ${s.clippedPercent.toFixed(1)}% at it, mean/ceiling ${s.meanOverCeiling.toFixed(2)}`;
+  if (clip.real && clip.sim) parts.push(`Clipping: take ${sig(clip.real)}; simulation ${sig(clip.sim)}.`);
+  if (Number.isFinite(report.anchorGainDb)) {
+    const g = report.anchorGainDb;
+    parts.push(`Level at 300 Hz–3 kHz: the simulation is ${Math.abs(g).toFixed(1)} dB ${g >= 0 ? 'louder' : 'quieter'} (volume and voice_scale set this).`);
+  }
+  box.replaceChildren(table, ...parts.map(note));
+}
+
+if (els.referenceFile) els.referenceFile.addEventListener('change', () => loadReferenceTake(els.referenceFile.files[0]));
+if (els.referenceChannel) els.referenceChannel.addEventListener('change', () => { if (referenceDecoded) alignReferenceTake(); });
+if (els.referenceClear) els.referenceClear.addEventListener('click', () => clearReferenceTake());
+setReferenceStatus(REFERENCE_HELP);
 
 /* ------------------------------------------------------------------ */
 /* Visualizer                                                         */
@@ -1821,6 +2044,7 @@ els.vizRes = document.getElementById('viz-res');
 els.vizLufs = document.getElementById('viz-lufs');
 els.vizLoop = document.getElementById('viz-loop');
 els.vizLegend = document.getElementById('viz-legend');
+els.vizAvg = document.getElementById('viz-avg');
 state.vizScale = LS.get('tf2ve_viz_scale', 'lin') === 'log' ? 'log' : 'lin';
 state.waveScale = LS.get('tf2ve_wave_scale', 'lin') === 'db' ? 'db' : 'lin';
 state.vizRange = VIZ.ranges.includes(Number(LS.get('tf2ve_viz_range', 72))) ? Number(LS.get('tf2ve_viz_range', 72)) : 72;
@@ -1942,6 +2166,7 @@ function spectrumAt(samples, center, fftSize, out) {
 
 // The version the listener hears: processed (wet) or original (dry).
 function audibleBuffer() {
+  if (state.abMode === 'real' && state.realTake) return { samples: state.realTake.samples, rate: state.realTake.rate, label: 'REAL' };
   if (state.abMode === 'dry' && state.decodedSource) {
     return { samples: state.decodedSource.getChannelData(0), rate: state.decodedSource.sampleRate, label: 'DRY' };
   }
@@ -2680,7 +2905,7 @@ function drawCodecLane(L, range) {
 // Loudness lane: momentary (400 ms, thin) and short-term (3 s, bold) loudness
 // of the wet render and the dry source, each value drawn at the centre of its
 // window, with dashed lines at their integrated loudness.
-const LUFS_STYLE = { WET: '102, 192, 244', DRY: '235, 235, 235' };
+const LUFS_STYLE = { WET: '102, 192, 244', DRY: '235, 235, 235', REAL: '164, 208, 7' };
 function drawLufsLane(L, range) {
   if (!L.lufsH) return;
   const { w } = L, y0 = L.lufsY, hL = L.lufsH, span = range.t1 - range.t0;
@@ -2692,7 +2917,7 @@ function drawLufsLane(L, range) {
   for (const level of [-12, -24, -36]) { const y = Math.round(toY(level)) + 0.5; ctx.moveTo(0, y); ctx.lineTo(w, y); }
   ctx.stroke();
   const stats = state.meterStats;
-  const series = stats ? [['DRY', stats.dry], ['WET', stats.wet]].filter(([, s]) => s && s.history) : [];
+  const series = stats ? [['DRY', stats.dry], ['REAL', stats.real], ['WET', stats.wet]].filter(([, s]) => s && s.history) : [];
   for (const [label, s] of series) {
     const rgb = LUFS_STYLE[label], hop = s.history.hop;
     for (const [values, windowHops, width, alpha] of [[s.history.momentary, 4, 1, 0.45], [s.history.shortTerm, 30, 1.6, 0.95]]) {
@@ -2812,7 +3037,7 @@ function drawHover(L, buffer, range) {
   } else if (region === 'lufs') {
     const stats = state.meterStats || {};
     const fmt = (v) => (v === null ? '—' : Number.isFinite(v) ? v.toFixed(1) : '−∞');
-    for (const [label, s] of [['wet', stats.wet], ['dry', stats.dry]]) {
+    for (const [label, s] of [['wet', stats.wet], ['dry', stats.dry], ['real', stats.real]]) {
       if (!s || !s.history) continue;
       const v = lufsAt(s, t);
       text += ` · ${label} M ${fmt(v.m)} S ${fmt(v.s)}`;
@@ -2834,12 +3059,13 @@ function drawHover(L, buffer, range) {
 
 /* ---------------- BARS ---------------- */
 
-// The version not being heard, for the BARS overlay.
+// The version to overlay in BARS: the render when hearing the source or the
+// real take; the real take (or else the source) when hearing the render.
 function otherBuffer() {
   if (!state.processedBuffer || !state.decodedSource) return null;
-  return state.abMode === 'dry'
-    ? { samples: state.processedBuffer, rate: state.processedRate, label: 'WET' }
-    : { samples: state.decodedSource.getChannelData(0), rate: state.decodedSource.sampleRate, label: 'DRY' };
+  if (state.abMode !== 'wet') return { samples: state.processedBuffer, rate: state.processedRate, label: 'WET' };
+  if (state.realTake) return { samples: state.realTake.samples, rate: state.realTake.rate, label: 'REAL' };
+  return { samples: state.decodedSource.getChannelData(0), rate: state.decodedSource.sampleRate, label: 'DRY' };
 }
 
 // Spectrum of `buffer` at the playhead, as band levels, shifted by its A/B
@@ -2926,6 +3152,211 @@ function drawBarsView(buffer, w, h, now) {
   }
 }
 
+/* ---------------- BARS: average spectrum ---------------- */
+
+// AVG: the long-term average spectrum of the render and the source over the
+// selection (or the whole file), the source shifted to the render's
+// loudness, and their difference. Welch's method: power averaged over
+// 8192-point Blackman windows (up to 1500, spread evenly), skipping windows
+// below -70 dBFS RMS as BS.1770 gates silence; then 1/6-octave smoothing.
+const AVG = { fft: 8192, minFft: 1024, maxWindows: 1500, gateDb: -70, octave: 1 / 6, diffRange: 24 };
+state.barsAvg = LS.get('tf2ve_bars_avg', false) === true;
+const avgResults = new Map();   // "id:t0:t1" -> Promise<{ power, rate, fft, windows }>
+
+function averagePower(samples, rate, t0, t1) {
+  const key = `${bufferId(samples)}:${t0.toFixed(4)}:${t1.toFixed(4)}`;
+  if (!avgResults.has(key)) {
+    if (avgResults.size >= 16) avgResults.delete(avgResults.keys().next().value);
+    const job = (async () => {
+      const from = Math.max(0, Math.floor(t0 * rate)), to = Math.min(samples.length, Math.ceil(t1 * rate));
+      const part = samples.subarray(from, to);
+      let n = AVG.fft;
+      while (n > AVG.minFft && n > part.length) n /= 2;
+      const plan = fftPlan(n), sum = new Float64Array(n / 2 + 1);
+      const count = Math.max(1, Math.min(AVG.maxWindows, Math.floor((part.length - n) / (n / 2)) + 1));
+      const step = count > 1 ? (part.length - n) / (count - 1) : 0;
+      const gate = Math.pow(10, AVG.gateDb / 10) * n;
+      let used = 0, yieldAt = performance.now() + 12;
+      for (let i = 0; i < count; i++) {
+        const start = Math.round(i * step);
+        let energy = 0;
+        for (let j = start; j < Math.min(part.length, start + n); j++) energy += part[j] * part[j];
+        if (energy < gate && count > 1) continue;
+        windowedFft(plan, part, part.length < n ? part.length / 2 : start + n / 2);
+        for (let k = 0; k <= n / 2; k++) sum[k] += plan.re[k] * plan.re[k] + plan.im[k] * plan.im[k];
+        used++;
+        if (performance.now() > yieldAt) { await yieldToUi(); yieldAt = performance.now() + 12; }
+      }
+      // Mean power per bin, scaled like AnalyserNode (a full-scale sine reads about -13.6 dB).
+      for (let k = 0; k <= n / 2; k++) sum[k] = used ? sum[k] / used / (n * n) : 0;
+      return { power: sum, rate, fft: n, windows: used };
+    })();
+    job.catch(() => avgResults.delete(key));
+    avgResults.set(key, job);
+  }
+  return avgResults.get(key);
+}
+
+// dB per pixel column, smoothed over 1/6 octave around each column's
+// frequency (prefix sums of power; narrow low bands interpolate).
+function smoothedSpectrum(result, w, top) {
+  const { power, rate, fft } = result, binHz = rate / fft, last = power.length - 1;
+  const prefix = new Float64Array(power.length + 1);
+  for (let k = 0; k < power.length; k++) prefix[k + 1] = prefix[k] + power[k];
+  const at = (bin) => { const k = Math.min(last - 1, Math.floor(bin)), f = bin - k; return power[k] * (1 - f) + power[k + 1] * f; };
+  const half = Math.pow(2, AVG.octave / 2), out = new Float32Array(w);
+  for (let x = 0; x < w; x++) {
+    const hz = VIZ.minHz * Math.pow(top / VIZ.minHz, (x + 0.5) / w);
+    const lo = hz / half / binHz, hi = Math.min(last, hz * half / binHz);
+    let p;
+    if (hi - lo < 2) p = at(Math.min(last - 1, hz / binHz));
+    else { const k0 = Math.ceil(lo), k1 = Math.floor(hi); p = (prefix[k1 + 1] - prefix[k0]) / (k1 - k0 + 1); }
+    out[x] = p > 0 ? 10 * Math.log10(p) : -Infinity;
+  }
+  return out;
+}
+
+let avgView = null;   // { key, wet, ref, extra, ... } for the current width and range
+// The render against the real take when one is loaded (dry drawn faintly
+// behind), else against the dry source. Each is shifted to the render's
+// loudness over the analysed range.
+function drawAverageView(w, h) {
+  drawBackdrop(w, h);
+  const versions = {
+    WET: state.processedBuffer ? { samples: state.processedBuffer, rate: state.processedRate } : null,
+    DRY: state.decodedSource ? { samples: state.decodedSource.getChannelData(0), rate: state.decodedSource.sampleRate } : null,
+    REAL: state.realTake ? { samples: state.realTake.samples, rate: state.realTake.rate } : null
+  };
+  const refLabel = versions.REAL ? 'REAL' : 'DRY';
+  const order = ['WET', refLabel, ...(versions.REAL ? ['DRY'] : [])].filter(label => versions[label]);
+  const first = versions[order[0]];
+  const duration = first.samples.length / first.rate;
+  const range = vizSel ? { t0: vizSel.t0, t1: Math.min(vizSel.t1, duration) } : { t0: 0, t1: duration };
+  // A take covers only part of the source: analyse where it has audio.
+  if (state.realTake) { range.t0 = Math.max(range.t0, state.realTake.overlap.t0); range.t1 = Math.min(range.t1, state.realTake.overlap.t1); }
+  if (!(range.t1 - range.t0 > 0.05)) { drawLabel('The selection is outside the real take.', 8, 8); els.canvas.dataset.view = ''; return; }
+  const top = Math.min(VIZ.maxHz, ...order.map(label => versions[label].rate / 2));
+  const key = `${order.map(label => bufferId(versions[label].samples)).join(':')}:${range.t0.toFixed(4)}:${range.t1.toFixed(4)}:${Math.round(w)}`;
+  const whole = !vizSel && !state.realTake;
+  if (!avgView || avgView.key !== key) {
+    avgView = { key, pending: true };
+    const view = avgView;
+    Promise.all(order.map(label => averagePower(versions[label].samples, versions[label].rate, range.t0, range.t1)))
+      .then(async (powers) => {
+        // Match loudness over the same range (RMS when it is under 0.4 s).
+        const levels = await Promise.all(order.map(label => (whole ? measure(versions[label].samples, versions[label].rate)
+          : measureRange(versions[label].samples, versions[label].rate, range.t0, range.t1)).catch(() => null)));
+        if (avgView !== view) return;
+        const lufs = (s) => (s && Number.isFinite(s.integrated) ? s.integrated : null);
+        const curves = {};
+        order.forEach((label, i) => {
+          let offset = 0, match = '';
+          if (i > 0 && order[0] === 'WET') {
+            if (lufs(levels[0]) !== null && lufs(levels[i]) !== null) { offset = lufs(levels[0]) - lufs(levels[i]); match = 'loudness'; }
+            else if (levels[0] && levels[i] && Number.isFinite(levels[0].rms) && Number.isFinite(levels[i].rms)) { offset = levels[0].rms - levels[i].rms; match = 'RMS'; }
+          }
+          curves[label] = { values: smoothedSpectrum(powers[i], Math.round(w), top).map(v => v + offset), offset, match };
+        });
+        Object.assign(view, { pending: false, top, range, curves, refLabel, windows: powers[0].windows, fft: powers[0].fft });
+        refreshVisualizer();
+      })
+      .catch((error) => { if (avgView === view) { view.pending = false; view.error = error.message; refreshVisualizer(); } });
+  }
+  const v = avgView;
+  const specH = Math.round(h * 0.68), diffY = specH + 4, diffH = h - diffY - 2;
+  // Level grid and frequency grid.
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)'; ctx.lineWidth = 1;
+  const yDb = (db) => specH * (1 - dbToUnit(db));
+  for (const dbLine of [-20, -40, -60, -80]) {
+    const y = Math.round(yDb(dbLine)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  drawFrequencyGrid(w, specH, top, false);
+  ctx.fillStyle = '#05080b'; ctx.fillRect(0, specH, w, h - specH);
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.14)'; ctx.fillRect(0, specH, w, 1);
+  const yDiff = (d) => diffY + diffH / 2 - Math.max(-1, Math.min(1, d / AVG.diffRange)) * diffH / 2;
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)';
+  ctx.beginPath();
+  for (const d of [-12, 12]) { const y = Math.round(yDiff(d)) + 0.5; ctx.moveTo(0, y); ctx.lineTo(w, y); }
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+  ctx.beginPath(); ctx.moveTo(0, Math.round(yDiff(0)) + 0.5); ctx.lineTo(w, Math.round(yDiff(0)) + 0.5); ctx.stroke();
+  const STYLE = { WET: ['rgba(102, 192, 244, 0.95)', 2], DRY: ['rgba(235, 235, 235, 0.85)', 1.5], REAL: ['rgba(164, 208, 7, 0.95)', 1.5] };
+  if (v.pending || v.error) {
+    drawLabel(v.error ? `Average spectrum failed: ${v.error}` : 'Analyzing…', w - 8, 6, 'rgba(255, 184, 34, 0.9)', 'right');
+  } else {
+    const curve = (values, color, width, y) => {
+      ctx.strokeStyle = color; ctx.lineWidth = width;
+      ctx.beginPath();
+      let pen = false;
+      for (let x = 0; x < values.length; x++) {
+        if (!Number.isFinite(values[x])) { pen = false; continue; }
+        const yy = y(values[x]);
+        if (pen) ctx.lineTo(x + 0.5, yy); else { ctx.moveTo(x + 0.5, yy); pen = true; }
+      }
+      ctx.stroke();
+    };
+    // Back to front: the faint source behind a real take, the reference, the render.
+    if (v.curves.DRY && v.refLabel === 'REAL') curve(v.curves.DRY.values, 'rgba(235, 235, 235, 0.3)', 1, yDb);
+    if (v.curves[v.refLabel]) curve(v.curves[v.refLabel].values, ...STYLE[v.refLabel], yDb);
+    if (v.curves.WET) curve(v.curves.WET.values, ...STYLE.WET, yDb);
+    v.diff = null;
+    if (v.curves.WET && v.curves[v.refLabel]) {
+      // Difference, where either version is above the display floor.
+      const ref = v.curves[v.refLabel].values;
+      const diff = v.curves.WET.values.map((a, x) => (Math.max(a, ref[x]) > VIZ.minDb ? a - ref[x] : NaN));
+      ctx.fillStyle = 'rgba(255, 184, 34, 0.18)';
+      for (let x = 0; x < diff.length; x++) {
+        if (!Number.isFinite(diff[x])) continue;
+        const y0 = yDiff(0), y1 = yDiff(diff[x]);
+        ctx.fillRect(x, Math.min(y0, y1), 1, Math.abs(y1 - y0));
+      }
+      curve(diff, 'rgba(255, 184, 34, 0.95)', 1.5, yDiff);
+      v.diff = diff;
+    }
+  }
+  drawFrequencyGrid(w, specH, top, true);
+  for (const dbLine of [-20, -40, -60, -80]) {
+    const y = Math.round(yDb(dbLine));
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)'; ctx.fillRect(2, y - 5, 22, 10);
+    drawLabel(String(dbLine), 4, y - 5, 'rgba(200, 210, 220, 0.75)');
+  }
+  for (const d of [-12, 12]) {
+    const y = yDiff(d);
+    if (y - 5 < specH + 2 || y + 5 > h) continue;
+    drawLabel(`${d > 0 ? '+' : '−'}${Math.abs(d)}`, 4, y - 5, 'rgba(200, 210, 220, 0.6)');
+  }
+  drawLabel(`Δ wet − ${refLabel.toLowerCase()}`, w - 6, diffY + 2, 'rgba(255, 184, 34, 0.8)', 'right');
+  const where = vizSel || state.realTake ? `${formatTime(range.t0, 2)}–${formatTime(range.t1, 2)}` : 'whole file';
+  drawPlate(`AVERAGE SPECTRUM · ${where}${v.fft ? ` · ${v.fft}-pt, ${v.windows} windows, 1/6 oct` : ''}`, 30, 3);
+  if (v.curves) {
+    let x = 30;
+    for (const label of ['WET', refLabel, ...(refLabel === 'REAL' ? ['DRY'] : [])]) {
+      const c = v.curves[label];
+      if (!c) continue;
+      const shift = c.match ? ` (${c.offset >= 0 ? '+' : '−'}${Math.abs(c.offset).toFixed(1)} dB)` : '';
+      const text = `— ${label}${shift}`;
+      drawLabel(text, x, 17, label === 'DRY' && refLabel === 'REAL' ? 'rgba(235, 235, 235, 0.5)' : STYLE[label][0]);
+      ctx.font = '9px Verdana, sans-serif';
+      x += ctx.measureText(text).width + 12;
+    }
+    if (Object.values(v.curves).some(c => c.match)) drawLabel(`${Object.values(v.curves).find(c => c.match).match} matched to wet`, x, 17, 'rgba(200, 210, 220, 0.55)');
+  }
+  els.canvas.dataset.view = v.pending ? '' : `avg:${refLabel.toLowerCase()}:${range.t0.toFixed(4)}-${range.t1.toFixed(4)}`;
+
+  if (vizHover && !v.pending && v.curves) {
+    const x = Math.min(w - 1, Math.max(0, Math.floor(vizHover.x)));
+    const hz = VIZ.minHz * Math.pow(v.top / VIZ.minHz, (x + 0.5) / w);
+    const fmt = (d) => (Number.isFinite(d) ? d.toFixed(1) : '−∞');
+    let text = formatHz(hz);
+    for (const label of ['WET', 'REAL', 'DRY']) if (v.curves[label]) text += ` · ${label.toLowerCase()} ${fmt(v.curves[label].values[x])}`;
+    if (v.diff && Number.isFinite(v.diff[x])) text += ` · Δ ${v.diff[x] >= 0 ? '+' : '−'}${Math.abs(v.diff[x]).toFixed(1)} dB`;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, h); ctx.stroke();
+    drawTag(text, vizHover.x + 10, Math.max(30, Math.min(specH - 18, vizHover.y - 20)), w);
+  }
+}
+
 // dBFS labels for the waveform's amplitude grid.
 function drawWaveLabels(w, h) {
   const map = waveMapper(), mid = h / 2;
@@ -2944,7 +3375,10 @@ function drawVisualizer(now = performance.now()) {
   const { w, h, dpr } = resizeCanvas();
   const buffer = audibleBuffer();
   if (!buffer) { drawBackdrop(w, h); drawLabel('Load audio to visualize', 8, 8); els.canvas.dataset.view = ''; return; }
-  if (state.vizMode === 'bars') { drawBarsView(buffer, w, h, now); return; }
+  if (state.vizMode === 'bars') {
+    if (state.barsAvg) drawAverageView(w, h); else drawBarsView(buffer, w, h, now);
+    return;
+  }
   const L = vizLayout(w, h);
   const range = drawTimeView(buffer, w, L.mainH, dpr);
   const spec = state.vizMode === 'spec';
@@ -2995,7 +3429,7 @@ function updateLegend() {
   const time = state.vizMode !== 'bars';
   const info = time ? codecFrames() : null;
   const lufs = time && state.showLufs && !!(state.processedBuffer || state.decodedSource);
-  const key = `${info ? bufferId(info.frameLog) : 0}:${lufs}`;
+  const key = `${info ? bufferId(info.frameLog) : 0}:${lufs}:${!!state.realTake}`;
   if (key === legendKey) return;
   legendKey = key;
   const items = [];
@@ -3033,7 +3467,7 @@ function updateLegend() {
     head.textContent = 'Loudness';
     head.title = 'BS.1770 loudness over time: momentary (400 ms) and short-term (3 s), each at the centre of its window';
     items.push(head);
-    for (const label of ['WET', 'DRY']) {
+    for (const label of ['WET', 'DRY', ...(state.realTake ? ['REAL'] : [])]) {
       items.push(item(line(LUFS_STYLE[label], 2, false), `${label.toLowerCase()} S`, `${label.toLowerCase()} short-term (3 s)`));
       items.push(item(line(LUFS_STYLE[label], 1, false), `${label.toLowerCase()} M`, `${label.toLowerCase()} momentary (400 ms)`));
     }
@@ -3059,6 +3493,11 @@ function updateVizTools() {
   if (els.vizRange) {
     els.vizRange.hidden = !(state.vizMode === 'spec' || (state.vizMode === 'wave' && state.waveScale === 'db'));
     els.vizRange.textContent = `${state.vizRange} dB`;
+  }
+  if (els.vizAvg) {
+    els.vizAvg.hidden = state.vizMode !== 'bars';
+    els.vizAvg.disabled = !loaded;
+    els.vizAvg.setAttribute('aria-pressed', String(state.barsAvg));
   }
   if (els.vizRes) {
     els.vizRes.hidden = state.vizMode !== 'spec';
@@ -3110,6 +3549,11 @@ if (els.vizLog) els.vizLog.addEventListener('click', () => {
     // Keep the visible band where the new axis can show it (log starts at 20 Hz).
     if (vizFreq.lo !== null && state.vizScale === 'log') vizFreq.lo = Math.max(VIZ.logMinHz, vizFreq.lo);
   }
+  refreshVisualizer();
+});
+if (els.vizAvg) els.vizAvg.addEventListener('click', () => {
+  state.barsAvg = !state.barsAvg;
+  LS.set('tf2ve_bars_avg', state.barsAvg);
   refreshVisualizer();
 });
 if (els.vizRange) els.vizRange.addEventListener('click', () => {
@@ -3343,6 +3787,11 @@ els.audio.addEventListener('play', () => {
         state.sourceNodeDry = state.audioCtx.createMediaElementSource(els.audioDry);
         state.sourceNodeDry.connect(state.dryGain).connect(state.analyser);
       }
+      if (els.audioReal) {
+        state.realGain = state.audioCtx.createGain();
+        state.sourceNodeReal = state.audioCtx.createMediaElementSource(els.audioReal);
+        state.sourceNodeReal.connect(state.realGain).connect(state.analyser);
+      }
       applyAbMatch();
     } catch (e) {
       state.analyser = null;   // visualizer falls back to buffer analysis
@@ -3352,13 +3801,14 @@ els.audio.addEventListener('play', () => {
   // A selection loop starts at the selection when played from outside it.
   if (state.loop && vizSel && (els.audio.currentTime < vizSel.t0 || els.audio.currentTime >= vizSel.t1)) els.audio.currentTime = vizSel.t0;
   loopLastTime = els.audio.currentTime;
-  if (els.audioDry && els.audioDry.src) { syncDry(); els.audioDry.play().catch(() => {}); }
+  syncTwins();
+  for (const el of twins()) el.play().catch(() => {});
   state.isPlaying = true;
   cancelAnimationFrame(state.animationId);
   state.animationId = requestAnimationFrame(animateVisualizer);
 });
 function stopVisualizer() {
-  if (els.audioDry) els.audioDry.pause();
+  for (const el of [els.audioDry, els.audioReal]) if (el) el.pause();
   state.isPlaying = false;
   cancelAnimationFrame(state.animationId);
   refreshVisualizer();
@@ -3369,7 +3819,7 @@ els.audio.addEventListener('ended', () => {
   if (state.loop && vizSel) { els.audio.currentTime = vizSel.t0; els.audio.play().catch(() => {}); return; }
   stopVisualizer();
 });
-els.audio.addEventListener('seeked', () => { syncDry(); loopLastTime = els.audio.currentTime; refreshVisualizer(); });
+els.audio.addEventListener('seeked', () => { syncTwins(); loopLastTime = els.audio.currentTime; refreshVisualizer(); });
 els.audio.addEventListener('timeupdate', () => { checkLoop(); refreshVisualizer(); });
 let resizeTimer = 0;
 window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(refreshVisualizer, 150); });
