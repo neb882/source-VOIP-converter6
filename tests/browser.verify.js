@@ -399,6 +399,16 @@ async function verifyVideo(page) {
     check(same && audio.length === 1 && download.suggestedFilename().endsWith(`_tf2_steam.${ext}`),
       `${name}: Download video keeps the picture byte for byte and carries the render`, `${download.suggestedFilename()}, audio ${audio[0] && audio[0].format}`);
   }
+  // A video dropped on the page loads as the source like one chosen in step 1
+  // (a .mov is video/quicktime, not audio), and the status says what to do.
+  await page.evaluate(async (bytes) => {
+    const data = new DataTransfer();
+    data.items.add(new File([new Uint8Array(bytes)], 'dropped.mov', { type: 'video/quicktime' }));
+    document.querySelector('h1').dispatchEvent(new DragEvent('drop', { dataTransfer: data, bubbles: true, cancelable: true }));
+  }, [...fs.readFileSync(path.join(__dirname, 'video', 'h264_pcm.mov'))]);
+  await page.waitForFunction(() => state.sourceName === 'dropped.mov' && !document.getElementById('download-video').hidden);
+  const status = await page.locator('#source-status').textContent();
+  check(status.includes('Download video (MOV)'), 'a dropped .mov loads as the video source and the status points to Download video', status);
   // Loading plain audio hides it again.
   await page.locator('#file').setInputFiles({ name: 'after-video.wav', mimeType: 'audio/wav', buffer: wavTone(.5) });
   await page.waitForFunction(() => state.sourceName === 'after-video.wav');
@@ -496,6 +506,10 @@ async function verifyBatchAndFormats(browser, base) {
       { name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('not audio') }
     ]);
     check((await summary()).includes('2 files') && (await summary()).includes('skipped 1 file'), 'batch adds audio files and skips others', await summary());
+    // A video's audio can be batched too.
+    await page.locator('#batch-files').setInputFiles({ name: 'clip.mov', mimeType: 'video/quicktime', buffer: fs.readFileSync(path.join(__dirname, 'video', 'h264_pcm.mov')) });
+    check((await summary()).includes('3 files'), 'batch takes video files for their audio', await summary());
+    await page.locator('.batch-item', { hasText: 'clip.mov' }).locator('.bi-remove').click();
     check(JSON.stringify(await page.locator('.batch-item .bi-name').allTextContents()) === '["a-song.wav","b-song.wav"]', 'batch sorts files by name');
     // A multi-file choice in step 1 and a drop on the batch panel both queue files.
     await page.locator('#file').setInputFiles([

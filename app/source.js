@@ -292,8 +292,10 @@ async function loadSourceFile(f) {
     if (keep) {
       state.sourceVideo = { bytes: keep, name: f.name, info };
       logLine(`FS_MountFile: video (${info.container.toUpperCase()}, ${info.codec}) kept; Download video puts the render back into it.`, 'sys');
+      setStatus(`${els.status.textContent} · video: process, then Download video (${info.container.toUpperCase()})`, 'success');
     } else if (video) {
       logLine(`FS_MountFile: ${info && info.note ? info.note : 'only MP4 and MOV videos can take the render back; this one gives its audio only.'}`, 'warn');
+      setStatus(`${els.status.textContent} · the video's audio only (only MP4 and MOV can take the render back)`, 'success');
     }
     updateVideoButton();
   } catch (error) {
