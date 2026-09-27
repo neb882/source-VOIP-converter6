@@ -157,4 +157,29 @@ check('Level tracking rejects unequal lengths', true);
     toneTrack.segments.length === 1 && near(toneTrack.segments[0].delayMs, 800, 3));
 }
 
+// Segment measures for the pre-registered predictions (tests/predictions).
+{
+  const sr = 48000, db = (x) => 20 * Math.log10(x);
+  const sine = (f, amp, n) => Float32Array.from({ length: n }, (_, i) => amp * Math.sin(2 * Math.PI * f * i / sr));
+  // A 1 kHz sine at 0.1 reads its RMS level in its band; white noise 10 dB
+  // louder than the sine is some 16 dB under it there.
+  let seed = 1;
+  const noise = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647 - .5; };
+  const x = sine(1000, .1, 2 * sr), mixed = Float32Array.from(x, v => v + .775 * noise());
+  const band = TF2Reference.segmentBand('sine1k_-20dB');
+  check('Segment band: a 1 kHz sine is measured 30 Hz either side', band[0] === 970 && band[1] === 1030
+    && TF2Reference.segmentBand('tone_5000Hz_-20dB').join() === '4970,5030' && TF2Reference.segmentBand('pink_-20dB').join() === '150,10000');
+  check('Band level: a sine reads its RMS level in its band', near(TF2Reference.bandLevelDb(x, sr, 0, x.length, ...band), db(.1 / Math.SQRT2), .01));
+  check('Band level: a sine stays measurable under 10 dB louder broadband noise',
+    near(TF2Reference.bandLevelDb(mixed, sr, 0, mixed.length, ...band), db(.1 / Math.SQRT2), .3));
+  // The clamp: a clipped sine's plateau, even with a spike 2 dB over it.
+  const clipped = Float32Array.from(sine(1000, .3, sr), v => Math.max(-.15, Math.min(.15, v)));
+  clipped[1000] = .15 * 10 ** (2.1 / 20);
+  check('Clamp: found at the plateau, not at a louder spike', near(db(TF2Reference.clampLevel(clipped)), db(.15), .1));
+  const stats = TF2Reference.segmentStats(clipped, sr, [{ name: 'sine1k_-10dB', start_s: 0, dur_s: 1 }], TF2Reference.clampLevel(clipped));
+  const expected = 100 * (1 - 2 / Math.PI * Math.asin(.9 * .15 / .3));
+  check(`Segment stats: the clipped share counts samples within 10% of the clamp (${stats[0].clipPct.toFixed(1)}%)`,
+    stats.length === 1 && near(stats[0].clipPct, expected, 1));
+}
+
 console.log(`\n${passed} paired-reference checks passed.`);

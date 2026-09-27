@@ -222,6 +222,13 @@ For the clip from the "whoosh" investigation (a river recording and its TF2 take
 
 **Every take at once.** `pnpm accuracy --takes <folder>` runs this check over the owner's 18 recordings in headless Chromium. Each is rendered with the settings it was recorded with, lined up and compared, and the talk-spurt timing goes to JSON with `--json`. The takes and their settings are listed in [`tests/accuracy.takes.json`](tests/accuracy.takes.json); the recordings themselves are not distributed. The results are in [REFERENCE_2026.md](tests/REFERENCE_2026.md#results).
 
+**Predictions made before the recordings.** A model fitted to recordings should reproduce them; the harder test is recordings it has not seen. [`tests/predictions/`](tests/predictions/PREDICTIONS.md) holds the app's predictions for six takes nobody has recorded yet:
+- `vaudio_celt` and `vaudio_celt_high`, each with two competing hypotheses
+- `voice_scale 2`, `voice_avggain 1` and `voice_maxgain 3`
+- `volume 1`
+
+They were rendered, measured and frozen by hash before the takes exist, with the scoring rules fixed in advance. The rules were checked on the Set B takes and on stand-in takes made from the renders plus real game sound. When the takes come in, `pnpm accuracy --score-predictions --takes <folder>` scores them against the registered file, and the results go in that file whatever they are.
+
 ## Reference recordings
 
 The owner attributes `real tf2 VOIP recording 2024.mp3` to [this TF2 video](https://www.youtube.com/watch?v=nqXpT5uNdT8). It is mixed with game audio, so it can only be screened:

@@ -479,6 +479,8 @@ A pure sine's codec noise moves by about 2 dB with where the 20 ms frames fall o
 
 ## What remains unverified
 
+Six settings no recording covers yet are predicted in advance in [predictions/PREDICTIONS.md](predictions/PREDICTIONS.md): the legacy codecs `vaudio_celt` and `vaudio_celt_high`, `voice_scale 2`, `voice_avggain 1`, `voice_maxgain 3` and `volume 1`.
+
 - **Talk-spurt timing and latency trimming.** Renders keep the source timeline by default. Early starts after short silences (finding 19) are an option, modeled statistically: which spurt TF2 moves is not predictable. The 5.8 ms latency trims inside a spurt (finding 10) and the recorder's clock drift (about 400 ppm in every take, finding 15) are not modeled. All of these occur with a remote listener on a dedicated server too (Set D).
 - **Steam's libopus build.** Finding 16 identifies libopus 1.1.x, most likely 1.1.2 or later, which give identical packets here. Steam's compiler and math library could still change packets in their last bits. Steam's capture resampler is modeled by its measured roll-off, not reproduced. Pure tones at 11.5–12 kHz fall into DTX in Steam's encoder more often than in the model.
 - **Stereo capture.** Finding 6 is one capture chain (a stereo virtual cable). A physical microphone is mono either way.
