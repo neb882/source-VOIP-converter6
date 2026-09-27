@@ -269,20 +269,25 @@ const CODEC_PROFILES = {
     senderGate: { thresholdDb: -39.5, prerollMs: 120, holdMs: 440 },
     voiceRate: 44100, mixer: 'sinc', status: 'experimental'
   },
-  // vaudio_celt ran CELT at 22.05 kHz / ~22 kbps. Opus's CELT layer is its
-  // descendant; this is a stand-in, not the original 0.x bitstream.
+  // vaudio_celt is CELT 0.11 at 22050 Hz: 512-sample frames (23.2 ms) in
+  // 64-byte packets, 22.05 kbps. Opus's CELT layer is its descendant; this is
+  // a stand-in, not the 0.11 bitstream. See tests/LEGACY_CODECS.md.
   celt_22: {
     displayName: 'CELT era (Opus CELT layer, 22 kbps)',
     codecRate: 24000, bitrate: 22000, application: 'lowdelay', signal: 'auto',
     voiceRate: 22050, mixer: 'linear', status: 'modeled'
   },
+  // vaudio_celt_high: one public source gives 44100 Hz, 256-sample frames
+  // and 120-byte packets (165 kbps), at odds with the "44 kbps" usually
+  // quoted; unconfirmed until a take (tests/LEGACY_CODECS.md).
   celt_44: {
     displayName: 'CELT high (Opus CELT layer, 44 kbps)',
     codecRate: 48000, bitrate: 44000, application: 'lowdelay', signal: 'auto',
     voiceRate: 44100, mixer: 'sinc', status: 'modeled'
   },
   // vaudio_speex was 8 kHz narrowband CELP. SILK is a different LPC codec
-  // with a similar narrowband character; this is a stand-in.
+  // with a similar narrowband character; this is a stand-in. Source's Speex
+  // quality is not public, and current TF2 cannot load the codec.
   speex: {
     displayName: 'Narrowband (Opus SILK, 8 kHz / 8 kbps)',
     codecRate: 8000, bitrate: 8000, application: 'voip', signal: 'voice',

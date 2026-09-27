@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { fft, findMatch, consistentTimeline, sampleTimeline, describePair, rmsDb, clipSignature, levelTracking } from './reference.compare.mjs';
+import { fft, findMatch, consistentTimeline, sampleTimeline, describePair, rmsDb, clipSignature, levelTracking, audioEngine } from './reference.compare.mjs';
+import { createRequire } from 'node:module';
+const TF2Reference = createRequire(import.meta.url)('../reference.js');
 
 let passed = 0;
 const check = (label, condition) => { assert.ok(condition, label); passed++; console.log(`  ok    ${label}`); };
@@ -58,4 +60,59 @@ check('Level tracking removes a constant gain and finds perfect agreement',
   near(tracked.offsetDb, 20 * Math.log10(2), 1e-6) && tracked.rmsDeviationDb < 1e-6 && near(tracked.correlation, 1, 1e-9));
 assert.throws(() => levelTracking(wobble, wobble.subarray(1), 48000));
 check('Level tracking rejects unequal lengths', true);
+
+// The page's real-take comparison (reference.js): a take made from the app's
+// own render, 1.2345 s late, on a clock 200 ppm fast, 10 dB quieter, with a
+// little noise, must be found and lined up with the source to a few
+// microseconds, and then compare as identical.
+{
+  const { audio, sandbox } = audioEngine();
+  sandbox.TF2Opus = await import('../opus-codec.mjs');
+  globalThis.TF2Audio = audio;
+  const sr = 48000, seconds = 20;
+  let seed = 7;
+  const random = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 4294967296) * 2 - 1;
+  // Speech-like: syllables of shaped noise and gliding harmonics, with pauses.
+  const src = new Float32Array(sr * seconds);
+  let lp = 0;
+  for (let i = 0; i < src.length; i++) {
+    const t = i / sr, syllable = Math.floor(t / .23), on = (syllable * 7919) % 5 !== 0;
+    const env = on ? Math.sin(Math.PI * ((t / .23) % 1)) ** 2 : 0;
+    const f0 = 110 + 40 * Math.sin(t * 1.3) + 15 * (syllable % 4);
+    lp += .3 * (random() - lp);
+    let v = .25 * lp;
+    for (let h = 1; h <= 12; h++) v += Math.sin(2 * Math.PI * f0 * h * t + h) / (h + 1);
+    src[i] = .12 * env * v;
+  }
+  const sim = (await audio.process({ sampleRate: sr, length: src.length, numberOfChannels: 1, getChannelData: () => src }, { codec: 'steam' })).samples;
+  const k = 1.0002, delay = 1.2345, takeLength = Math.round((seconds + 2) * sr);
+  const clean = TF2Reference.locate(TF2Reference.warp(src, sr, { offsetSeconds: delay, scale: 1 / k }, sr, takeLength), sr, src, sr);
+  check(`Real take: offset and clock of a delayed, skewed copy (${((clean.offsetSeconds + delay * k) * 1e6).toFixed(2)} us, ${((clean.scale / k - 1) * 1e6).toFixed(2)} ppm off)`,
+    near(clean.offsetSeconds, -delay * k, 5e-6) && near(clean.scale, k, .5e-6));
+  // Through the chain: the render itself sits a fraction of a millisecond
+  // off the source (the codec's residual delay), and the take inherits it.
+  const own = TF2Reference.locate(sim, sr, src, sr);
+  const take = TF2Reference.warp(sim, sr, { offsetSeconds: delay, scale: 1 / k }, sr, takeLength).map(v => .316 * v + 1e-4 * random());
+  const found = TF2Reference.locate(take, sr, src, sr);
+  const expected = own.offsetSeconds - delay * k * own.scale;
+  check(`Real take: a take of the render lines up with the source (${((found.offsetSeconds - expected) * 1e6).toFixed(2)} us, render ${(own.offsetSeconds * 1e6).toFixed(0)} us off the source)`,
+    near(found.offsetSeconds, expected, 20e-6) && near(found.scale, own.scale * k, 1e-6) && found.polarity === 1 && found.correlation > .8);
+  const aligned = TF2Reference.warp(take, sr, found, sr, src.length);
+  const report = TF2Reference.compareTake(aligned, sim, sr);
+  const worst = Math.max(...report.bands.filter(b => b.simMinusRealDb !== null && Number(b.hz.split('-')[1]) <= 12000).map(b => Math.abs(b.simMinusRealDb)));
+  check(`Real take: aligned, the take matches the render (bands within ${worst.toFixed(2)} dB, levels ${report.levelTracking.rmsDeviationDb.toFixed(3)} dB rms)`,
+    worst < .1 && report.levelTracking.rmsDeviationDb < .05 && near(report.anchorGainDb, 10, .1));
+  const simOnSource = TF2Reference.warp(sim, sr, own, sr, src.length);
+  let err = 0, ref = 0;
+  for (let i = sr; i < src.length - sr; i++) { err += (.316 * simOnSource[i] - aligned[i]) ** 2; ref += (.316 * simOnSource[i]) ** 2; }
+  check(`Real take: the aligned take nulls against the render (${(10 * Math.log10(err / ref)).toFixed(1)} dB)`, 10 * Math.log10(err / ref) < -25);
+  const short = TF2Reference.locate(take.subarray(Math.round(3 * sr), Math.round(6 * sr)), sr, src, sr);
+  // Too short to measure the clock (200 ppm here): within a fraction of a millisecond.
+  const at = (tl, tau) => tl.offsetSeconds + tl.scale * tau;
+  check(`Real take: a 3 s excerpt is found (${short.method}, ${((at(short, 1.5) - at(found, 4.5)) * 1e6).toFixed(0)} us at its centre)`,
+    near(at(short, 1.5), at(found, 4.5), 200e-6) && near(at(short, 0), at(found, 3), 500e-6) && near(at(short, 3), at(found, 6), 500e-6));
+  assert.throws(() => TF2Reference.locate(Float32Array.from({ length: sr * 5 }, () => .1 * random()), sr, src, sr), /not found|line up/);
+  check('Real take: unrelated audio is rejected', true);
+}
+
 console.log(`\n${passed} paired-reference checks passed.`);

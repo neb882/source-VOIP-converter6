@@ -43,7 +43,8 @@ function gatePlan(samples, frames, frameSize, gate) {
   return sent;
 }
 
-export async function roundTrip(samples, sampleRate, bitrate, options = {}) {
+// Encoder settings shared by roundTrip and createVoiceStream.
+function encoderSettings(sampleRate, bitrate, options) {
   const frameSize = sampleRate / 50;
   const application = options.application ?? 'voip';
   const signal = options.signal ?? 'auto';
@@ -51,9 +52,43 @@ export async function roundTrip(samples, sampleRate, bitrate, options = {}) {
   if (!(signal in SIGNALS)) throw new RangeError(`Unknown Opus signal "${signal}"`);
   const complexity = options.complexity ?? 10;
   const vbr = !!options.vbr, dtx = !!options.dtx;
-  const { createEncoder, createDecoder, loadLibopus } = await runtime(options.runtime ?? '1.6.1');
-  const encoderOptions = { sampleRate, channels: 1, frameSize,
+  return { sampleRate, channels: 1, frameSize,
     application: APPLICATIONS[application], signal: SIGNALS[signal], bitrate, complexity, vbr, dtx, fec: false };
+}
+
+// One 20 ms frame at a time, with roundTrip's settings: for the live monitor.
+// restart() starts a new talk spurt with a fresh encoder and decoder, as
+// roundTrip does. encode() returns the packet with its mode; decode() and
+// conceal() return frameSize samples.
+export async function createVoiceStream(sampleRate, bitrate, options = {}) {
+  const encoderOptions = encoderSettings(sampleRate, bitrate, options);
+  const { frameSize } = encoderOptions;
+  const { createEncoder, createDecoder } = await runtime(options.runtime ?? '1.6.1');
+  let encoder = await createEncoder(encoderOptions);
+  let decoder = await createDecoder({ sampleRate, channels: 1 });
+  return {
+    frameSize,
+    lookahead: encoder.getLookahead(),
+    async restart() {
+      encoder.free(); decoder.free();
+      encoder = await createEncoder(encoderOptions);
+      decoder = await createDecoder({ sampleRate, channels: 1 });
+    },
+    encode(frame) {
+      const packet = encoder.encodeFloat(frame);
+      return { bytes: packet.byteLength, mode: packetMode(packet), dtx: packet.byteLength <= 2, packet };
+    },
+    decode(packet) { return decoder.decodeFloat(packet, { frameSize }); },
+    conceal() { return decoder.decodePacketLossFloat(frameSize); },
+    free() { encoder?.free(); decoder?.free(); encoder = decoder = null; }
+  };
+}
+
+export async function roundTrip(samples, sampleRate, bitrate, options = {}) {
+  const encoderOptions = encoderSettings(sampleRate, bitrate, options);
+  const { frameSize, complexity, vbr, dtx } = encoderOptions;
+  const application = options.application ?? 'voip', signal = options.signal ?? 'auto';
+  const { createEncoder, createDecoder, loadLibopus } = await runtime(options.runtime ?? '1.6.1');
   let encoder, decoder;
   try {
     encoder = await createEncoder(encoderOptions);
