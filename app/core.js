@@ -31,6 +31,7 @@ const els = {
   dlVideo:   document.getElementById('download-video'),
   format:    document.getElementById('format'),
   status:    document.getElementById('source-status'),
+  demoSpeaker: document.getElementById('demo-speaker'),
   progress:  document.getElementById('process-progress'),
   advancedToggle: document.getElementById('advanced-toggle'),
   consoleDetails: document.getElementById('console-details'),
@@ -110,6 +111,7 @@ const state = {
   lastCodecInfo: null,   // codec statistics of the last render (net_graph)
   sourceName: null,      // name of the loaded clip (file or mic)
   sourceVideo: null,     // the MP4/MOV the clip came from: { bytes, name, info } (video.js)
+  sourceDemo: null,      // the TF2 demo the clip came from: { file, parsed, speaker, codecKey, received } (demo.js)
   recorder: null,        // active PCM capture session
   recTick: null,         // recording timer interval
   processing: false,
@@ -120,6 +122,7 @@ const state = {
 
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
 const MAX_VIDEO_BYTES = 1024 * 1024 * 1024;   // a video's audio is small; its picture is copied, not decoded
+const MAX_DEMO_BYTES = 512 * 1024 * 1024;     // a demo is read whole; about 170 KB per second of game
 const MAX_AUDIO_SECONDS = 10 * 60;
 const MAX_RECORDING_SECONDS = 5 * 60;
 

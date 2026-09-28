@@ -12,7 +12,7 @@
  *
  * Depends on the app/ page scripts: els, state, LS, renderOptions, captureSource,
  * startWorkerJob, canUseWorker, exportWav, cachedExport, currentFormat,
- * outputName, saveBlob, loadSourceFile, isVideoFile, logLine, MAX_FILE_BYTES,
+ * outputName, saveBlob, loadSourceFile, isVideoFile, isDemoFile, logLine, MAX_FILE_BYTES,
  * MAX_VIDEO_BYTES, MAX_AUDIO_SECONDS; and on TF2Audio, TF2Formats, TF2Zip.
  * =========================================================================
  */
@@ -530,8 +530,8 @@
     const audio = files.filter(f => isAudio(f.file));
     // One file dropped outside the batch panel loads as the source, like step 1.
     if (!onBatch && !folder && files.length === 1) {
-      if (audio.length) loadSourceFile(audio[0].file);
-      else setStatus(`${files[0].file.name} is not an audio or video file.`, 'error');
+      if (audio.length || isDemoFile(files[0].file)) loadSourceFile(files[0].file);
+      else setStatus(`${files[0].file.name} is not an audio or video file or a TF2 demo.`, 'error');
       return;
     }
     if (files.length) add(files, { reveal: !onBatch });

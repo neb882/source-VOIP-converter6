@@ -415,6 +415,35 @@ async function verifyVideo(page) {
   check(await page.locator('#download-video').isHidden(), 'an audio source hides the video download');
 }
 
+// A TF2 demo: its voice loads as the source, and Process runs only the
+// receiver on it (demo.js, tests/demo.verify.mjs makes the fixture).
+async function verifyDemo(page) {
+  console.log('\n[Browser 3h] TF2 demo voice');
+  await page.locator('#file').setInputFiles(path.join(__dirname, 'demo', 'synthetic.dem'));
+  await page.waitForFunction(() => state.sourceDemo && !document.getElementById('process').disabled);
+  const loaded = await page.evaluate(() => ({ name: state.sourceName, codec: els.codec.value, rate: state.decodedSource.sampleRate,
+    seconds: state.decodedSource.duration, status: els.status.textContent, speakers: [...els.demoSpeaker.options].map(o => o.value), shown: !els.demoSpeaker.hidden }));
+  check(loaded.name === 'synthetic_76561198000000001.dem' && loaded.codec === 'steam' && loaded.rate === 24000 && Math.abs(loaded.seconds - 3.2) < .01
+    && /Process plays it through TF2's receiver/.test(loaded.status),
+    'a demo loads the first speaker\'s voice as the source, at 24 kHz, with the Steam codec', `${loaded.name}, ${loaded.seconds.toFixed(2)} s`);
+  check(loaded.shown && loaded.speakers.length === 2, 'with two speakers, a select picks whose voice to take', loaded.speakers.join(', '));
+  await page.locator('#demo-speaker').selectOption('76561198000000002');
+  await page.waitForFunction(() => state.sourceDemo && state.sourceDemo.speaker.id === '76561198000000002' && !document.getElementById('process').disabled);
+  await page.locator('#demo-speaker').selectOption('76561198000000001');
+  await page.waitForFunction(() => state.sourceDemo && state.sourceDemo.speaker.id === '76561198000000001' && !document.getElementById('process').disabled);
+  check(true, 'switching speakers reloads the voice from the same demo');
+  await page.locator('#process').click();
+  await page.waitForFunction(() => state.processedBuffer && state.lastCodecInfo, null, { timeout: 60000 });
+  const info = await page.evaluate(() => ({ backend: state.lastCodecInfo.backend, frames: state.lastCodecInfo.frames, lost: state.lastCodecInfo.lostFrames,
+    dtx: state.lastCodecInfo.dtxFrames, log: [...document.querySelectorAll('#console-log .line, #console-log div')].map(e => e.textContent).join('\n') }));
+  check(info.backend === 'demo' && info.frames === 160 && info.lost === 1 && info.dtx === 1,
+    'Process runs the receiver only, and the codec lane shows the demo\'s own frames', `${info.frames} frames, ${info.lost} lost, ${info.dtx} DTX`);
+  // Any other source clears the demo.
+  await page.locator('#file').setInputFiles({ name: 'after-demo.wav', mimeType: 'audio/wav', buffer: wavTone(.5) });
+  await page.waitForFunction(() => state.sourceName === 'after-demo.wav');
+  check(await page.evaluate(() => state.sourceDemo === null && els.demoSpeaker.hidden), 'loading audio afterwards leaves demo mode');
+}
+
 async function verifyLiveMonitor(page) {
   console.log('\n[Browser 3f] Live monitor');
   await page.locator('#live-toggle').click();
@@ -798,6 +827,7 @@ async function main() {
     await verifyAverageAndRealTake(page);
     await verifyLiveMonitor(page);
     await verifyVideo(page);
+    await verifyDemo(page);
 
     await page.locator('#file').setInputFiles({ name: 'long-tone.wav', mimeType: 'audio/wav', buffer: wavTone(20) });
     await page.waitForFunction(() => !document.getElementById('process').disabled);
@@ -859,10 +889,10 @@ async function main() {
     check(afterUpdate.keys.includes(SHELL_CACHE), 'current app shell cache is populated', SHELL_CACHE);
     check(await page.evaluate(async (name) => {
       const cache = await caches.open(name);
-      const needed = ['batch.js', 'formats.js', 'flac.js', 'zip.js', 'meter.js', 'reference.js', 'video.js', 'live.js', 'live-worker.js', 'live-worklet.js',
+      const needed = ['batch.js', 'formats.js', 'flac.js', 'zip.js', 'meter.js', 'reference.js', 'video.js', 'demo.js', 'live.js', 'live-worker.js', 'live-worklet.js',
         'vendor/lame/index.mjs', 'vendor/lame/lame-3.100.wasm.mjs', 'vendor/celt-0.11/index.mjs', 'vendor/celt-0.11/celt-0.11.wasm.mjs'];
       return (await Promise.all(needed.map(path => cache.match(new URL(path, location.href).href)))).every(Boolean);
-    }, SHELL_CACHE), 'batch, format, meter, reference, video, live-monitor, CELT and MP3 encoder files are cached for offline use');
+    }, SHELL_CACHE), 'batch, format, meter, reference, video, demo, live-monitor, CELT and MP3 encoder files are cached for offline use');
     // Restore the normal registration while still online. Otherwise reloading
     // registers sw.js again and races another replacement against file loading.
     await activateServiceWorker(page, 'sw.js');

@@ -15,6 +15,8 @@ function mountSource(mono, sampleRate, name, left = null) {
   if (duration > MAX_AUDIO_SECONDS) throw new Error('the clip exceeds the 10 minute limit');
   state.sourceName = name;
   state.sourceVideo = null;
+  state.sourceDemo = null;
+  if (els.demoSpeaker) els.demoSpeaker.hidden = true;
   updateVideoButton();
   if (state.dryBlob) URL.revokeObjectURL(state.dryBlob);
   if (state.lastBlob) URL.revokeObjectURL(state.lastBlob);
@@ -269,11 +271,83 @@ document.querySelectorAll('.preset-btn').forEach(btn => {
 });
 
 const isVideoFile = (f) => /^video\//.test(f.type) || /\.(mp4|m4v|mov|3gp|webm|mkv)$/i.test(f.name);
+const isDemoFile = (f) => /\.dem$/i.test(f.name);
+// The codec profile whose receiver plays a demo's voice.
+const DEMO_PROFILES = { steam: 'steam', vaudio_celt: 'celt_22', vaudio_celt_high: 'celt_44' };
+
+// A TF2 demo: its voice as the game received it (demo.js). The packets are
+// decoded here; Process then runs only the receiver (auto-gain, clamp,
+// mixer), so the render is what a listener heard, not a second encoding.
+async function loadDemoFile(f, speakerId = null) {
+  if (f.size > MAX_DEMO_BYTES) {
+    setStatus(`Demo is ${(f.size / 1048576).toFixed(0)} MB; the limit is ${MAX_DEMO_BYTES / 1048576} MB.`, 'error');
+    return;
+  }
+  const selection = ++sourceLoadId;
+  els.process.disabled = true;
+  try {
+    setStatus(`Reading ${f.name}…`);
+    const parsed = state.sourceDemo && state.sourceDemo.file === f ? state.sourceDemo.parsed : TF2Demo.parse(await f.arrayBuffer());
+    if (selection !== sourceLoadId) return;
+    const speakers = parsed.speakers.filter(s => s.frames > 0).sort((a, b) => b.frames - a.frames);
+    if (!speakers.length) {
+      const why = parsed.voice.length ? 'its voice messages carry no audio (a demo made with record keeps only their headers; record with SourceTV)' : 'it has no voice messages';
+      throw new Error(why);
+    }
+    const speaker = speakers.find(s => s.id === speakerId) || speakers[0];
+    const codecKey = DEMO_PROFILES[speaker.codec];
+    if (!codecKey) throw new Error(`its voice codec ${speaker.codec} is not supported`);
+    setStatus(`Decoding ${speaker.frames} voice frames…`);
+    // Imports resolve against this script's folder (app/); the codecs are at the root.
+    const decoded = await TF2Demo.decode(parsed, speaker, {
+      opus: async (rate) => (await import(new URL('vendor/libopus-1.1/index.mjs', document.baseURI).href)).createDecoder({ sampleRate: rate, channels: 1 }),
+      celt: async (rate, frame, bytes) => (await import(new URL('vendor/celt-0.11/index.mjs', document.baseURI).href)).createCodec(rate, frame, { packetBytes: bytes })
+    });
+    if (selection !== sourceLoadId) return;
+    // Renders stop at 10 minutes; a longer demo keeps its first 10.
+    const keep = Math.min(decoded.samples.length, MAX_AUDIO_SECONDS * decoded.rate);
+    const frames = Math.min(decoded.frameLog.length, Math.ceil(keep / decoded.frameSamples));
+    if (keep < decoded.samples.length) logLine(`demo: the voice runs ${(decoded.samples.length / decoded.rate / 60).toFixed(1)} minutes; the first 10 are kept.`, 'warn');
+    const name = `${f.name.replace(/\.dem$/i, '')}_${speaker.id.replace(/\s+/g, '')}.dem`;
+    mountSource(decoded.samples.slice(0, keep), decoded.rate, name);
+    state.sourceDemo = { file: f, parsed, speaker, codecKey,
+      received: { frameLog: decoded.frameLog.slice(0, frames), frameBytes: decoded.frameBytes.slice(0, frames), frameMs: 1000 * decoded.frameSeconds,
+        spurts: decoded.spurts, version: speaker.codec === 'steam' ? 'Steam packets from the demo' : `${speaker.codec} packets from the demo` } };
+    els.codec.value = codecKey;
+    els.codec.dispatchEvent(new Event('change'));
+    updateDemoSpeakers(speakers, speaker);
+    const h = parsed.header, kbps = speaker.frames > speaker.dtx ? (speaker.bytes * 8 / (speaker.frames * decoded.frameSeconds) / 1000) : 0;
+    logLine(`demo: ${h.server || 'server'} on ${h.map}, ${h.seconds.toFixed(1)} s, voice codec ${speaker.codec}; ${speakers.length} speaker${speakers.length === 1 ? '' : 's'}.`, 'sys');
+    logLine(`demo: ${speaker.id}: ${speaker.frames} frames in ${speaker.spurts || '?'} talk spurts, ${speaker.dtx} DTX, ${speaker.lost} lost before the server, ${kbps.toFixed(1)} kbps while talking.`, 'sys');
+    setStatus(`${name} · ${(keep / decoded.rate).toFixed(1)}s of voice as sent · Process plays it through TF2's receiver`, 'success');
+  } catch (error) {
+    if (selection !== sourceLoadId) return;
+    setStatus(`Could not read the demo's voice: ${error.message}`, 'error');
+    logLine(`demo: ${error.message}`, 'err');
+  }
+}
+
+function updateDemoSpeakers(speakers, current) {
+  if (!els.demoSpeaker) return;
+  els.demoSpeaker.hidden = speakers.length < 2;
+  els.demoSpeaker.replaceChildren(...speakers.map(s => {
+    const o = document.createElement('option');
+    o.value = s.id;
+    o.textContent = `${s.id} (${s.frames} frames)`;
+    o.selected = s === current;
+    return o;
+  }));
+}
+
+if (els.demoSpeaker) els.demoSpeaker.addEventListener('change', () => {
+  if (state.sourceDemo) loadDemoFile(state.sourceDemo.file, els.demoSpeaker.value);
+});
 
 // Load one file as the source (file picker or a single dropped file). A
 // video's audio becomes the source; an MP4 or MOV is also kept, so the render
 // can go back into it (video.js).
 async function loadSourceFile(f) {
+  if (isDemoFile(f)) return loadDemoFile(f);
   const video = isVideoFile(f), limit = video ? MAX_VIDEO_BYTES : MAX_FILE_BYTES;
   if (f.size > limit) {
     setStatus(`File is ${(f.size / 1024 / 1024).toFixed(1)} MB; the limit is ${limit / 1024 / 1024} MB${video ? ' for video' : ''}.`, 'error');
@@ -346,6 +420,6 @@ els.file.addEventListener('change', () => {
     window.TF2Batch.add(files, { reveal: true });
     return;
   }
-  if (files[0].size > (isVideoFile(files[0]) ? MAX_VIDEO_BYTES : MAX_FILE_BYTES)) els.file.value = '';
+  if (!isDemoFile(files[0]) && files[0].size > (isVideoFile(files[0]) ? MAX_VIDEO_BYTES : MAX_FILE_BYTES)) els.file.value = '';
   loadSourceFile(files[0]);
 });

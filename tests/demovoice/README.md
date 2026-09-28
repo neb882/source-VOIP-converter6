@@ -4,6 +4,8 @@ A SourceTV demo stores every voice message exactly as the server received it: St
 
 Client demos made with `record` keep the voice messages but not their payloads, so use SourceTV.
 
+The app reads demos itself ([`demo.js`](../../demo.js)): load a `.dem` in step 1. On the Set D demo, its parser gives this tool's 5148 records byte for byte, and its decoding matches `decode.mjs` to one 16-bit step with the same libopus. The app decodes with libopus 1.1.5, Steam's release.
+
 ## Recording
 
 1. Run a dedicated server with SourceTV. SteamCMD app 232250 installs it; launch it with `+sv_cheats 1 +sv_alltalk 1 +tv_enable 1 +tv_delay 0 +map ctf_2fort`.

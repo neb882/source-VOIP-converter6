@@ -29,10 +29,11 @@
     <section class="panel" aria-labelledby="step-source">
       <h2 id="step-source"><span class="step" aria-hidden="true">1</span> Source</h2>
       <div class="upload-row">
-        <input id="file" type="file" accept="audio/*,video/*,.mkv" multiple aria-label="Audio or video file to process (choose several to batch them)">
+        <input id="file" type="file" accept="audio/*,video/*,.mkv,.dem" multiple aria-label="Audio or video file or TF2 demo to process (choose several to batch them)">
+        <select id="demo-speaker" class="demo-speaker" hidden aria-label="Speaker in the demo" title="Whose voice to take from the demo"></select>
         <button id="mic" type="button" title="Record from microphone (+voicerecord)">🎤 Record</button>
         <button id="live-toggle" type="button" aria-pressed="false" title="Live monitor: hear your microphone through the TF2 voice chain in real time, with the current settings (use headphones)">🎧 Live</button>
-        <div id="source-status" class="source-status" role="status" aria-live="polite">Choose or drop an audio or video file, or record. MP4 and MOV come back as video; several files go to the batch (step 4).</div>
+        <div id="source-status" class="source-status" role="status" aria-live="polite">Choose or drop an audio or video file or a TF2 demo, or record. MP4 and MOV come back as video; several files go to the batch (step 4).</div>
       </div>
       <div id="live-panel" class="live-panel" hidden>
         <div class="live-devices">
@@ -425,6 +426,7 @@
   <script src="meter.js"></script>
   <script src="reference.js"></script>
   <script src="video.js"></script>
+  <script src="demo.js"></script>
   <script src="app/core.js"></script>
   <script src="app/console.js"></script>
   <script src="app/source.js"></script>
