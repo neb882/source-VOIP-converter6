@@ -346,9 +346,13 @@ els.process.addEventListener('click', async () => {
   logLine(`S_StartSound: initializing render...`);
 
   try {
-    const codecKey = els.codec.value;
+    // A demo's voice arrives already coded: only the receiver runs, with the
+    // demo's own codec (audio.js opts.received).
+    const demo = state.sourceDemo;
+    const codecKey = demo ? demo.codecKey : els.codec.value;
     const opts = {
       ...renderOptions(),
+      ...(demo ? { codec: demo.codecKey, received: demo.received } : {}),
       onProgress:  (p) => {
         const percent = Math.min(100, Math.max(0, Math.round(p * 100)));
         els.process.textContent = `Processing… ${percent}%`;
@@ -356,7 +360,8 @@ els.process.addEventListener('click', async () => {
       }
     };
 
-    logLine(`MIX: codec=${opts.codec} pos=${opts.listenerPos || 'manual:'+opts.dspRoom} gain=${opts.micGain} vs=${opts.voiceScale}`);
+    logLine(demo ? `MIX: demo voice as received, codec=${opts.codec}, receiver only; vs=${opts.voiceScale}`
+      : `MIX: codec=${opts.codec} pos=${opts.listenerPos || 'manual:'+opts.dspRoom} gain=${opts.micGain} vs=${opts.voiceScale}`);
 
     const t0 = performance.now();
     const result = await runAudioProcess(state.decodedSource, opts);

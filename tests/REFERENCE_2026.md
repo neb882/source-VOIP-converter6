@@ -434,6 +434,9 @@ A pure sine's codec noise moves by about 2 dB with where the 20 ms frames fall o
 - **DTX:** 629 frames against 693. The segment counts match to within 5 frames (sines 130/130, noise 19/19, bursts 54/54, vowel 0/0). Most of the gap is in the 11.5–12 kHz tones (173 against 243).
 - **Codec spectrum against the packets:** within ±0.06 dB from 0 to 11.4 kHz on noise, and ±0.2 dB to 12 kHz.
 - **Full render against recording A:** spectrum within ±0.5 dB from 100 Hz to 11.8 kHz on noise and the vowel, most bands within ±0.2 dB. Median segment levels are within ±0.2 dB on segments more than 15 dB above the ambience. On the DTX'd 8 kHz tone, the recording has −32.5 dBFS and the model −33.0.
+- **Steam's packets through the receiver alone.** The app reads the demo itself (`demo.js`) and renders its packets with only the receiver running (`opts.received`). Each result is lined up talk spurt by talk spurt as in the accuracy suite:
+  - **Recording A** (`volume 0.15`): 0.14 dB rms in half-second blocks (worst 0.67 dB, r 0.996, 148 blocks), with the overall level 0.15 dB high. Bands from 120 Hz to 11 kHz are within 0.3 dB; 80–120 Hz is −0.8 dB and 11–12 kHz −2.0 dB.
+  - **Recording B** (`volume 0.077`): 0.89 dB rms, with bands within 0.9 dB. That listener's clipping differs (Listener B, below).
 
 **Set C.** The app rendered the network test signal and was measured the same way as the takes:
 

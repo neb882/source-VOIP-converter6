@@ -12,7 +12,7 @@
  */
 
 const CACHE_PREFIX = 'tf2ve-';
-const CACHE = `${CACHE_PREFIX}v15`;
+const CACHE = `${CACHE_PREFIX}v16`;
 const ASSETS = [
   './',
   './index.html',
@@ -35,6 +35,7 @@ const ASSETS = [
   './meter.js',
   './reference.js',
   './video.js',
+  './demo.js',
   './live.js',
   './live-worker.js',
   './live-worklet.js',

@@ -38,6 +38,13 @@ FLAC and MP3 are made from the WAV when a file is saved. MP3 is lossy on top of 
 - **Audio:** AAC where the browser has an AAC encoder (WebCodecs). Otherwise Opus in MP4, or 16-bit PCM in MOV, which editors and DAWs import directly. It starts where the old audio did, and the encoder's delay is skipped by an edit list.
 - **Files:** regular and fragmented MP4/MOV are read; the output is a regular file with its index first. WebM and Matroska files give their audio only.
 
+**TF2 demos.** Load a SourceTV demo (`.dem`), and the voice in it becomes the source. A demo holds each speaker's Steam packets exactly as the server received them, so no second encoding happens:
+- **Speakers:** each speaker is found by SteamID, and a menu picks one when there are several.
+- **Rendering:** Process runs only TF2's receiver on the demo's own packets: concealment of lost frames, comfort noise for DTX, auto-gain, the clamp and the mixer. The result is what a listener heard.
+- **Codec lane:** shows the demo's real frames, including DTX and lost packets.
+- **Accuracy:** rendered this way at `volume 0.15`, the Set D demo tracks the sender's own loopback recording within 0.14 dB rms in half-second blocks (r 0.996). Its spectrum is within 0.3 dB from 120 Hz to 11 kHz.
+- **Limits:** a demo made with `record` keeps the voice messages but not their audio, so record with SourceTV ([tests/demovoice/README.md](tests/demovoice/README.md)). The legacy codecs `vaudio_celt` and `vaudio_celt_high` are read too.
+
 **Batch** (step 4) renders many files with the current settings and saves them one by one or as one ZIP.
 - **Adding files:** use the batch file picker, choose several files in step 1, or drop files or whole folders anywhere on the page. A single file dropped outside the batch loads as the source.
 - **Rendering:** runs two files at a time on machines with four or more cores. Each row reports length, integrated loudness and true peak, and has preview, save and remove buttons.
@@ -258,6 +265,12 @@ pnpm test:all
 - **`tests/verify.js`:** resampler passband/stopband/alignment, the profile FIR, and the auto-gain law. Also the live chain: each streaming stage (resamplers, FIR, auto-gain, loss model) equals its offline counterpart sample for sample, and the whole chain reproduces a render. The law checks cover the measured sine overdrive at `voice_avggain` 0.5 and 0.25, the cap, the int16 clamp, silence hold, step timing and the `voice_scale` sawtooth and truncation. Also the voice gate (threshold, pre-roll, hold, talk spurts, DTX comfort noise on steady tones, send/skip accounting), stereo capture, real codec modes per profile, all room presets 0–29, the measured loss bursts and late-frame jitter with PLC, option robustness and WAV structure.
 - **`tests/opus.verify.mjs`:** frame timing and boundary pulses, exact lengths, bitrates and packet sizes, TOC mode reporting, native concealment, silence, mute, determinism, the sender gate inside the round trip (pre-roll, hold, talk spurts), opt-in DTX, the per-frame log behind the codec lane, leveling and cap behavior, output-volume linearity, pre-encoder filtering, and codec-failure reporting. Also the libopus 1.1.5 build: its packets are bit-identical to a native build of the release, and its DTX differs from 1.6.1's as Steam's does.
 - **`tests/reference.verify.mjs`:** alignment, clock drift, polarity, fractional delay, clip-signature and level-tracking metrics. Also the in-page real-take check. A take made from a render (delayed, clock-skewed, quieter) is lined up with its source to within 10 µs and 0.2 ppm, and compares as identical. Short excerpts are found, and unrelated audio is rejected.
+- **`tests/demo.verify.mjs`:** TF2 demos (`demo.js`) on a synthetic SourceTV demo written bit by bit. It has two Steam speakers, a lost frame, a DTX frame, end-of-transmission markers, messages that leave the stream off byte alignment, a payload that fails its CRC, and a `vaudio_celt` demo. The checks:
+  - every packet comes out byte for byte, with its sequence number
+  - talk spurts sit at their tick
+  - the voice decodes back to the tone
+  - received voice skips the sender and codec, and its codec lane is the demo's
+  - the browser test loads the same demo (`tests/demo/synthetic.dem`) and switches speakers
 - **`tests/video.verify.mjs`:** the video remux on ffmpeg-made fixtures in `tests/video/`: H.264 with AAC (regular, fragmented, and with delayed audio), H.264 with PCM in MOV, and VP9 with Opus. Every video sample comes out byte for byte with its timing, the index comes first, and the new audio decodes back on time and starts where the old audio did. A stand-in WebCodecs encoder checks the AAC path: frames land unchanged, the AudioSpecificConfig goes into the `esds` box, and the edit list skips the priming.
 - **`tests/formats.verify.mjs`:** download formats and ZIPs.
   - FLAC decodes bit-exact with valid frame CRCs, through an independent decoder in the test.
@@ -310,6 +323,7 @@ These tests establish implementation behavior; the accuracy claims rest on the p
 | `meter.js` | loudness and level measurement |
 | `reference.js` | finding a source in a real take, aligning it talk spurt by talk spurt, and the comparison measures (page, worker and Node tools) |
 | `video.js` | reading MP4/MOV and writing the video back with the render as its audio |
+| `demo.js` | reading the voice in a TF2 demo and decoding it as the receiving game does |
 | `live.js`, `live-worker.js`, `live-worklet.js` | live monitor: interface, the streaming chain in a worker, capture and playback on the audio thread |
 
 Tests and local tooling are under `tests/`.

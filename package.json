@@ -5,7 +5,7 @@
   "description": "Browser-based TF2 voice-chat emulator: real Opus plus the measured Steam voice gate and Source receiver auto-gain and clipping.",
   "scripts": {
     "dev": "node tests/static-server.js",
-    "test": "node tests/verify.js && node tests/opus.verify.mjs && node tests/reference.verify.mjs && node tests/formats.verify.mjs && node tests/meter.verify.mjs && node tests/video.verify.mjs",
+    "test": "node tests/verify.js && node tests/opus.verify.mjs && node tests/reference.verify.mjs && node tests/formats.verify.mjs && node tests/meter.verify.mjs && node tests/video.verify.mjs && node tests/demo.verify.mjs",
     "vendor:opus": "node tests/vendor-opus.mjs",
     "test:vendor": "node tests/vendor-opus.mjs --check",
     "build:opus11": "node tests/libopus11/build.mjs",

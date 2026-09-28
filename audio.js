@@ -707,6 +707,24 @@
     return { chain: customChain(env), mix: env.mix };
   }
 
+  // opus-codec.mjs FRAME: what happened to each codec frame.
+  const FRAME_CODES = { gated: 0, silk: 1, hybrid: 2, celt: 3, dtx: 4, lost: 5, late: 6 };
+
+  // Frame statistics for voice that arrived already coded (opts.received),
+  // in the shape roundTrip's info takes, for the codec lane and net_graph.
+  function receivedCodecInfo(received, sampleRate) {
+    const frameLog = Uint8Array.from(received.frameLog);
+    const frameBytes = received.frameBytes ? Uint16Array.from(received.frameBytes) : new Uint16Array(frameLog.length);
+    const count = (code) => frameLog.reduce((n, c) => n + (c === code ? 1 : 0), 0);
+    const frameMs = finiteOr(received.frameMs, 20);
+    return { backend: 'demo', version: received.version || 'as received', sampleRate, frameMs, framesPerPacket: 1,
+      frameSamples: Math.round(sampleRate * frameMs / 1000), frames: frameLog.length,
+      gatedFrames: count(FRAME_CODES.gated), dtxFrames: count(FRAME_CODES.dtx), lostFrames: count(FRAME_CODES.lost), underrunFrames: 0,
+      spurts: finiteOr(received.spurts, 0), encodedBytes: frameBytes.reduce((n, b) => n + b, 0), gate: null,
+      modes: { silk: count(FRAME_CODES.silk), hybrid: count(FRAME_CODES.hybrid), celt: count(FRAME_CODES.celt) },
+      plc: 'opus', frameLog, frameBytes };
+  }
+
   /**
    * Render a source AudioBuffer (or any { sampleRate, length,
    * numberOfChannels, getChannelData }) through the TF2 voice pipeline.
@@ -734,6 +752,11 @@
    *   voiceScale:   voice_scale, applied inside the auto-gain           [1]
    *   volume:       output level after the mixer                        [0.5]
    *   seed:         PRNG seed for the loss pattern / crackle        [0xC0FFEE]
+   *   received:     the source is voice as the game received it, already
+   *                 through a sender and the codec (a demo's packets,
+   *                 demo.js): { frameLog, frameBytes, frameMs, spurts,
+   *                 concealed, version }. Only the receiver runs; sender,
+   *                 gate, codec and network settings are ignored.      [null]
    * }
    *
    * Resolves to { samples: Float32Array, sampleRate, blob, codecInfo }
@@ -769,6 +792,7 @@
     const voiceScale   = clamp(finiteOr(opts.voiceScale, 1), 0, 4);
     const volume       = clamp(finiteOr(opts.volume, engine.volume), 0, 1);
     const rand         = mulberry32(finiteOr(opts.seed, 0xC0FFEE) >>> 0);
+    const received     = opts.received && opts.received.frameLog ? opts.received : null;
 
     const srcRate = audioBuffer.sampleRate;
     const mixRate = engine.mixRate;
@@ -781,7 +805,7 @@
     let samples = bufferToMono(audioBuffer, captureChannel);
     if (!samples.every(Number.isFinite)) throw new TypeError('Source PCM contains a non-finite sample.');
     const playbackLength = Math.round(samples.length * playbackRate / srcRate);
-    if (micGain !== 1) {
+    if (micGain !== 1 && !received) {
       for (let i = 0; i < samples.length; i++) samples[i] *= micGain;
     }
     samples = hardClip(samples, INT16_FULL_SCALE);
@@ -790,19 +814,20 @@
 
     /* ---- 2) Resample to the codec rate; optional capture filters ---- */
     samples = resampleSinc(samples, srcRate, codecRate);
-    if (hp > 10) samples = applyBiquad(samples, biquadCoefs('highpass', codecRate, hp, 0.707));
-    if (lp < codecRate * 0.45) {
+    if (hp > 10 && !received) samples = applyBiquad(samples, biquadCoefs('highpass', codecRate, hp, 0.707));
+    if (lp < codecRate * 0.45 && !received) {
       samples = applyBiquad(samples, biquadCoefs('lowpass', codecRate, lp, 0.707));
       samples = applyBiquad(samples, biquadCoefs('lowpass', codecRate, lp, 0.707));
     }
-    const captureEq = enableCodec ? profileEq(codec, 'captureEq') : null;
+    const captureEq = enableCodec && !received ? profileEq(codec, 'captureEq') : null;
     if (captureEq) samples = applyFirZeroPhase(samples, captureEq);
     report(0.2);
     await microYield();
 
     /* ---- 3) Encode -> lose packets -> decode / conceal ---- */
     let codecInfo = { backend: 'bypass', sampleRate: codecRate, frameMs };
-    if (enableCodec) {
+    if (received) codecInfo = receivedCodecInfo(received, codecRate);
+    else if (enableCodec) {
       const opus = await loadOpusModule();
       const bitrate = Math.max(6000, Math.round(codec.bitrate * bits / 16));
       // The codec's own frame length: 20 ms for Opus, frameSize for CELT.
