@@ -377,7 +377,7 @@ The accuracy suite ([`tests/accuracy.mjs`](accuracy.mjs)) lines every take up wi
   - 23 of them follow a silence of at most 0.45 s in the gate model.
   - The early start takes up most of that silence: 0–130 ms of it is left in 21 of the 25.
   - The next spurt goes back to the usual delay in 19 of the 25.
-- **Rate.** After a silence of at most 0.45 s, not directly after an early start, 21 of 51 spurts (41%) start early. It varies from take to take (1 of 9 for listener B, 4 of 4 in two takes), and the same test signal gets different spurts moved in different takes. Which spurt moves is not predictable from the signal.
+- **Rate.** After a silence of at most 0.45 s, not directly after an early start, 21 of 51 spurts (41%) start early. It varies from take to take (1 of 9 for listener B, 4 of 4 in two takes), and the same test signal gets different spurts moved in different takes. Which spurt moves is not predictable from the signal; finding 21 shows what decides it.
 - **Inside a spurt**, the delay steps by a few milliseconds (57 steps of 4–20 ms, a few up to 68 ms, over 24 minutes of talk spurts). These include the 5.8 ms latency trims of finding 10.
 
 The render keeps the source's timeline by default, so the dry/wet A/B and the real-take check line up. **Talk-spurt timing → TF2 re-timing** (`voice_retime 1`) applies this finding: after a silence of up to 0.45 s, a spurt starts early with probability 0.41, by the silence less a random 0–130 ms (at most 350 ms), and the spurt after it keeps its time. It is seeded like the loss model.
@@ -385,6 +385,33 @@ The render keeps the source's timeline by default, so the dry/wet A/B and the re
 ### 20. The Steam render's low frequencies lead the source by Opus's own phase
 
 A render of white noise lines up with its source to 0.3 µs in the 8–11 kHz band, which the CELT layer of hybrid mode codes: the encoder's lookahead is trimmed exactly. Below 8 kHz the SILK layer leads by a frequency-dependent amount: 35–70 µs at 1–6 kHz, 86 µs at 0.3–1 kHz and about 370 µs at 100–300 Hz. libopus alone, without the app's chain, does the same in both 1.1.5 and 1.6.1. It is the phase response of SILK's own processing, which TF2's libopus shares, so the render keeps it rather than shifting it. An Opus test pins both bands.
+
+### 21. An early start is the receiver appending a spurt to voice it still has queued
+
+What makes a spurt start early (finding 19) is the receiver's queue:
+- **Restart.** The receiver keeps some voice queued ahead of playback. A spurt that arrives to an empty queue waits a fixed restart latency, L0.
+- **Silence record.** After every end of transmission, the sender sends a 1500-sample (62.5 ms) silence record. It is in every spurt of the Set D demo.
+- **Appending.** If a spurt's first packet arrives while the previous spurt's voice and that silence record are still queued, the spurt is appended. It starts early by the silence less 62.5 ms, and the queue shrinks by as much.
+- **Draining.** If the queue has drained first, the spurt restarts at L0, which is why the next spurt returns to the usual delay.
+
+`tests/retiming.mjs` reproduces all of the following from the accuracy suite's results and the Set D demo.
+
+- **Set D, spurt by spurt.** The demo gives when each of Steam's 20 spurts reached the server, to 60 ms (SourceTV writes voice every 4 ticks).
+  - **Listener A:** one parameter, L0 of 320–375 ms, reproduces all 17 observable transitions: the four early starts, the four returns and the nine unchanged. Two further pairs of spurts arrived overlapping and count as one spurt in the gate model.
+  - **Early or not:** the early starts follow arrival gaps of 380 ms, and the spurts after gaps of 440–460 ms restart.
+  - **The signal cannot tell them apart.** Spurts 4 and 8 follow identical 440 ms silences in the gate model of the test signal, but their packets arrived 380 and 440 ms after the previous spurt's. Spurt 4 started early; spurt 8 did not.
+- **Size.** At a 380 ms gap the model predicts −317 ms; spurts 4, 6 and 9 came out at −335, −324 and −306 ms. The fourth early start, spurt 13, follows two spurts whose packets overlapped: it came out at −328 ms against −437 predicted, with 60 ms timing resolution at both ends.
+- **Listener B.** No spurt moved by more than 88 ms, the size of its alignment noise. That fits a shorter queue on that PC (L0 under about 0.28 s), for which the model predicts no early starts here.
+- **The other takes** show the same structure:
+  - early starts of the appending kind only after gate-model silences of 0.44 s or less. The two other shifts past −80 ms (−128 and −156 ms, after silences of 1.4 and 10.4 s) are far too small to be a spurt appended across that silence.
+  - at the test signal's 440 ms silences, every early start is followed by a restart (11 of 11)
+  - at the shorter silences in speech and the network signal, early starts chain until the queue runs out. The speech take has three with no restart between them: −124, −197 and −102 ms.
+- **Predicting from a recording or source file.** Each transition was predicted from the take's earlier transitions only, with the model learning the session's L0. Over the 146 transitions, it scores −0.379 per transition (log-likelihood) against −0.356 for the flat 41% rule.
+  - It wins where silences sit clearly below or above the threshold: speech (−7.2 against −11.5), the network signal (−1.4 against −4.2) and listener B.
+  - It loses on the four Set B takes, whose 440 ms silences sit at the threshold. There, ±30 ms of packet batching decides, which a recording does not show.
+  - The arrival jitter was fixed at ±30 ms from Set D beforehand. At ±60 ms, chosen after seeing the results, the model scores −0.349.
+
+So the mechanism explains the early starts, and a demo's packet timing predicts them spurt by spurt. From a recording or a source file, a spurt near the threshold stays a coin flip. The app therefore keeps the statistical rule (`voice_retime`).
 
 ## Model
 
@@ -484,7 +511,7 @@ A pure sine's codec noise moves by about 2 dB with where the 20 ms frames fall o
 
 Six settings no recording covers yet are predicted in advance in [predictions/PREDICTIONS.md](predictions/PREDICTIONS.md): the legacy codecs `vaudio_celt` and `vaudio_celt_high`, `voice_scale 2`, `voice_avggain 1`, `voice_maxgain 3` and `volume 1`.
 
-- **Talk-spurt timing and latency trimming.** Renders keep the source timeline by default. Early starts after short silences (finding 19) are an option, modeled statistically: which spurt TF2 moves is not predictable. The 5.8 ms latency trims inside a spurt (finding 10) and the recorder's clock drift (about 400 ppm in every take, finding 15) are not modeled. All of these occur with a remote listener on a dedicated server too (Set D).
+- **Talk-spurt timing and latency trimming.** Renders keep the source timeline by default. Early starts after short silences (finding 19) are an option, modeled statistically. Which spurt TF2 moves depends on packet timing that a recording does not show (finding 21). The 5.8 ms latency trims inside a spurt (finding 10) and the recorder's clock drift (about 400 ppm in every take, finding 15) are not modeled. All of these occur with a remote listener on a dedicated server too (Set D).
 - **Steam's libopus build.** Finding 16 identifies libopus 1.1.x, most likely 1.1.2 or later, which give identical packets here. Steam's compiler and math library could still change packets in their last bits. Steam's capture resampler is modeled by its measured roll-off, not reproduced. Pure tones at 11.5–12 kHz fall into DTX in Steam's encoder more often than in the model.
 - **Stereo capture.** Finding 6 is one capture chain (a stereo virtual cable). A physical microphone is mono either way.
 - **Comfort-noise details.** The model reproduces when comfort noise starts and how often it refreshes, but not the random excitation's exact values. For a steady tone below 60 Hz, the sign and height of each near-DC plateau differ from TF2's (finding 18).
@@ -507,6 +534,6 @@ For a new take of the test signal:
 3. Record only the game's output, losslessly.
 4. Note the TF2 and Steam versions and the `volume` value.
 
-For SourceTV packets, see [`tests/demovoice/`](demovoice/README.md).
+For SourceTV packets, see [`tests/demovoice/`](demovoice/README.md). For talk-spurt timing (finding 21), run `node tests/retiming.mjs --accuracy results.json --demo voicetest.dem` on the accuracy suite's JSON.
 
 Use single quotes around filenames containing `$` in PowerShell. The compare tool reads files locally, prints JSON and uploads nothing. A full run takes a few minutes.

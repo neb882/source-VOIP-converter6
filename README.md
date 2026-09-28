@@ -124,7 +124,7 @@ Evidence, method, residuals and open questions are in [tests/REFERENCE_2026.md](
 
 What that does **not** establish:
 - Valve's source code for the gain stage or Steam's gate. Neither is in the public Source SDK 2013; both are identified from recordings.
-- Which talk spurts TF2's receiver re-times. The receiver starts about 40% of spurts early after a short silence (finding 19), but which ones varies from take to take of the same signal. Renders keep the source timeline unless **Talk-spurt timing** is set to TF2 re-timing, which applies the measured statistics; latency trims inside a spurt are not modeled.
+- Which talk spurts TF2's receiver re-times. The receiver starts about 40% of spurts early after a short silence (finding 19). It does so when the next spurt's first packet arrives while the previous one is still queued: the spurt is appended, starting early by the silence less a 62.5 ms silence record (finding 21). A SourceTV demo's packet timing predicts this spurt by spurt. A recording or source file does not, because near the threshold ±30 ms of packet batching decides. Renders keep the source timeline unless **Talk-spurt timing** is set to TF2 re-timing, which applies the measured statistics; latency trims inside a spurt are not modeled.
 - Steam's exact libopus build and capture resampler. The release is 1.1.x (1.1.2–1.1.5 give identical packets). The resampler is modeled by its measured roll-off, and pure tones at 11.5–12 kHz still differ.
 - The absolute playback level. That depends on game and OS volume; the rendered file uses `volume 0.5`, where the recordings used 0.15.
 - Real internet loss. The network model comes from simulated loss and jitter in TF2 (`net_fakeloss`, `net_fakejitter` on a listen server).
@@ -227,7 +227,7 @@ For the clip from the "whoosh" investigation (a river recording and its TF2 take
 
 **Timing of the render.** The Steam render keeps the source's timeline: its 8–11 kHz band lines up with the source to within a microsecond. Lower frequencies lead by 35–370 µs, which is the phase of Opus's SILK layer. TF2's libopus does the same, so it is kept (finding 20).
 
-**Every take at once.** `pnpm accuracy --takes <folder>` runs this check over the owner's 18 recordings in headless Chromium. Each is rendered with the settings it was recorded with, lined up and compared, and the talk-spurt timing goes to JSON with `--json`. The takes and their settings are listed in [`tests/accuracy.takes.json`](tests/accuracy.takes.json); the recordings themselves are not distributed. The results are in [REFERENCE_2026.md](tests/REFERENCE_2026.md#results).
+**Every take at once.** `pnpm accuracy --takes <folder>` runs this check over the owner's 18 recordings in headless Chromium. Each is rendered with the settings it was recorded with, lined up and compared, and the talk-spurt timing goes to JSON with `--json`. The takes and their settings are listed in [`tests/accuracy.takes.json`](tests/accuracy.takes.json); the recordings themselves are not distributed. The results are in [REFERENCE_2026.md](tests/REFERENCE_2026.md#results). `node tests/retiming.mjs --accuracy <json> [--demo <dem>]` then tests what decides which talk spurts start early (finding 21).
 
 **Predictions made before the recordings.** A model fitted to recordings should reproduce them; the harder test is recordings it has not seen. [`tests/predictions/`](tests/predictions/PREDICTIONS.md) holds the app's predictions for six takes nobody has recorded yet:
 - `vaudio_celt` and `vaudio_celt_high`, each with two competing hypotheses
